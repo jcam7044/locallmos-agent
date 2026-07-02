@@ -12,6 +12,11 @@ use std::sync::Arc;
 pub struct OllamaAdapter {
     base: String,
     http: reqwest::Client,
+    /// How long Ollama keeps a model resident after a request. Sent on every
+    /// request so it overrides the server's OLLAMA_KEEP_ALIVE default — otherwise
+    /// a short/zero default unloads the model between chat turns and reloads it
+    /// cold each time.
+    keep_alive: String,
 }
 
 #[derive(Deserialize)]
@@ -55,7 +60,13 @@ impl OllamaAdapter {
     pub fn new(http: reqwest::Client) -> Self {
         let base = std::env::var("LOCALLMOS_OLLAMA_URL")
             .unwrap_or_else(|_| "http://127.0.0.1:11434".to_string());
-        Self { base: base.trim_end_matches('/').to_string(), http }
+        let keep_alive =
+            std::env::var("LOCALLMOS_CHAT_KEEP_ALIVE").unwrap_or_else(|_| "30m".to_string());
+        Self {
+            base: base.trim_end_matches('/').to_string(),
+            http,
+            keep_alive,
+        }
     }
 
     pub fn endpoint(&self) -> &str {
@@ -112,6 +123,7 @@ impl OllamaAdapter {
                 "model": model,
                 "messages": messages,
                 "stream": true,
+                "keep_alive": self.keep_alive,
             }))
             .send()
             .await?;
@@ -206,7 +218,7 @@ impl RuntimeAdapter for OllamaAdapter {
         let resp = self
             .http
             .post(format!("{}/api/generate", self.base))
-            .json(&serde_json::json!({ "model": model, "keep_alive": "30m" }))
+            .json(&serde_json::json!({ "model": model, "keep_alive": self.keep_alive }))
             .send()
             .await?;
         if resp.status().is_success() {

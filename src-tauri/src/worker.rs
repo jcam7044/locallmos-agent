@@ -127,10 +127,7 @@ async fn telemetry_tick(state: &Arc<AppState>) -> Result<()> {
         s.runtime_state = Some(snap.state.clone());
         s.loaded_model = snap.models.iter().find(|m| m.loaded).map(|m| m.name.clone());
         s.cpu_pct = telemetry.cpu_utilization_pct;
-        if let Some(g) = telemetry.gpus.first() {
-            s.gpu_name = g.name.clone();
-            s.gpu_util_pct = g.utilization_pct;
-        }
+        s.gpus = telemetry.gpus.clone();
     }
     Ok(())
 }

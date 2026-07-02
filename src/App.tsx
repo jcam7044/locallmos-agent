@@ -1,6 +1,17 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
+type GpuStat = {
+  index: number;
+  name: string | null;
+  vendor: string;
+  utilizationPct: number | null;
+  memoryUsedBytes: number | null;
+  memoryTotalBytes: number | null;
+  temperatureC: number | null;
+  powerWatts: number | null;
+};
+
 type AgentStatus = {
   enrolled: boolean;
   rigId: string | null;
@@ -10,10 +21,14 @@ type AgentStatus = {
   runtimeState: string | null;
   loadedModel: string | null;
   cpuPct: number | null;
-  gpuName: string | null;
-  gpuUtilPct: number | null;
+  gpus: GpuStat[];
   lastError: string | null;
 };
+
+function formatGB(bytes: number | null): string {
+  if (bytes == null) return "—";
+  return `${(bytes / 1024 ** 3).toFixed(1)} GB`;
+}
 
 const label: React.CSSProperties = { color: "#64748b", fontSize: 12 };
 const card: React.CSSProperties = {
@@ -100,14 +115,19 @@ export function App() {
           <Row k="Runtime" v={`${status.runtimeKind ?? "—"} (${status.runtimeState ?? "?"})`} />
           <Row k="Loaded model" v={status.loadedModel ?? "—"} />
           <Row k="CPU" v={status.cpuPct != null ? `${status.cpuPct.toFixed(0)}%` : "—"} />
-          <Row
-            k="GPU"
-            v={
-              status.gpuName
-                ? `${status.gpuName} · ${status.gpuUtilPct?.toFixed(0) ?? "?"}%`
-                : "—"
-            }
-          />
+          {status.gpus.length === 0 ? (
+            <Row k="GPU" v="—" />
+          ) : (
+            status.gpus.map((g) => (
+              <Row
+                key={g.index}
+                k={`GPU ${g.index}`}
+                v={`${g.name ?? g.vendor} · ${g.utilizationPct?.toFixed(0) ?? "?"}% · ${formatGB(
+                  g.memoryUsedBytes,
+                )}/${formatGB(g.memoryTotalBytes)}`}
+              />
+            ))
+          )}
         </div>
       )}
 

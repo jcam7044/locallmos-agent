@@ -5,9 +5,17 @@
 
 use crate::runtime::RuntimeSnapshot;
 use anyhow::{anyhow, Result};
-use reqwest::Client;
+use reqwest::{Client, StatusCode};
 use serde::Deserialize;
 use serde_json::{json, Value};
+
+/// The server rejected our refresh secret: the rig was deleted from the
+/// dashboard (its credentials cascade-deleted) or otherwise revoked. Callers
+/// treat this as "de-enroll and return to the pairing screen", distinct from a
+/// transient network/5xx failure which should just be retried.
+#[derive(Debug, thiserror::Error)]
+#[error("this rig was removed from the dashboard; enroll again to reconnect")]
+pub struct CredentialsRevoked;
 
 #[derive(Deserialize)]
 pub struct EnrollResp {
@@ -121,6 +129,12 @@ impl Supabase {
             .json(&json!({ "rigId": rig_id, "refreshSecret": refresh_secret }))
             .send()
             .await?;
+        // A 401 means the stored refresh secret is no longer valid — the rig
+        // was deleted/revoked. Surface it as a typed error so the worker can
+        // wipe local credentials and drop back to pairing.
+        if resp.status() == StatusCode::UNAUTHORIZED {
+            return Err(CredentialsRevoked.into());
+        }
         if !resp.status().is_success() {
             return Err(anyhow!("token refresh failed: HTTP {}", resp.status()));
         }
@@ -143,6 +157,13 @@ impl Supabase {
         ensure_ok(resp, "post_metrics").await
     }
 
+    /// Update `last_seen`/host info and, crucially, tell the caller whether the
+    /// rig is still live. We filter on `deleted_at is null` and request the
+    /// updated row back: with a valid JWT a live rig returns one row, but a rig
+    /// the owner soft-deleted from the dashboard returns zero rows. That doubles
+    /// as a cheap "am I still enrolled?" probe every telemetry tick — see
+    /// `worker::telemetry_tick`. Returns `Ok(true)` if live, `Ok(false)` if
+    /// deleted.
     pub async fn heartbeat(
         &self,
         token: &str,
@@ -150,21 +171,29 @@ impl Supabase {
         os: &str,
         arch: &str,
         version: &str,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let ts = chrono::Utc::now().to_rfc3339();
         let resp = self
             .auth(
-                self.http
-                    .patch(format!("{}/rigs?id=eq.{rig_id}", self.rest)),
+                self.http.patch(format!(
+                    "{}/rigs?id=eq.{rig_id}&deleted_at=is.null&select=id",
+                    self.rest
+                )),
                 token,
             )
-            .header("Prefer", "return=minimal")
+            .header("Prefer", "return=representation")
             .json(&json!({
                 "last_seen": ts, "os": os, "arch": arch, "agent_version": version,
             }))
             .send()
             .await?;
-        ensure_ok(resp, "heartbeat").await
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(anyhow!("heartbeat failed: HTTP {status}: {body}"));
+        }
+        let rows: Vec<Value> = resp.json().await.unwrap_or_default();
+        Ok(!rows.is_empty())
     }
 
     pub async fn upsert_runtime(

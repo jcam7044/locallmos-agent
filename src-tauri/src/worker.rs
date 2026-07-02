@@ -2,7 +2,10 @@
 //! desired-state reconciliation. Also hosts OS-level actions (service restart,
 //! reboot) shared with the runtime adapters.
 
+use crate::config::AgentConfig;
 use crate::runtime::RuntimeAdapter;
+use crate::status::AgentStatus;
+use crate::supabase::CredentialsRevoked;
 use crate::AppState;
 use anyhow::{anyhow, Result};
 use chrono::Utc;
@@ -56,12 +59,44 @@ pub async fn ensure_token(state: &Arc<AppState>) -> Result<String> {
     let stale = cfg.token.is_none()
         || cfg.token_expires_at.map_or(true, |exp| exp - now < 120);
     if stale {
-        let tr = state.supabase.refresh_token(&rig_id, &secret).await?;
-        cfg.token = Some(tr.token);
-        cfg.token_expires_at = Some(now + tr.expires_in);
-        cfg.save().ok();
+        match state.supabase.refresh_token(&rig_id, &secret).await {
+            Ok(tr) => {
+                cfg.token = Some(tr.token);
+                cfg.token_expires_at = Some(now + tr.expires_in);
+                cfg.save().ok();
+            }
+            Err(e) => {
+                // If the refresh secret was revoked (rig deleted from the
+                // dashboard), wipe local credentials and return to pairing.
+                // Other errors are transient — leave enrollment intact.
+                if e.downcast_ref::<CredentialsRevoked>().is_some() {
+                    drop(cfg); // release before reset_to_pairing re-locks config
+                    reset_to_pairing(state).await;
+                }
+                return Err(e);
+            }
+        }
     }
     Ok(cfg.token.clone().unwrap())
+}
+
+/// Wipe local enrollment and drop the tray UI back to the pairing screen.
+/// Called when the rig no longer exists server-side (owner deleted it) or its
+/// credentials were revoked. Idempotent: safe to call from any loop.
+pub async fn reset_to_pairing(state: &Arc<AppState>) {
+    {
+        let mut cfg = state.config.lock().await;
+        if !cfg.is_enrolled() {
+            return; // already reset by another loop
+        }
+        tracing::warn!("rig removed server-side; clearing credentials and returning to pairing");
+        *cfg = AgentConfig::default();
+        cfg.save().ok();
+    }
+    let mut s = state.status.lock().await;
+    *s = AgentStatus::default();
+    s.last_error =
+        Some("This rig was removed from the dashboard. Enter a new pairing code to reconnect.".into());
 }
 
 pub async fn rig_id(state: &Arc<AppState>) -> Option<String> {
@@ -101,6 +136,19 @@ async fn telemetry_tick(state: &Arc<AppState>) -> Result<()> {
     let token = ensure_token(state).await?;
     let rid = rig_id(state).await.ok_or_else(|| anyhow!("not enrolled"))?;
 
+    // Heartbeat first: it doubles as an "is this rig still enrolled?" probe. If
+    // the owner deleted the rig from the dashboard, the row is gone and the
+    // child-table writes below would fail their foreign key — so detect it here
+    // and drop back to pairing instead of erroring in a loop.
+    let exists = state
+        .supabase
+        .heartbeat(&token, &rid, os_name(), arch_name(), AGENT_VERSION)
+        .await?;
+    if !exists {
+        reset_to_pairing(state).await;
+        return Ok(());
+    }
+
     // System telemetry.
     let telemetry = {
         let mut mon = state.monitor.lock().await;
@@ -116,10 +164,6 @@ async fn telemetry_tick(state: &Arc<AppState>) -> Result<()> {
     let snap = state.ollama.snapshot().await;
     state.supabase.upsert_runtime(&token, &rid, &snap).await?;
     state.supabase.upsert_models(&token, &rid, &snap).await?;
-    state
-        .supabase
-        .heartbeat(&token, &rid, os_name(), arch_name(), AGENT_VERSION)
-        .await?;
 
     // Reflect into the tray status.
     {

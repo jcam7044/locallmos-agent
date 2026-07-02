@@ -49,8 +49,13 @@ pub struct AppState {
 
 fn build_state() -> Arc<AppState> {
     let settings = Settings::from_env();
+    // Use connect + idle-read timeouts rather than a single total-request
+    // deadline: fast-fail the short polling/Supabase calls when a host is down,
+    // but don't cap streaming chat, where the model can take a while to load
+    // before the first token and a long generation can outlast any fixed total.
     let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(15))
+        .connect_timeout(Duration::from_secs(5))
+        .read_timeout(Duration::from_secs(300))
         .build()
         .expect("failed to build HTTP client");
     let supabase = Supabase::new(http.clone(), &settings.supabase_url, &settings.anon_key);

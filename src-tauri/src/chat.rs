@@ -22,9 +22,10 @@ use crate::supabase::ChatPending;
 use crate::AppState;
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Notify;
 
 /// Broadcast event name on the `chat:{id}` channel (mirrors CHAT_STREAM_EVENT
 /// in packages/shared/src/chat.ts).
@@ -32,6 +33,9 @@ const CHAT_EVENT: &str = "chunk";
 /// Flush cadence / size for batching token deltas into broadcasts.
 const FLUSH_INTERVAL: Duration = Duration::from_millis(80);
 const FLUSH_CHARS: usize = 24;
+/// How often to re-emit the "loading" ping while a cold model loads, so a
+/// late-subscribing client still catches it before the first token.
+const LOADING_HEARTBEAT: Duration = Duration::from_millis(1500);
 
 fn topic(message_id: &str) -> String {
     format!("chat:{message_id}")
@@ -128,15 +132,52 @@ pub async fn process(state: &Arc<AppState>, pending: ChatPending) -> Result<()> 
     let cancel = Arc::new(AtomicBool::new(false));
     state.cancels.lock().await.insert(pending.id.clone(), cancel.clone());
 
+    // If the model isn't resident, Ollama blocks the chat request while it loads
+    // (tens of seconds for large models). Heartbeat a "loading" ping so the web
+    // shows a loading state instead of looking hung; stop it on the first token.
+    let stop_loading = Arc::new(Notify::new());
+    let loading_task = if ws_ready && !state.ollama.is_model_loaded(&model).await {
+        let state = state.clone();
+        let chan = chan.clone();
+        let stop = stop_loading.clone();
+        let model = model.clone();
+        Some(tokio::spawn(async move {
+            let payload = json!({ "type": "loading", "model": model });
+            loop {
+                state.realtime.broadcast(&chan, CHAT_EVENT, payload.clone()).await.ok();
+                tokio::select! {
+                    _ = stop.notified() => break,
+                    _ = tokio::time::sleep(LOADING_HEARTBEAT) => {}
+                }
+            }
+        }))
+    } else {
+        None
+    };
+
     // Stream tokens from Ollama into the broadcaster.
-    let result = state
-        .ollama
-        .chat_stream(&model, Value::Array(messages), cancel, |delta| {
-            let _ = tx.send(delta.to_string());
-        })
-        .await;
+    let first_token = Arc::new(AtomicBool::new(false));
+    let result = {
+        let first_token = first_token.clone();
+        let stop_loading = stop_loading.clone();
+        let tx = tx.clone();
+        state
+            .ollama
+            .chat_stream(&model, Value::Array(messages), cancel, move |delta| {
+                if !first_token.swap(true, Ordering::Relaxed) {
+                    stop_loading.notify_one(); // first token → drop the loading state
+                }
+                let _ = tx.send(delta.to_string());
+            })
+            .await
+    };
     state.cancels.lock().await.remove(&pending.id);
     drop(tx);
+    // Ensure the heartbeat stops even if the turn ended before any token.
+    stop_loading.notify_one();
+    if let Some(t) = loading_task {
+        let _ = t.await;
+    }
     let last_seq = broadcaster.await.unwrap_or(0);
 
     let outcome = match result {

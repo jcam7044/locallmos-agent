@@ -72,6 +72,17 @@ impl OllamaAdapter {
         resp.json::<VersionResp>().await.ok().map(|v| v.version)
     }
 
+    /// True if `model` is currently resident in Ollama (per `/api/ps`). Lets a
+    /// chat turn tell the web when it's about to incur a cold model load. Errs
+    /// toward "not loaded" (matches conservatively) so we never suppress the
+    /// loading indicator during a real load.
+    pub async fn is_model_loaded(&self, model: &str) -> bool {
+        let loaded = self.loaded_names().await;
+        loaded.contains(model)
+            // A bare name (no tag) resolves to ":latest" in Ollama.
+            || (!model.contains(':') && loaded.contains(&format!("{model}:latest")))
+    }
+
     async fn loaded_names(&self) -> HashSet<String> {
         let mut set = HashSet::new();
         if let Ok(resp) = self.http.get(format!("{}/api/ps", self.base)).send().await {

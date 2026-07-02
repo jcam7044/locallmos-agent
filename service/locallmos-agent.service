@@ -1,0 +1,26 @@
+[Unit]
+Description=LocalLMOS Agent (local LLM rig monitor/controller)
+Documentation=https://github.com/your-org/locallmos
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/locallmos-agent service
+Restart=on-failure
+RestartSec=5
+
+# Rig credentials live here (shared with `enroll`); Supabase settings are read
+# from the env file below.
+Environment=LOCALLMOS_CONFIG_DIR=/etc/locallmos-agent
+EnvironmentFile=-/etc/locallmos-agent/agent.env
+
+# Runs as root so it can restart the runtime (systemctl restart ollama) and
+# reboot the machine. If you do NOT need those control actions, set a dedicated
+# unprivileged user here instead, e.g.:
+#   User=locallmos
+#   Group=locallmos
+User=root
+
+[Install]
+WantedBy=multi-user.target

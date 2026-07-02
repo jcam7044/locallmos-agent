@@ -23,9 +23,12 @@ impl AgentConfig {
     }
 
     fn path() -> Result<PathBuf> {
-        let dir = dirs::config_dir()
-            .context("no config dir")?
-            .join("locallmos-agent");
+        // Allow an explicit override so a system service and CLI enrollment
+        // (which may run as different users) can share the same config file.
+        let dir = match std::env::var("LOCALLMOS_CONFIG_DIR") {
+            Ok(d) if !d.is_empty() => PathBuf::from(d),
+            _ => dirs::config_dir().context("no config dir")?.join("locallmos-agent"),
+        };
         std::fs::create_dir_all(&dir).ok();
         Ok(dir.join("config.json"))
     }

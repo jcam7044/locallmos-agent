@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- macOS launchd daemon. Install to /Library/LaunchDaemons/os.locallmos.agent.plist
+     (runs at boot as root). See SERVICE.md. -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>os.locallmos.agent</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/locallmos-agent</string>
+    <string>service</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>LOCALLMOS_CONFIG_DIR</key>
+    <string>/etc/locallmos-agent</string>
+    <key>LOCALLMOS_SUPABASE_URL</key>
+    <string>https://YOUR_PROJECT_REF.supabase.co</string>
+    <key>LOCALLMOS_SUPABASE_ANON_KEY</key>
+    <string>your-anon-key</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/var/log/locallmos-agent.log</string>
+  <key>StandardErrorPath</key>
+  <string>/var/log/locallmos-agent.log</string>
+</dict>
+</plist>

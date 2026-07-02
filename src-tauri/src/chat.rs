@@ -2,6 +2,21 @@
 //! Ollama, and relay token deltas to the web over the agent's Realtime
 //! websocket (rig-scoped broadcast). Safe to call from both the Realtime handler
 //! and the fallback poll — the claim makes processing single-shot.
+//!
+//! Resilience: the *authoritative* result is the persisted `chat_messages` row,
+//! never the ephemeral broadcast. So disconnects degrade gracefully rather than
+//! losing the answer:
+//!   * Socket down when the turn starts → `join` fails, `ws_ready = false`: we
+//!     skip live streaming but still generate + persist the reply, which the web
+//!     picks up via postgres_changes (appears at completion instead of streaming).
+//!   * Socket drops mid-stream → `broadcast` calls no-op (`.ok()`); generation
+//!     continues and the final content is still persisted. Only that turn's live
+//!     streaming is lost — not the answer.
+//!   * The Realtime loop (`realtime::run`) reconnects within ~5s, and the 30s
+//!     fallback poll in `worker.rs` picks up any assistant turn whose INSERT
+//!     event was missed while the socket was down.
+//! A mid-stream socket drop is not retried for the *current* turn; that would
+//! need per-turn resumable streaming (out of scope for v1).
 
 use crate::supabase::ChatPending;
 use crate::AppState;

@@ -22,6 +22,7 @@ use crate::supabase::ChatPending;
 use crate::AppState;
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -123,13 +124,18 @@ pub async fn process(state: &Arc<AppState>, pending: ChatPending) -> Result<()> 
         })
     };
 
+    // Register a cancel flag so a Stop request can abort this turn.
+    let cancel = Arc::new(AtomicBool::new(false));
+    state.cancels.lock().await.insert(pending.id.clone(), cancel.clone());
+
     // Stream tokens from Ollama into the broadcaster.
     let result = state
         .ollama
-        .chat_stream(&model, Value::Array(messages), |delta| {
+        .chat_stream(&model, Value::Array(messages), cancel, |delta| {
             let _ = tx.send(delta.to_string());
         })
         .await;
+    state.cancels.lock().await.remove(&pending.id);
     drop(tx);
     let last_seq = broadcaster.await.unwrap_or(0);
 

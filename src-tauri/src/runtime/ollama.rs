@@ -6,6 +6,8 @@ use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 pub struct OllamaAdapter {
     base: String,
@@ -89,6 +91,7 @@ impl OllamaAdapter {
         &self,
         model: &str,
         messages: Value,
+        cancel: Arc<AtomicBool>,
         mut on_delta: F,
     ) -> Result<String> {
         let resp = self
@@ -110,6 +113,11 @@ impl OllamaAdapter {
         let mut buf: Vec<u8> = Vec::new();
         let mut full = String::new();
         while let Some(chunk) = stream.next().await {
+            // Stop-generation: return what we have so far. Dropping the response
+            // stream closes the connection, which halts Ollama's generation.
+            if cancel.load(Ordering::Relaxed) {
+                return Ok(full);
+            }
             buf.extend_from_slice(&chunk?);
             while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
                 let line: Vec<u8> = buf.drain(..=nl).collect();

@@ -18,6 +18,8 @@ mod status;
 mod supabase;
 mod worker;
 
+use std::collections::HashMap;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -41,6 +43,8 @@ pub struct AppState {
     pub ollama: OllamaAdapter,
     pub monitor: Mutex<Monitor>,
     pub realtime: Arc<realtime::RealtimeHandle>,
+    /// In-flight chat turns → cancel flag, for stop-generation.
+    pub cancels: Mutex<HashMap<String, Arc<AtomicBool>>>,
 }
 
 fn build_state() -> Arc<AppState> {
@@ -68,6 +72,7 @@ fn build_state() -> Arc<AppState> {
         ollama,
         monitor: Mutex::new(Monitor::new()),
         realtime: Arc::new(realtime::RealtimeHandle::new()),
+        cancels: Mutex::new(HashMap::new()),
     })
 }
 

@@ -162,6 +162,7 @@ async fn connect_and_listen(state: &Arc<AppState>) -> Result<()> {
             "config": {
                 "postgres_changes": [
                     { "event": "INSERT", "schema": "public", "table": "chat_messages", "filter": format!("rig_id=eq.{rig}") },
+                    { "event": "UPDATE", "schema": "public", "table": "chat_messages", "filter": format!("rig_id=eq.{rig}") },
                     { "event": "INSERT", "schema": "public", "table": "commands", "filter": format!("rig_id=eq.{rig}") }
                 ]
             },
@@ -226,18 +227,33 @@ async fn route(state: &Arc<AppState>, txt: &str) {
     }
 }
 
-/// Dispatch a `postgres_changes` INSERT to the command or chat handler.
+/// Dispatch a `postgres_changes` event to the command / chat / cancel handlers.
 async fn handle_change(state: &Arc<AppState>, v: &Value) {
     let Some(data) = v.get("payload").and_then(|p| p.get("data")) else {
         return;
     };
-    if data.get("type").and_then(Value::as_str) != Some("INSERT") {
-        return;
-    }
+    let change_type = data.get("type").and_then(Value::as_str).unwrap_or("");
     let table = data.get("table").and_then(Value::as_str).unwrap_or("");
     let Some(record) = data.get("record") else {
         return;
     };
+
+    // Stop-generation: a UPDATE that sets cancel_requested trips the turn's flag.
+    if change_type == "UPDATE" && table == "chat_messages" {
+        if record.get("cancel_requested").and_then(Value::as_bool) == Some(true) {
+            if let Some(id) = record.get("id").and_then(Value::as_str) {
+                if let Some(flag) = state.cancels.lock().await.get(id) {
+                    flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                    tracing::info!("chat {id}: cancel requested");
+                }
+            }
+        }
+        return;
+    }
+
+    if change_type != "INSERT" {
+        return;
+    }
 
     match table {
         "commands" => {

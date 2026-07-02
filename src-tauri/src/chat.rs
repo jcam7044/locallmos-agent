@@ -1,7 +1,7 @@
 //! Chat turn handling: claim a pending assistant message, stream the reply from
-//! Ollama, and relay token deltas to the web over Realtime broadcast. Safe to
-//! call from both the Realtime handler and the fallback poll — the claim makes
-//! processing single-shot.
+//! Ollama, and relay token deltas to the web over the agent's Realtime
+//! websocket (rig-scoped broadcast). Safe to call from both the Realtime handler
+//! and the fallback poll — the claim makes processing single-shot.
 
 use crate::supabase::ChatPending;
 use crate::AppState;
@@ -53,45 +53,52 @@ pub async fn process(state: &Arc<AppState>, pending: ChatPending) -> Result<()> 
         .map(|m| json!({ "role": m.role, "content": m.content }))
         .collect();
 
+    // Join the private broadcast channel over the websocket. If the socket is
+    // down we still generate + persist the reply, just without live streaming.
+    let chan = topic(&pending.id);
+    let ws_ready = state.realtime.join(&chan, &token).await.is_ok();
+    if !ws_ready {
+        tracing::warn!("chat {}: realtime unavailable, streaming disabled", pending.id);
+    }
+
     // Async broadcaster: batches deltas from the sync stream callback.
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    let topic = topic(&pending.id);
     let broadcaster = {
         let state = state.clone();
-        let token = token.clone();
-        let topic = topic.clone();
+        let chan = chan.clone();
         tokio::spawn(async move {
             let mut seq: u64 = 0;
             let mut buf = String::new();
             let mut ticker = tokio::time::interval(FLUSH_INTERVAL);
             ticker.tick().await; // consume immediate first tick
+            let flush = |seq: &mut u64, buf: &mut String| {
+                let payload = json!({ "type": "token", "seq": *seq, "delta": buf.as_str() });
+                *seq += 1;
+                payload
+            };
             loop {
                 tokio::select! {
                     maybe = rx.recv() => match maybe {
                         Some(delta) => {
                             buf.push_str(&delta);
                             if buf.len() >= FLUSH_CHARS {
-                                let payload = json!({ "type": "token", "seq": seq, "delta": buf.as_str() });
-                                state.supabase.broadcast(&token, &topic, CHAT_EVENT, payload).await.ok();
-                                seq += 1;
+                                let p = flush(&mut seq, &mut buf);
+                                if ws_ready { state.realtime.broadcast(&chan, CHAT_EVENT, p).await.ok(); }
                                 buf.clear();
                             }
                         }
                         None => {
-                            // Sender dropped: final flush and stop.
                             if !buf.is_empty() {
-                                let payload = json!({ "type": "token", "seq": seq, "delta": buf.as_str() });
-                                state.supabase.broadcast(&token, &topic, CHAT_EVENT, payload).await.ok();
-                                seq += 1;
+                                let p = flush(&mut seq, &mut buf);
+                                if ws_ready { state.realtime.broadcast(&chan, CHAT_EVENT, p).await.ok(); }
                             }
                             break;
                         }
                     },
                     _ = ticker.tick() => {
                         if !buf.is_empty() {
-                            let payload = json!({ "type": "token", "seq": seq, "delta": buf.as_str() });
-                            state.supabase.broadcast(&token, &topic, CHAT_EVENT, payload).await.ok();
-                            seq += 1;
+                            let p = flush(&mut seq, &mut buf);
+                            if ws_ready { state.realtime.broadcast(&chan, CHAT_EVENT, p).await.ok(); }
                             buf.clear();
                         }
                     }
@@ -111,13 +118,15 @@ pub async fn process(state: &Arc<AppState>, pending: ChatPending) -> Result<()> 
     drop(tx);
     let last_seq = broadcaster.await.unwrap_or(0);
 
-    match result {
+    let outcome = match result {
         Ok(full) => {
-            state
-                .supabase
-                .broadcast(&token, &topic, CHAT_EVENT, json!({ "type": "done", "seq": last_seq }))
-                .await
-                .ok();
+            if ws_ready {
+                state
+                    .realtime
+                    .broadcast(&chan, CHAT_EVENT, json!({ "type": "done", "seq": last_seq }))
+                    .await
+                    .ok();
+            }
             state
                 .supabase
                 .update_chat_message(&token, &pending.id, "done", Some(&full), None)
@@ -126,16 +135,17 @@ pub async fn process(state: &Arc<AppState>, pending: ChatPending) -> Result<()> 
         }
         Err(e) => {
             let msg = e.to_string();
-            state
-                .supabase
-                .broadcast(
-                    &token,
-                    &topic,
-                    CHAT_EVENT,
-                    json!({ "type": "error", "seq": last_seq, "message": msg }),
-                )
-                .await
-                .ok();
+            if ws_ready {
+                state
+                    .realtime
+                    .broadcast(
+                        &chan,
+                        CHAT_EVENT,
+                        json!({ "type": "error", "seq": last_seq, "message": msg }),
+                    )
+                    .await
+                    .ok();
+            }
             state
                 .supabase
                 .update_chat_message(&token, &pending.id, "error", None, Some(&msg))
@@ -143,5 +153,10 @@ pub async fn process(state: &Arc<AppState>, pending: ChatPending) -> Result<()> 
                 .ok();
             Err(e)
         }
+    };
+
+    if ws_ready {
+        state.realtime.leave(&chan).await;
     }
+    outcome
 }

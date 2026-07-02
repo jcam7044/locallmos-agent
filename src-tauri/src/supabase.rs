@@ -64,7 +64,6 @@ pub struct Supabase {
     http: Client,
     rest: String,
     functions: String,
-    realtime: String,
     base: String,
     anon: String,
 }
@@ -75,7 +74,6 @@ impl Supabase {
             http,
             rest: format!("{base_url}/rest/v1"),
             functions: format!("{base_url}/functions/v1"),
-            realtime: format!("{base_url}/realtime/v1"),
             base: base_url.to_string(),
             anon: anon.to_string(),
         }
@@ -387,31 +385,6 @@ impl Supabase {
         ensure_ok(resp, "update_chat_message").await
     }
 
-    /// Stream a token delta to the private Realtime broadcast channel.
-    pub async fn broadcast(
-        &self,
-        token: &str,
-        topic: &str,
-        event: &str,
-        payload: Value,
-    ) -> Result<()> {
-        let resp = self
-            .auth(
-                self.http.post(format!("{}/api/broadcast", self.realtime)),
-                token,
-            )
-            .json(&json!({
-                "messages": [{
-                    "topic": topic,
-                    "event": event,
-                    "payload": payload,
-                    "private": true,
-                }]
-            }))
-            .send()
-            .await?;
-        ensure_ok(resp, "broadcast").await
-    }
 }
 
 async fn ensure_ok(resp: reqwest::Response, ctx: &str) -> Result<()> {

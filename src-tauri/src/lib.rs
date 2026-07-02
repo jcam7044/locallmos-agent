@@ -40,6 +40,7 @@ pub struct AppState {
     pub status: Mutex<AgentStatus>,
     pub ollama: OllamaAdapter,
     pub monitor: Mutex<Monitor>,
+    pub realtime: Arc<realtime::RealtimeHandle>,
 }
 
 fn build_state() -> Arc<AppState> {
@@ -66,6 +67,7 @@ fn build_state() -> Arc<AppState> {
         status: Mutex::new(status),
         ollama,
         monitor: Mutex::new(Monitor::new()),
+        realtime: Arc::new(realtime::RealtimeHandle::new()),
     })
 }
 

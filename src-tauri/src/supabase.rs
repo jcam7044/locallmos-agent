@@ -44,10 +44,28 @@ pub struct DesiredState {
     pub desired_runtime_state: Option<String>,
 }
 
+/// A pending assistant turn the agent must fulfil.
+#[derive(Deserialize, Clone)]
+pub struct ChatPending {
+    pub id: String,
+    pub conversation_id: String,
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+/// A prior message used as chat context.
+#[derive(Deserialize, Clone)]
+pub struct ChatContextMsg {
+    pub role: String,
+    pub content: String,
+}
+
 pub struct Supabase {
     http: Client,
     rest: String,
     functions: String,
+    realtime: String,
+    base: String,
     anon: String,
 }
 
@@ -57,8 +75,19 @@ impl Supabase {
             http,
             rest: format!("{base_url}/rest/v1"),
             functions: format!("{base_url}/functions/v1"),
+            realtime: format!("{base_url}/realtime/v1"),
+            base: base_url.to_string(),
             anon: anon.to_string(),
         }
+    }
+
+    /// Base URL (e.g. https://ref.supabase.co) for building the Realtime WS URL.
+    pub fn base_url(&self) -> &str {
+        &self.base
+    }
+
+    pub fn anon_key(&self) -> &str {
+        &self.anon
     }
 
     // ---- edge functions -------------------------------------------------
@@ -258,6 +287,130 @@ impl Supabase {
             .send()
             .await?;
         ensure_ok(resp, "update_command").await
+    }
+
+    /// Atomically claim a pending command (pending → running). Returns true if
+    /// *this* caller won the claim (safe against the WS + fallback-poll race).
+    pub async fn claim_command(&self, token: &str, id: &str) -> Result<bool> {
+        self.claim(token, "commands", id, "running").await
+    }
+
+    /// Atomically claim a pending assistant message (pending → streaming).
+    pub async fn claim_chat_message(&self, token: &str, id: &str) -> Result<bool> {
+        self.claim(token, "chat_messages", id, "streaming").await
+    }
+
+    async fn claim(&self, token: &str, table: &str, id: &str, to: &str) -> Result<bool> {
+        let resp = self
+            .auth(
+                self.http.patch(format!(
+                    "{}/{table}?id=eq.{id}&status=eq.pending",
+                    self.rest
+                )),
+                token,
+            )
+            .header("Prefer", "return=representation")
+            .json(&serde_json::json!({ "status": to }))
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            let s = resp.status();
+            return Err(anyhow!("claim {table} failed: HTTP {s}"));
+        }
+        let rows: Vec<Value> = resp.json().await.unwrap_or_default();
+        Ok(!rows.is_empty())
+    }
+
+    // ---- chat -----------------------------------------------------------
+    pub async fn fetch_pending_chat(
+        &self,
+        token: &str,
+        rig_id: &str,
+    ) -> Result<Vec<ChatPending>> {
+        let resp = self
+            .auth(
+                self.http.get(format!(
+                    "{}/chat_messages?rig_id=eq.{rig_id}&status=eq.pending&role=eq.assistant&select=id,conversation_id,model&order=created_at.asc",
+                    self.rest
+                )),
+                token,
+            )
+            .send()
+            .await?;
+        Ok(resp.json().await?)
+    }
+
+    /// Prior completed messages in a conversation, oldest first, for context.
+    pub async fn fetch_chat_context(
+        &self,
+        token: &str,
+        conversation_id: &str,
+    ) -> Result<Vec<ChatContextMsg>> {
+        let resp = self
+            .auth(
+                self.http.get(format!(
+                    "{}/chat_messages?conversation_id=eq.{conversation_id}&status=eq.done&select=role,content&order=created_at.asc",
+                    self.rest
+                )),
+                token,
+            )
+            .send()
+            .await?;
+        Ok(resp.json().await?)
+    }
+
+    pub async fn update_chat_message(
+        &self,
+        token: &str,
+        id: &str,
+        status: &str,
+        content: Option<&str>,
+        error: Option<&str>,
+    ) -> Result<()> {
+        let mut body = json!({ "status": status });
+        if let Some(c) = content {
+            body["content"] = json!(c);
+        }
+        if let Some(e) = error {
+            body["error"] = json!(e);
+        }
+        let resp = self
+            .auth(
+                self.http
+                    .patch(format!("{}/chat_messages?id=eq.{id}", self.rest)),
+                token,
+            )
+            .header("Prefer", "return=minimal")
+            .json(&body)
+            .send()
+            .await?;
+        ensure_ok(resp, "update_chat_message").await
+    }
+
+    /// Stream a token delta to the private Realtime broadcast channel.
+    pub async fn broadcast(
+        &self,
+        token: &str,
+        topic: &str,
+        event: &str,
+        payload: Value,
+    ) -> Result<()> {
+        let resp = self
+            .auth(
+                self.http.post(format!("{}/api/broadcast", self.realtime)),
+                token,
+            )
+            .json(&json!({
+                "messages": [{
+                    "topic": topic,
+                    "event": event,
+                    "payload": payload,
+                    "private": true,
+                }]
+            }))
+            .send()
+            .await?;
+        ensure_ok(resp, "broadcast").await
     }
 }
 

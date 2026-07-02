@@ -45,7 +45,7 @@ pub async fn enroll(state: &Arc<AppState>, code: &str, name: &str) -> Result<()>
 }
 
 /// Return a valid device JWT, refreshing it when missing or near expiry.
-async fn ensure_token(state: &Arc<AppState>) -> Result<String> {
+pub async fn ensure_token(state: &Arc<AppState>) -> Result<String> {
     let mut cfg = state.config.lock().await;
     let rig_id = cfg.rig_id.clone().ok_or_else(|| anyhow!("not enrolled"))?;
     let secret = cfg
@@ -64,7 +64,7 @@ async fn ensure_token(state: &Arc<AppState>) -> Result<String> {
     Ok(cfg.token.clone().unwrap())
 }
 
-async fn rig_id(state: &Arc<AppState>) -> Option<String> {
+pub async fn rig_id(state: &Arc<AppState>) -> Option<String> {
     state.config.lock().await.rig_id.clone()
 }
 
@@ -78,8 +78,11 @@ async fn set_error(state: &Arc<AppState>, err: impl std::fmt::Display) {
 /// Tauri's async runtime so the tasks run inside its Tokio context.
 pub fn spawn_loops(state: Arc<AppState>) {
     tauri::async_runtime::spawn(telemetry_loop(state.clone()));
-    tauri::async_runtime::spawn(command_loop(state.clone()));
-    tauri::async_runtime::spawn(reconcile_loop(state));
+    tauri::async_runtime::spawn(reconcile_loop(state.clone()));
+    // Commands + chat arrive instantly over Realtime; the fallback poll is a
+    // safety net for reconnects / missed events.
+    tauri::async_runtime::spawn(fallback_loop(state.clone()));
+    tauri::async_runtime::spawn(crate::realtime::run(state));
 }
 
 async fn telemetry_loop(state: Arc<AppState>) {
@@ -132,38 +135,53 @@ async fn telemetry_tick(state: &Arc<AppState>) -> Result<()> {
     Ok(())
 }
 
-async fn command_loop(state: Arc<AppState>) {
-    let period = Duration::from_secs(state.settings.command_poll_secs);
+/// Safety-net poll (30s): catches commands/chat missed while the Realtime
+/// socket was down or reconnecting. The claim step makes this idempotent with
+/// the Realtime path.
+async fn fallback_loop(state: Arc<AppState>) {
+    let period = Duration::from_secs(30);
     loop {
         if rig_id(&state).await.is_some() {
-            if let Err(e) = command_tick(&state).await {
-                set_error(&state, e).await;
+            if let Err(e) = fallback_tick(&state).await {
+                tracing::debug!("fallback poll: {e}");
             }
         }
         tokio::time::sleep(period).await;
     }
 }
 
-async fn command_tick(state: &Arc<AppState>) -> Result<()> {
+async fn fallback_tick(state: &Arc<AppState>) -> Result<()> {
     let token = ensure_token(state).await?;
     let rid = rig_id(state).await.ok_or_else(|| anyhow!("not enrolled"))?;
-    let pending = state.supabase.fetch_pending_commands(&token, &rid).await?;
 
-    for cmd in pending {
-        state
-            .supabase
-            .update_command(&token, &cmd.id, "running", None)
-            .await
-            .ok();
-
-        let (ok, result) = execute(state, &cmd.kind, &cmd.payload).await;
-        let status = if ok { "done" } else { "error" };
-        state
-            .supabase
-            .update_command(&token, &cmd.id, status, Some(result))
-            .await
-            .ok();
+    for cmd in state.supabase.fetch_pending_commands(&token, &rid).await? {
+        process_command(state, &cmd.id, &cmd.kind, &cmd.payload).await.ok();
     }
+    for pending in state.supabase.fetch_pending_chat(&token, &rid).await? {
+        crate::chat::process(state, pending).await.ok();
+    }
+    Ok(())
+}
+
+/// Claim + execute a single command. Safe to call from both the Realtime
+/// handler and the fallback poll — only the caller that wins the claim runs it.
+pub async fn process_command(
+    state: &Arc<AppState>,
+    id: &str,
+    kind: &str,
+    payload: &Value,
+) -> Result<()> {
+    let token = ensure_token(state).await?;
+    if !state.supabase.claim_command(&token, id).await? {
+        return Ok(());
+    }
+    let (ok, result) = execute(state, kind, payload).await;
+    let status = if ok { "done" } else { "error" };
+    state
+        .supabase
+        .update_command(&token, id, status, Some(result))
+        .await
+        .ok();
     Ok(())
 }
 

@@ -8,8 +8,10 @@
 //! The worker loops (telemetry, commands, reconcile) are identical across GUI
 //! and service modes; only the shell differs.
 
+mod chat;
 mod config;
 mod monitor;
+mod realtime;
 pub mod runtime;
 mod settings;
 mod status;

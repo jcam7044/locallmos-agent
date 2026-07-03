@@ -18,14 +18,22 @@
 //! A mid-stream socket drop is not retried for the *current* turn; that would
 //! need per-turn resumable streaming (out of scope for v1).
 
+use crate::runtime::ollama::ChatDelta;
 use crate::supabase::ChatPending;
 use crate::AppState;
 use anyhow::{anyhow, Result};
+use base64::Engine;
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Notify;
+
+/// A streamed delta batched by the broadcaster into a `token`/`thinking` event.
+enum StreamDelta {
+    Content(String),
+    Thinking(String),
+}
 
 /// Broadcast event name on the `chat:{id}` channel (mirrors CHAT_STREAM_EVENT
 /// in packages/shared/src/chat.ts).
@@ -56,22 +64,46 @@ pub async fn process(state: &Arc<AppState>, pending: ChatPending) -> Result<()> 
             let msg = "no model specified for chat turn";
             state
                 .supabase
-                .update_chat_message(&token, &pending.id, "error", None, Some(msg))
+                .update_chat_message(&token, &pending.id, "error", None, None, Some(msg))
                 .await
                 .ok();
             return Err(anyhow!(msg));
         }
     };
 
-    // Build the Ollama chat history from prior completed messages.
+    // Build the Ollama chat history from prior completed messages, folding in
+    // attachments: images become per-message base64 `images`; documents have
+    // their extracted text appended to the message content.
     let context = state
         .supabase
         .fetch_chat_context(&token, &pending.conversation_id)
         .await?;
-    let messages: Vec<Value> = context
-        .iter()
-        .map(|m| json!({ "role": m.role, "content": m.content }))
-        .collect();
+    let mut messages: Vec<Value> = Vec::with_capacity(context.len());
+    for m in &context {
+        let mut content = m.content.clone();
+        let mut images: Vec<String> = Vec::new();
+        for a in &m.attachments {
+            match a.kind.as_str() {
+                "image" => match state.supabase.download_attachment(&token, &a.storage_path).await {
+                    Ok(bytes) => {
+                        images.push(base64::engine::general_purpose::STANDARD.encode(bytes))
+                    }
+                    Err(e) => tracing::warn!("chat {}: image download failed: {e}", pending.id),
+                },
+                "document" => {
+                    if let Some(text) = a.extracted_text.as_deref().filter(|t| !t.is_empty()) {
+                        content.push_str(&format!("\n\n[Attached file]\n{text}"));
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut obj = json!({ "role": m.role, "content": content });
+        if !images.is_empty() {
+            obj["images"] = json!(images);
+        }
+        messages.push(obj);
+    }
 
     // Join the private broadcast channel over the websocket. If the socket is
     // down we still generate + persist the reply, just without live streaming.
@@ -81,46 +113,53 @@ pub async fn process(state: &Arc<AppState>, pending: ChatPending) -> Result<()> 
         tracing::warn!("chat {}: realtime unavailable, streaming disabled", pending.id);
     }
 
-    // Async broadcaster: batches deltas from the sync stream callback.
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    // Async broadcaster: batches content + thinking deltas from the sync stream
+    // callback into `token`/`thinking` events on the shared channel.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<StreamDelta>();
     let broadcaster = {
         let state = state.clone();
         let chan = chan.clone();
         tokio::spawn(async move {
             let mut seq: u64 = 0;
-            let mut buf = String::new();
+            let mut content = String::new();
+            let mut thinking = String::new();
             let mut ticker = tokio::time::interval(FLUSH_INTERVAL);
             ticker.tick().await; // consume immediate first tick
-            let flush = |seq: &mut u64, buf: &mut String| {
-                let payload = json!({ "type": "token", "seq": *seq, "delta": buf.as_str() });
-                *seq += 1;
-                payload
-            };
+
+            // Flush a non-empty buffer as a typed event, bumping the shared seq.
+            macro_rules! emit {
+                ($ty:expr, $buf:expr) => {{
+                    if !$buf.is_empty() {
+                        let payload = json!({ "type": $ty, "seq": seq, "delta": $buf.as_str() });
+                        seq += 1;
+                        if ws_ready {
+                            state.realtime.broadcast(&chan, CHAT_EVENT, payload).await.ok();
+                        }
+                        $buf.clear();
+                    }
+                }};
+            }
+
             loop {
                 tokio::select! {
                     maybe = rx.recv() => match maybe {
-                        Some(delta) => {
-                            buf.push_str(&delta);
-                            if buf.len() >= FLUSH_CHARS {
-                                let p = flush(&mut seq, &mut buf);
-                                if ws_ready { state.realtime.broadcast(&chan, CHAT_EVENT, p).await.ok(); }
-                                buf.clear();
-                            }
+                        Some(StreamDelta::Content(d)) => {
+                            content.push_str(&d);
+                            if content.len() >= FLUSH_CHARS { emit!("token", content); }
+                        }
+                        Some(StreamDelta::Thinking(d)) => {
+                            thinking.push_str(&d);
+                            if thinking.len() >= FLUSH_CHARS { emit!("thinking", thinking); }
                         }
                         None => {
-                            if !buf.is_empty() {
-                                let p = flush(&mut seq, &mut buf);
-                                if ws_ready { state.realtime.broadcast(&chan, CHAT_EVENT, p).await.ok(); }
-                            }
+                            emit!("thinking", thinking);
+                            emit!("token", content);
                             break;
                         }
                     },
                     _ = ticker.tick() => {
-                        if !buf.is_empty() {
-                            let p = flush(&mut seq, &mut buf);
-                            if ws_ready { state.realtime.broadcast(&chan, CHAT_EVENT, p).await.ok(); }
-                            buf.clear();
-                        }
+                        emit!("thinking", thinking);
+                        emit!("token", content);
                     }
                 }
             }
@@ -163,11 +202,14 @@ pub async fn process(state: &Arc<AppState>, pending: ChatPending) -> Result<()> 
         let tx = tx.clone();
         state
             .ollama
-            .chat_stream(&model, Value::Array(messages), cancel, move |delta| {
+            .chat_stream(&model, Value::Array(messages), pending.think, cancel, move |delta| {
                 if !first_token.swap(true, Ordering::Relaxed) {
-                    stop_loading.notify_one(); // first token → drop the loading state
+                    stop_loading.notify_one(); // first delta (thinking or content) → drop loading
                 }
-                let _ = tx.send(delta.to_string());
+                let _ = match delta {
+                    ChatDelta::Content(s) => tx.send(StreamDelta::Content(s.to_string())),
+                    ChatDelta::Thinking(s) => tx.send(StreamDelta::Thinking(s.to_string())),
+                };
             })
             .await
     };
@@ -181,7 +223,7 @@ pub async fn process(state: &Arc<AppState>, pending: ChatPending) -> Result<()> 
     let last_seq = broadcaster.await.unwrap_or(0);
 
     let outcome = match result {
-        Ok(full) => {
+        Ok(out) => {
             if ws_ready {
                 state
                     .realtime
@@ -189,9 +231,10 @@ pub async fn process(state: &Arc<AppState>, pending: ChatPending) -> Result<()> 
                     .await
                     .ok();
             }
+            let thinking = (!out.thinking.is_empty()).then_some(out.thinking.as_str());
             state
                 .supabase
-                .update_chat_message(&token, &pending.id, "done", Some(&full), None)
+                .update_chat_message(&token, &pending.id, "done", Some(&out.content), thinking, None)
                 .await?;
             Ok(())
         }
@@ -210,7 +253,7 @@ pub async fn process(state: &Arc<AppState>, pending: ChatPending) -> Result<()> 
             }
             state
                 .supabase
-                .update_chat_message(&token, &pending.id, "error", None, Some(&msg))
+                .update_chat_message(&token, &pending.id, "error", None, None, Some(&msg))
                 .await
                 .ok();
             Err(e)

@@ -13,6 +13,8 @@ pub struct ModelInfo {
     pub size_bytes: Option<u64>,
     pub quantization: Option<String>,
     pub loaded: bool,
+    /// Ollama model capabilities (e.g. "vision", "thinking", "tools").
+    pub capabilities: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]

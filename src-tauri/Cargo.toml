@@ -24,6 +24,7 @@ futures-util = "0.3"
 sysinfo = "0.32"
 nvml-wrapper = "0.10"
 chrono = { version = "0.4", features = ["serde"] }
+base64 = "0.22"
 anyhow = "1"
 thiserror = "2"
 dirs = "5"

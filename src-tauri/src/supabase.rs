@@ -59,13 +59,27 @@ pub struct ChatPending {
     pub conversation_id: String,
     #[serde(default)]
     pub model: Option<String>,
+    /// Whether the turn requested reasoning output (reasoning models only).
+    #[serde(default)]
+    pub think: bool,
 }
 
-/// A prior message used as chat context.
+/// A file attached to a chat message (embedded via PostgREST).
+#[derive(Deserialize, Clone)]
+pub struct ChatAttachment {
+    pub kind: String,
+    pub storage_path: String,
+    #[serde(default)]
+    pub extracted_text: Option<String>,
+}
+
+/// A prior message used as chat context, with any attachments it carried.
 #[derive(Deserialize, Clone)]
 pub struct ChatContextMsg {
     pub role: String,
     pub content: String,
+    #[serde(default, rename = "chat_attachments")]
+    pub attachments: Vec<ChatAttachment>,
 }
 
 pub struct Supabase {
@@ -241,6 +255,7 @@ impl Supabase {
                     "size_bytes": m.size_bytes,
                     "quantization": m.quantization,
                     "loaded": m.loaded,
+                    "capabilities": m.capabilities,
                 })
             })
             .collect();
@@ -357,7 +372,7 @@ impl Supabase {
         let resp = self
             .auth(
                 self.http.get(format!(
-                    "{}/chat_messages?rig_id=eq.{rig_id}&status=eq.pending&role=eq.assistant&select=id,conversation_id,model&order=created_at.asc",
+                    "{}/chat_messages?rig_id=eq.{rig_id}&status=eq.pending&role=eq.assistant&select=id,conversation_id,model,think&order=created_at.asc",
                     self.rest
                 )),
                 token,
@@ -376,7 +391,7 @@ impl Supabase {
         let resp = self
             .auth(
                 self.http.get(format!(
-                    "{}/chat_messages?conversation_id=eq.{conversation_id}&status=eq.done&select=role,content&order=created_at.asc",
+                    "{}/chat_messages?conversation_id=eq.{conversation_id}&status=eq.done&select=role,content,chat_attachments(kind,storage_path,extracted_text)&order=created_at.asc",
                     self.rest
                 )),
                 token,
@@ -386,17 +401,38 @@ impl Supabase {
         Ok(resp.json().await?)
     }
 
+    /// Download an attachment's bytes from the private Storage bucket. Storage
+    /// RLS authorizes the device via `device_serves_conversation` (see 0019).
+    pub async fn download_attachment(&self, token: &str, storage_path: &str) -> Result<Vec<u8>> {
+        let url = format!(
+            "{}/storage/v1/object/chat-attachments/{}",
+            self.base, storage_path
+        );
+        let resp = self.auth(self.http.get(url), token).send().await?;
+        if !resp.status().is_success() {
+            return Err(anyhow!(
+                "download_attachment failed: HTTP {}",
+                resp.status()
+            ));
+        }
+        Ok(resp.bytes().await?.to_vec())
+    }
+
     pub async fn update_chat_message(
         &self,
         token: &str,
         id: &str,
         status: &str,
         content: Option<&str>,
+        thinking: Option<&str>,
         error: Option<&str>,
     ) -> Result<()> {
         let mut body = json!({ "status": status });
         if let Some(c) = content {
             body["content"] = json!(c);
+        }
+        if let Some(t) = thinking {
+            body["thinking"] = json!(t);
         }
         if let Some(e) = error {
             body["error"] = json!(e);

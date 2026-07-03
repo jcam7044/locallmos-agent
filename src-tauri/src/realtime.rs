@@ -284,6 +284,7 @@ async fn handle_change(state: &Arc<AppState>, v: &Value) {
                     .unwrap_or("")
                     .to_string(),
                 model: record.get("model").and_then(Value::as_str).map(str::to_string),
+                think: record.get("think").and_then(Value::as_bool).unwrap_or(false),
             };
             if pending.id.is_empty() {
                 return;

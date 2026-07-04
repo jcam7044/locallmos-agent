@@ -7,7 +7,9 @@ Wants=network-online.target
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/locallmos-agent service
-Restart=on-failure
+# `always` (not on-failure): self-update exits cleanly (code 0) after swapping
+# the binary and relies on this restart to relaunch on the new version.
+Restart=always
 RestartSec=5
 
 # Rig credentials live here (shared with `enroll`); Supabase settings are read

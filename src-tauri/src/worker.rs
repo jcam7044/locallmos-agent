@@ -112,12 +112,47 @@ async fn set_error(state: &Arc<AppState>, err: impl std::fmt::Display) {
 /// Spawn all background loops. Called once from the Tauri setup hook. Uses
 /// Tauri's async runtime so the tasks run inside its Tokio context.
 pub fn spawn_loops(state: Arc<AppState>) {
+    // A freshly started process is never mid-update, so clear any 'installing'
+    // status the previous (pre-restart) process left behind. Runs once, before
+    // the auto-update loop's initial delay, so it can't race a real update.
+    tauri::async_runtime::spawn(clear_update_status(state.clone()));
     tauri::async_runtime::spawn(telemetry_loop(state.clone()));
     tauri::async_runtime::spawn(reconcile_loop(state.clone()));
     // Commands + chat arrive instantly over Realtime; the fallback poll is a
     // safety net for reconnects / missed events.
     tauri::async_runtime::spawn(fallback_loop(state.clone()));
+    tauri::async_runtime::spawn(update_loop(state.clone()));
     tauri::async_runtime::spawn(crate::realtime::run(state));
+}
+
+/// One-shot: settle `update_status` back to `idle` after a restart.
+async fn clear_update_status(state: Arc<AppState>) {
+    if rig_id(&state).await.is_none() {
+        return;
+    }
+    if let (Ok(token), Some(rid)) = (ensure_token(&state).await, rig_id(&state).await) {
+        state
+            .supabase
+            .set_update_status(&token, &rid, "idle", None)
+            .await
+            .ok();
+    }
+}
+
+/// Opt-in auto-update poll. Delayed at startup so it doesn't compete with
+/// enrollment / the first heartbeat; the work itself no-ops unless the owner
+/// enabled `auto_update` for this rig.
+async fn update_loop(state: Arc<AppState>) {
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    let period = Duration::from_secs(state.settings.update_check_secs);
+    loop {
+        if rig_id(&state).await.is_some() {
+            if let Err(e) = crate::updater::check_and_auto_update(&state).await {
+                tracing::debug!("auto-update check: {e}");
+            }
+        }
+        tokio::time::sleep(period).await;
+    }
 }
 
 async fn telemetry_loop(state: Arc<AppState>) {
@@ -246,6 +281,7 @@ async fn execute(state: &Arc<AppState>, kind: &str, payload: &Value) -> (bool, V
             reboot(delay).map(|_| json!({ "scheduled": true }))
         }
         "run_shell" => run_shell(payload),
+        "update_agent" => crate::updater::apply(state, payload).await,
         other => Err(anyhow!("unknown command type: {other}")),
     };
 

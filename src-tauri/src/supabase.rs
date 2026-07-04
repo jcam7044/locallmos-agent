@@ -52,6 +52,34 @@ pub struct DesiredState {
     pub desired_runtime_state: Option<String>,
 }
 
+/// A published agent release. `artifacts` is a `{ "os-arch": { url, sha256, sig } }`
+/// map — the agent picks the entry matching its own platform.
+#[derive(Deserialize, Clone)]
+pub struct ReleaseRow {
+    pub version: String,
+    #[serde(default)]
+    pub artifacts: Value,
+}
+
+/// A single platform artifact within a release.
+#[derive(Deserialize, Clone)]
+pub struct ReleaseArtifact {
+    pub url: String,
+    pub sha256: String,
+    pub sig: String,
+}
+
+/// Owner-set auto-update preferences for a rig.
+#[derive(Deserialize, Default, Clone)]
+pub struct UpdatePrefs {
+    #[serde(default)]
+    pub auto_update: bool,
+    #[serde(default)]
+    pub update_channel: Option<String>,
+    #[serde(default)]
+    pub target_agent_version: Option<String>,
+}
+
 /// A pending assistant turn the agent must fulfil.
 #[derive(Deserialize, Clone)]
 pub struct ChatPending {
@@ -287,6 +315,87 @@ impl Supabase {
             .await?;
         let rows: Vec<DesiredState> = resp.json().await?;
         Ok(rows.into_iter().next().unwrap_or_default())
+    }
+
+    // ---- self-update ----------------------------------------------------
+    /// The newest non-yanked release on a channel (via the `latest_agent_release`
+    /// view). `None` when the channel has no releases yet.
+    pub async fn fetch_latest_release(
+        &self,
+        token: &str,
+        channel: &str,
+    ) -> Result<Option<ReleaseRow>> {
+        let resp = self
+            .auth(
+                self.http.get(format!(
+                    "{}/latest_agent_release?channel=eq.{channel}&select=version,artifacts",
+                    self.rest
+                )),
+                token,
+            )
+            .send()
+            .await?;
+        let rows: Vec<ReleaseRow> = resp.json().await?;
+        Ok(rows.into_iter().next())
+    }
+
+    /// A specific release by channel + version (for a pinned/manual update).
+    pub async fn fetch_release(
+        &self,
+        token: &str,
+        channel: &str,
+        version: &str,
+    ) -> Result<Option<ReleaseRow>> {
+        let resp = self
+            .auth(
+                self.http.get(format!(
+                    "{}/agent_releases?channel=eq.{channel}&version=eq.{version}&yanked=is.false&select=version,artifacts",
+                    self.rest
+                )),
+                token,
+            )
+            .send()
+            .await?;
+        let rows: Vec<ReleaseRow> = resp.json().await?;
+        Ok(rows.into_iter().next())
+    }
+
+    /// This rig's owner-set auto-update preferences.
+    pub async fn fetch_update_prefs(&self, token: &str, rig_id: &str) -> Result<UpdatePrefs> {
+        let resp = self
+            .auth(
+                self.http.get(format!(
+                    "{}/rigs?id=eq.{rig_id}&select=auto_update,update_channel,target_agent_version",
+                    self.rest
+                )),
+                token,
+            )
+            .send()
+            .await?;
+        let rows: Vec<UpdatePrefs> = resp.json().await?;
+        Ok(rows.into_iter().next().unwrap_or_default())
+    }
+
+    /// Report update progress back to the rig row (`update_status`/`update_error`).
+    /// These are device-writable facts (see the rigs_device_scope_guard trigger).
+    pub async fn set_update_status(
+        &self,
+        token: &str,
+        rig_id: &str,
+        status: &str,
+        error: Option<&str>,
+    ) -> Result<()> {
+        let resp = self
+            .auth(
+                self.http
+                    .patch(format!("{}/rigs?id=eq.{rig_id}", self.rest)),
+                token,
+            )
+            .header("Prefer", "return=minimal")
+            .json(&json!({ "update_status": status, "update_error": error }))
+            .send()
+            .await?;
+        ensure_ok(resp, "set_update_status").await
     }
 
     pub async fn fetch_pending_commands(

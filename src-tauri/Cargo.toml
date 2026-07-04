@@ -28,6 +28,12 @@ base64 = "0.22"
 anyhow = "1"
 thiserror = "2"
 dirs = "5"
+# Self-update: verify the release artifact then atomically swap our own binary.
+sha2 = "0.10"
+minisign-verify = "0.2"
+self-replace = "1"
+semver = "1"
+hex = "0.4"
 dotenvy = "0.15"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

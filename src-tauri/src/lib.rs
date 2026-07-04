@@ -16,6 +16,7 @@ pub mod runtime;
 mod settings;
 mod status;
 mod supabase;
+mod updater;
 mod worker;
 
 use std::collections::HashMap;

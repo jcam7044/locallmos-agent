@@ -11,6 +11,8 @@ pub struct Settings {
     pub command_poll_secs: u64,
     /// How often the reconciler drives toward desired state.
     pub reconcile_secs: u64,
+    /// How often to check for a newer agent release (opt-in auto-update).
+    pub update_check_secs: u64,
 }
 
 impl Settings {
@@ -24,6 +26,7 @@ impl Settings {
             telemetry_interval_secs: env_u64("LOCALLMOS_TELEMETRY_SECS", 10),
             command_poll_secs: env_u64("LOCALLMOS_COMMAND_POLL_SECS", 3),
             reconcile_secs: env_u64("LOCALLMOS_RECONCILE_SECS", 20),
+            update_check_secs: env_u64("LOCALLMOS_UPDATE_CHECK_SECS", 3600),
         }
     }
 }

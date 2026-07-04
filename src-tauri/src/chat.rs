@@ -64,7 +64,7 @@ pub async fn process(state: &Arc<AppState>, pending: ChatPending) -> Result<()> 
             let msg = "no model specified for chat turn";
             state
                 .supabase
-                .update_chat_message(&token, &pending.id, "error", None, None, Some(msg))
+                .update_chat_message(&token, &pending.id, "error", None, None, Some(msg), None, None)
                 .await
                 .ok();
             return Err(anyhow!(msg));
@@ -234,7 +234,16 @@ pub async fn process(state: &Arc<AppState>, pending: ChatPending) -> Result<()> 
             let thinking = (!out.thinking.is_empty()).then_some(out.thinking.as_str());
             state
                 .supabase
-                .update_chat_message(&token, &pending.id, "done", Some(&out.content), thinking, None)
+                .update_chat_message(
+                    &token,
+                    &pending.id,
+                    "done",
+                    Some(&out.content),
+                    thinking,
+                    None,
+                    out.prompt_tokens,
+                    out.completion_tokens,
+                )
                 .await?;
             Ok(())
         }
@@ -253,7 +262,7 @@ pub async fn process(state: &Arc<AppState>, pending: ChatPending) -> Result<()> 
             }
             state
                 .supabase
-                .update_chat_message(&token, &pending.id, "error", None, None, Some(&msg))
+                .update_chat_message(&token, &pending.id, "error", None, None, Some(&msg), None, None)
                 .await
                 .ok();
             Err(e)

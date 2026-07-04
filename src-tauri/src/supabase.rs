@@ -418,6 +418,7 @@ impl Supabase {
         Ok(resp.bytes().await?.to_vec())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn update_chat_message(
         &self,
         token: &str,
@@ -426,6 +427,8 @@ impl Supabase {
         content: Option<&str>,
         thinking: Option<&str>,
         error: Option<&str>,
+        prompt_tokens: Option<u32>,
+        completion_tokens: Option<u32>,
     ) -> Result<()> {
         let mut body = json!({ "status": status });
         if let Some(c) = content {
@@ -436,6 +439,12 @@ impl Supabase {
         }
         if let Some(e) = error {
             body["error"] = json!(e);
+        }
+        if let Some(p) = prompt_tokens {
+            body["prompt_tokens"] = json!(p);
+        }
+        if let Some(c) = completion_tokens {
+            body["completion_tokens"] = json!(c);
         }
         let resp = self
             .auth(

@@ -193,7 +193,12 @@ impl OllamaAdapter {
             // Stop-generation: return what we have so far. Dropping the response
             // stream closes the connection, which halts Ollama's generation.
             if cancel.load(Ordering::Relaxed) {
-                return Ok(ChatOutput { content, thinking });
+                return Ok(ChatOutput {
+                    content,
+                    thinking,
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                });
             }
             buf.extend_from_slice(&chunk?);
             while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
@@ -225,11 +230,27 @@ impl OllamaAdapter {
                     }
                 }
                 if v.get("done").and_then(|d| d.as_bool()).unwrap_or(false) {
-                    return Ok(ChatOutput { content, thinking });
+                    let prompt_tokens = v
+                        .get("prompt_eval_count")
+                        .and_then(|n| n.as_u64())
+                        .map(|n| n as u32);
+                    let completion_tokens =
+                        v.get("eval_count").and_then(|n| n.as_u64()).map(|n| n as u32);
+                    return Ok(ChatOutput {
+                        content,
+                        thinking,
+                        prompt_tokens,
+                        completion_tokens,
+                    });
                 }
             }
         }
-        Ok(ChatOutput { content, thinking })
+        Ok(ChatOutput {
+            content,
+            thinking,
+            prompt_tokens: None,
+            completion_tokens: None,
+        })
     }
 }
 
@@ -243,6 +264,10 @@ pub enum ChatDelta<'a> {
 pub struct ChatOutput {
     pub content: String,
     pub thinking: String,
+    /// Ollama token counts from the final `done` line; `None` if the turn was
+    /// cancelled or the stream ended without one.
+    pub prompt_tokens: Option<u32>,
+    pub completion_tokens: Option<u32>,
 }
 
 impl RuntimeAdapter for OllamaAdapter {

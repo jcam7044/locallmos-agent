@@ -12,7 +12,7 @@
 set -euo pipefail
 
 # ---- defaults (override via flags or env) ---------------------------------
-REPO="${LOCALLMOS_REPO:-your-org/locallmos}"     # GitHub owner/repo hosting releases
+REPO="${LOCALLMOS_REPO:-jcam7044/locallmos}"     # GitHub owner/repo hosting releases
 CHANNEL="${LOCALLMOS_CHANNEL:-stable}"
 VERSION="latest"                                  # or an explicit vX.Y.Z tag
 NAME="$(hostname 2>/dev/null || echo my-rig)"
@@ -22,7 +22,7 @@ ANON_KEY="${LOCALLMOS_SUPABASE_ANON_KEY:-}"
 
 # minisign public key matching release CI's signing key. Keep in sync with
 # RELEASE_PUBLIC_KEY in apps/agent/src-tauri/src/updater.rs.
-PUBKEY="RWQ0000000000000000000000000000000000000000000000000000000000000000000000000000"
+PUBKEY="RWR+94+uka+PJB5Wbmak5GN2J+eZjIgoj3PGFH4dAoqhBuCfIFjBy6u7"
 
 CONFIG_DIR="/etc/locallmos-agent"
 BIN_DST="/usr/local/bin/locallmos-agent"

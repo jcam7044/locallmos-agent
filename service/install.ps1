@@ -11,7 +11,7 @@
 # cleanly) comes back up on the new binary without a reboot.
 
 param(
-  [string]$Repo        = $(if ($env:LOCALLMOS_REPO) { $env:LOCALLMOS_REPO } else { "your-org/locallmos" }),
+  [string]$Repo        = $(if ($env:LOCALLMOS_REPO) { $env:LOCALLMOS_REPO } else { "jcam7044/locallmos" }),
   [string]$Channel     = "stable",
   [string]$Version     = "latest",
   [string]$Name        = $env:COMPUTERNAME,

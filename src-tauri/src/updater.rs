@@ -20,9 +20,8 @@ use std::time::Duration;
 /// downloaded binary must carry a valid signature from this key before we run
 /// it — this is what makes swapping a privileged binary safe.
 ///
-/// TODO(release): replace with the real key printed by `minisign -G`.
 const RELEASE_PUBLIC_KEY: &str =
-    "RWQ0000000000000000000000000000000000000000000000000000000000000000000000000000";
+    "RWR+94+uka+PJB5Wbmak5GN2J+eZjIgoj3PGFH4dAoqhBuCfIFjBy6u7";
 
 /// "{os}-{arch}" — matches Rust's std::env::consts and the keys CI writes into
 /// `agent_releases.artifacts` (e.g. "linux-x86_64", "macos-aarch64").

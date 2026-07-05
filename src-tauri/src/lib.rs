@@ -131,7 +131,7 @@ fn init_tracing() {
 
 fn print_help() {
     println!(
-        "LocalLMOS agent\n\n\
+        "LocaLLMOS agent\n\n\
          USAGE:\n  \
          locallmos-agent                       launch the tray GUI\n  \
          locallmos-agent service               run headless (for systemd/launchd)\n  \

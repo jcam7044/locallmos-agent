@@ -178,3 +178,12 @@ else
   sudo launchctl load -w /Library/LaunchDaemons/os.locallmos.agent.plist
   echo "==> Done. Logs: tail -f /var/log/locallmos-agent.log"
 fi
+
+# ---- runtime check ---------------------------------------------------------
+if ! command -v ollama >/dev/null 2>&1; then
+  echo
+  echo "!! Ollama was not detected on this machine."
+  echo "   LocalLMOS uses Ollama to run models locally. Install it with:"
+  echo "     curl -fsSL https://ollama.com/install.sh | sh"
+  echo "   Then pull a model, e.g.:  ollama pull llama3.2"
+fi

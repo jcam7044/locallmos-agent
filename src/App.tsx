@@ -82,7 +82,7 @@ export function App() {
       {!status?.enrolled ? (
         <div style={{ ...card, marginTop: 16 }}>
           <p style={{ ...label, marginTop: 0 }}>
-            Enter the pairing code from your LocalLMOS dashboard.
+            Enter the pairing code from your LocaLLMOS dashboard.
           </p>
           <input
             placeholder="Rig name (e.g. Basement 3090)"
@@ -128,6 +128,17 @@ export function App() {
               />
             ))
           )}
+        </div>
+      )}
+
+      {status?.enrolled && status.runtimeState && status.runtimeState !== "running" && (
+        <div style={{ ...card, marginTop: 12, borderColor: "#78350f", background: "#1c1408" }}>
+          <strong style={{ color: "#fbbf24" }}>⚠ Ollama not detected</strong>
+          <p style={{ ...label, marginTop: 6 }}>
+            LocalLMOS needs Ollama running to load models. Install it from{" "}
+            <span style={{ fontFamily: "monospace", color: "#e2e8f0" }}>ollama.com/download</span>,
+            then pull a model (e.g. <span style={{ fontFamily: "monospace" }}>ollama pull llama3.2</span>).
+          </p>
         </div>
       )}
 

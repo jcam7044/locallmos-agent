@@ -87,3 +87,12 @@ Register-ScheduledTask -TaskName "LocalLMOS Agent" -Action $action -Trigger $tri
 Start-ScheduledTask -TaskName "LocalLMOS Agent"
 
 Write-Host "==> Done. The agent is running and will start at boot."
+
+# ---- runtime check ---------------------------------------------------------
+if (-not (Get-Command ollama -ErrorAction SilentlyContinue)) {
+  Write-Host ""
+  Write-Host "!! Ollama was not detected on this machine."
+  Write-Host "   LocalLMOS uses Ollama to run models locally. Install it from:"
+  Write-Host "     https://ollama.com/download   (or: winget install Ollama.Ollama)"
+  Write-Host "   Then pull a model, e.g.:  ollama pull llama3.2"
+}

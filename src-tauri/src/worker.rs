@@ -336,16 +336,39 @@ async fn reconcile_tick(state: &Arc<AppState>) -> Result<()> {
 // privileges; failures are reported back rather than panicking.
 // ---------------------------------------------------------------------------
 
-/// Restart a system service by name (best-effort, platform-specific).
+/// Restart a local runtime by name (best-effort, platform-specific). Only Linux
+/// runs Ollama as a managed service (`systemctl`). On macOS and Windows Ollama is
+/// normally a per-user desktop app, not a service, so we try a real service first
+/// (e.g. one set up via Homebrew or NSSM) and otherwise bounce the app itself. A
+/// headless root/SYSTEM daemon can't perfectly drive a user-session GUI app, so
+/// callers treat a failure here as advisory rather than fatal.
 pub async fn restart_service(name: &str) -> Result<()> {
-    let (program, args): (&str, Vec<String>) = if cfg!(target_os = "windows") {
-        ("powershell", vec!["-Command".into(), format!("Restart-Service {name}")])
+    if cfg!(target_os = "windows") {
+        // No Ollama Windows service exists by default; try one anyway (NSSM or a
+        // custom install), then fall back to bouncing the tray app, which is what
+        // supervises `ollama serve`.
+        if run_os(
+            "powershell",
+            &["-Command".into(), format!("Restart-Service {name} -ErrorAction Stop")],
+        )
+        .is_ok()
+        {
+            return Ok(());
+        }
+        let _ = run_os("taskkill", &["/F".into(), "/IM".into(), "ollama app.exe".into()]);
+        let _ = run_os("taskkill", &["/F".into(), "/IM".into(), "ollama.exe".into()]);
+        run_os("powershell", &["-Command".into(), "Start-Process 'ollama app.exe'".into()])
     } else if cfg!(target_os = "macos") {
-        ("brew", vec!["services".into(), "restart".into(), name.into()])
+        // Homebrew service when installed via brew; otherwise bounce the official
+        // .app — `open -a` (re)launches it, which starts its bundled server.
+        if run_os("brew", &["services".into(), "restart".into(), name.into()]).is_ok() {
+            return Ok(());
+        }
+        let _ = run_os("killall", &["Ollama".into()]);
+        run_os("open", &["-a".into(), "Ollama".into()])
     } else {
-        ("systemctl", vec!["restart".into(), name.into()])
-    };
-    run_os(program, &args)
+        run_os("systemctl", &["restart".into(), name.into()])
+    }
 }
 
 fn reboot(delay_seconds: u64) -> Result<()> {

@@ -56,6 +56,13 @@ esac
 PLATFORM="$OS-$ARCH"
 ASSET="locallmos-agent-$PLATFORM"
 
+# Reject targets CI doesn't publish yet, so users get a clear message instead of
+# a confusing 404 on download. Keep in sync with the release.yml build matrix.
+case "$PLATFORM" in
+  linux-x86_64|macos-x86_64|macos-aarch64) ;;
+  *) echo "no prebuilt agent for $PLATFORM yet — see the release matrix." >&2; exit 1 ;;
+esac
+
 # GitHub's /releases/latest/download/<asset> redirects to the newest release's
 # asset, so we need no API token or jq. A pinned version uses the tag path.
 if [ "$VERSION" = "latest" ]; then
@@ -183,7 +190,12 @@ fi
 if ! command -v ollama >/dev/null 2>&1; then
   echo
   echo "!! Ollama was not detected on this machine."
-  echo "   LocalLMOS uses Ollama to run models locally. Install it with:"
-  echo "     curl -fsSL https://ollama.com/install.sh | sh"
+  echo "   LocalLMOS uses Ollama to run models locally. Install it:"
+  if [ "$OS" = "macos" ]; then
+    echo "     Download the app from https://ollama.com/download"
+    echo "     (or, with Homebrew:  brew install ollama)"
+  else
+    echo "     curl -fsSL https://ollama.com/install.sh | sh"
+  fi
   echo "   Then pull a model, e.g.:  ollama pull llama3.2"
 fi

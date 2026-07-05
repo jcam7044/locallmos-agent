@@ -23,6 +23,11 @@ param(
 $ErrorActionPreference = "Stop"
 
 $arch = if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { "aarch64" } else { "x86_64" }
+# CI only publishes a windows-x86_64 build today; fail clearly on ARM64 rather
+# than 404 on download. Keep in sync with the release.yml build matrix.
+if ($arch -ne "x86_64") {
+  throw "No prebuilt agent for Windows $arch yet (only x86_64 is published)."
+}
 $asset = "locallmos-agent-windows-$arch.exe"
 $base = if ($Version -eq "latest") {
   "https://github.com/$Repo/releases/latest/download"

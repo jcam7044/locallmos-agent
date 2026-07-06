@@ -46,6 +46,8 @@ pub struct AppState {
     pub realtime: Arc<realtime::RealtimeHandle>,
     /// In-flight chat turns → cancel flag, for stop-generation.
     pub cancels: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    /// Shared HTTP client, reused for the web_fetch tool (direct GET from the rig).
+    pub http: reqwest::Client,
 }
 
 fn build_state() -> Arc<AppState> {
@@ -79,6 +81,7 @@ fn build_state() -> Arc<AppState> {
         monitor: Mutex::new(Monitor::new()),
         realtime: Arc::new(realtime::RealtimeHandle::new()),
         cancels: Mutex::new(HashMap::new()),
+        http,
     })
 }
 

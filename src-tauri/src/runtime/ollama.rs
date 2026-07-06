@@ -117,6 +117,12 @@ impl OllamaAdapter {
         &self.base
     }
 
+    /// Whether `model` advertises tool-calling support (per its `/api/show`
+    /// capabilities). Used to decide whether to advertise tools for a turn.
+    pub async fn model_supports_tools(&self, model: &str) -> bool {
+        self.capabilities(model).await.iter().any(|c| c == "tools")
+    }
+
     async fn version(&self) -> Option<String> {
         let resp = self
             .http
@@ -160,6 +166,7 @@ impl OllamaAdapter {
         model: &str,
         messages: Value,
         think: bool,
+        tools: Option<&Value>,
         cancel: Arc<AtomicBool>,
         mut on_delta: F,
     ) -> Result<ChatOutput> {
@@ -171,6 +178,12 @@ impl OllamaAdapter {
         });
         if think {
             body["think"] = Value::Bool(true);
+        }
+        // Only advertise tools when the round has any — otherwise a plain chat.
+        if let Some(t) = tools {
+            if t.as_array().map(|a| !a.is_empty()).unwrap_or(false) {
+                body["tools"] = t.clone();
+            }
         }
         let resp = self
             .http
@@ -189,6 +202,7 @@ impl OllamaAdapter {
         let mut buf: Vec<u8> = Vec::new();
         let mut content = String::new();
         let mut thinking = String::new();
+        let mut tool_calls: Vec<ToolCall> = Vec::new();
         while let Some(chunk) = stream.next().await {
             // Stop-generation: return what we have so far. Dropping the response
             // stream closes the connection, which halts Ollama's generation.
@@ -198,6 +212,7 @@ impl OllamaAdapter {
                     thinking,
                     prompt_tokens: None,
                     completion_tokens: None,
+                    tool_calls,
                 });
             }
             buf.extend_from_slice(&chunk?);
@@ -211,6 +226,19 @@ impl OllamaAdapter {
                     continue;
                 };
                 let message = v.get("message");
+                // Tool calls arrive in the message (usually with empty content).
+                if let Some(calls) = message.and_then(|m| m.get("tool_calls")).and_then(|c| c.as_array()) {
+                    for call in calls {
+                        if let Some(func) = call.get("function") {
+                            if let Some(name) = func.get("name").and_then(|n| n.as_str()) {
+                                tool_calls.push(ToolCall {
+                                    name: name.to_string(),
+                                    arguments: func.get("arguments").cloned().unwrap_or(Value::Null),
+                                });
+                            }
+                        }
+                    }
+                }
                 if let Some(delta) = message
                     .and_then(|m| m.get("thinking"))
                     .and_then(|c| c.as_str())
@@ -241,6 +269,7 @@ impl OllamaAdapter {
                         thinking,
                         prompt_tokens,
                         completion_tokens,
+                        tool_calls,
                     });
                 }
             }
@@ -250,6 +279,7 @@ impl OllamaAdapter {
             thinking,
             prompt_tokens: None,
             completion_tokens: None,
+            tool_calls,
         })
     }
 }
@@ -260,6 +290,22 @@ pub enum ChatDelta<'a> {
     Thinking(&'a str),
 }
 
+/// A tool call the model requested during a round. `arguments` is Ollama's parsed
+/// argument object; `name` is the function name.
+#[derive(Clone, Debug)]
+pub struct ToolCall {
+    pub name: String,
+    pub arguments: Value,
+}
+
+impl ToolCall {
+    /// Rebuild the tool_call object to echo back in the assistant message that
+    /// precedes the tool results (Ollama request format).
+    pub fn to_request_value(&self) -> Value {
+        serde_json::json!({ "function": { "name": self.name, "arguments": self.arguments } })
+    }
+}
+
 /// The assembled result of a chat turn.
 pub struct ChatOutput {
     pub content: String,
@@ -268,6 +314,8 @@ pub struct ChatOutput {
     /// cancelled or the stream ended without one.
     pub prompt_tokens: Option<u32>,
     pub completion_tokens: Option<u32>,
+    /// Tool calls the model requested this round (empty when it answered directly).
+    pub tool_calls: Vec<ToolCall>,
 }
 
 impl RuntimeAdapter for OllamaAdapter {

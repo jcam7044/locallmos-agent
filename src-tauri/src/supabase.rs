@@ -90,6 +90,12 @@ pub struct ChatPending {
     /// Whether the turn requested reasoning output (reasoning models only).
     #[serde(default)]
     pub think: bool,
+    /// Enable the built-in web_search/web_fetch tools for this turn.
+    #[serde(default)]
+    pub web_search: bool,
+    /// Caller-supplied (passthrough) tool definitions, from the API.
+    #[serde(default)]
+    pub request_tools: Option<Value>,
 }
 
 /// A file attached to a chat message (embedded via PostgREST).
@@ -481,7 +487,7 @@ impl Supabase {
         let resp = self
             .auth(
                 self.http.get(format!(
-                    "{}/chat_messages?rig_id=eq.{rig_id}&status=eq.pending&role=eq.assistant&select=id,conversation_id,model,think&order=created_at.asc",
+                    "{}/chat_messages?rig_id=eq.{rig_id}&status=eq.pending&role=eq.assistant&select=id,conversation_id,model,think,web_search,request_tools&order=created_at.asc",
                     self.rest
                 )),
                 token,
@@ -528,6 +534,7 @@ impl Supabase {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub async fn update_chat_message(
         &self,
         token: &str,
@@ -538,6 +545,8 @@ impl Supabase {
         error: Option<&str>,
         prompt_tokens: Option<u32>,
         completion_tokens: Option<u32>,
+        tool_calls: Option<&Value>,
+        tool_activity: Option<&Value>,
     ) -> Result<()> {
         let mut body = json!({ "status": status });
         if let Some(c) = content {
@@ -555,6 +564,12 @@ impl Supabase {
         if let Some(c) = completion_tokens {
             body["completion_tokens"] = json!(c);
         }
+        if let Some(tc) = tool_calls {
+            body["tool_calls"] = tc.clone();
+        }
+        if let Some(ta) = tool_activity {
+            body["tool_activity"] = ta.clone();
+        }
         let resp = self
             .auth(
                 self.http
@@ -568,6 +583,57 @@ impl Supabase {
         ensure_ok(resp, "update_chat_message").await
     }
 
+    /// Run a web search via the cloud `web-search` edge function (keeps the
+    /// per-user Brave key out of the rig). Scoped to `message_id` so the function
+    /// can verify this rig serves the turn and resolve whose key to use.
+    pub async fn web_search(
+        &self,
+        token: &str,
+        message_id: &str,
+        query: &str,
+        count: u32,
+    ) -> Result<WebSearchOutcome> {
+        let resp = self
+            .auth(self.http.post(format!("{}/web-search", self.functions)), token)
+            .json(&json!({ "query": query, "messageId": message_id, "count": count }))
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(anyhow!("web-search failed: HTTP {}", resp.status()));
+        }
+        let v: Value = resp.json().await?;
+        if v.get("code").and_then(|c| c.as_str()) == Some("no_key") {
+            return Ok(WebSearchOutcome::NoKey);
+        }
+        let results = v
+            .get("results")
+            .and_then(|r| r.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .map(|r| WebResult {
+                        title: r.get("title").and_then(|s| s.as_str()).unwrap_or("").to_string(),
+                        url: r.get("url").and_then(|s| s.as_str()).unwrap_or("").to_string(),
+                        snippet: r.get("snippet").and_then(|s| s.as_str()).unwrap_or("").to_string(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(WebSearchOutcome::Results(results))
+    }
+}
+
+/// A single web result from the `web-search` edge function.
+#[derive(Clone, Debug)]
+pub struct WebResult {
+    pub title: String,
+    pub url: String,
+    pub snippet: String,
+}
+
+/// Outcome of a `web_search` call: results, or the owner has no key configured.
+pub enum WebSearchOutcome {
+    Results(Vec<WebResult>),
+    NoKey,
 }
 
 async fn ensure_ok(resp: reqwest::Response, ctx: &str) -> Result<()> {

@@ -18,8 +18,9 @@
 //! A mid-stream socket drop is not retried for the *current* turn; that would
 //! need per-turn resumable streaming (out of scope for v1).
 
-use crate::runtime::ollama::ChatDelta;
-use crate::supabase::ChatPending;
+use crate::runtime::ollama::{ChatDelta, ToolCall};
+use crate::runtime::tools;
+use crate::supabase::{ChatPending, WebSearchOutcome};
 use crate::AppState;
 use anyhow::{anyhow, Result};
 use base64::Engine;
@@ -29,10 +30,15 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Notify;
 
-/// A streamed delta batched by the broadcaster into a `token`/`thinking` event.
+/// A streamed delta batched by the broadcaster into a `token`/`thinking` event,
+/// or a discrete tool-progress event flushed immediately.
 enum StreamDelta {
     Content(String),
     Thinking(String),
+    /// A built-in tool is about to run (name + JSON-string arguments).
+    Tool(String, String),
+    /// A built-in tool finished (name + short human summary).
+    ToolResult(String, String),
 }
 
 /// Broadcast event name on the `chat:{id}` channel (mirrors CHAT_STREAM_EVENT
@@ -64,7 +70,7 @@ pub async fn process(state: &Arc<AppState>, pending: ChatPending) -> Result<()> 
             let msg = "no model specified for chat turn";
             state
                 .supabase
-                .update_chat_message(&token, &pending.id, "error", None, None, Some(msg), None, None)
+                .update_chat_message(&token, &pending.id, "error", None, None, Some(msg), None, None, None, None)
                 .await
                 .ok();
             return Err(anyhow!(msg));
@@ -140,6 +146,21 @@ pub async fn process(state: &Arc<AppState>, pending: ChatPending) -> Result<()> 
                 }};
             }
 
+            // Send a discrete typed tool event immediately, flushing any pending
+            // text first so ordering is preserved.
+            macro_rules! emit_tool {
+                ($payload:expr) => {{
+                    emit!("thinking", thinking);
+                    emit!("token", content);
+                    let mut p = $payload;
+                    p["seq"] = json!(seq);
+                    seq += 1;
+                    if ws_ready {
+                        state.realtime.broadcast(&chan, CHAT_EVENT, p).await.ok();
+                    }
+                }};
+            }
+
             loop {
                 tokio::select! {
                     maybe = rx.recv() => match maybe {
@@ -150,6 +171,12 @@ pub async fn process(state: &Arc<AppState>, pending: ChatPending) -> Result<()> 
                         Some(StreamDelta::Thinking(d)) => {
                             thinking.push_str(&d);
                             if thinking.len() >= FLUSH_CHARS { emit!("thinking", thinking); }
+                        }
+                        Some(StreamDelta::Tool(name, arguments)) => {
+                            emit_tool!(json!({ "type": "tool", "name": name, "arguments": arguments }));
+                        }
+                        Some(StreamDelta::ToolResult(name, summary)) => {
+                            emit_tool!(json!({ "type": "tool_result", "name": name, "summary": summary }));
                         }
                         None => {
                             emit!("thinking", thinking);
@@ -194,25 +221,118 @@ pub async fn process(state: &Arc<AppState>, pending: ChatPending) -> Result<()> 
         None
     };
 
-    // Stream tokens from Ollama into the broadcaster.
+    // Assemble the tools to advertise this turn: the built-in web tools (when the
+    // turn requested them and the model supports tool calls) plus any caller
+    // passthrough tools (API function calling).
+    let model_tools = state.ollama.model_supports_tools(&model).await;
+    let mut tool_defs: Vec<Value> = Vec::new();
+    if model_tools {
+        if pending.web_search {
+            if let Some(arr) = tools::builtin_defs().as_array() {
+                tool_defs.extend(arr.iter().cloned());
+            }
+        }
+        if let Some(reqt) = pending.request_tools.as_ref().and_then(|v| v.as_array()) {
+            tool_defs.extend(reqt.iter().cloned());
+        }
+    }
+    let tools_value = (!tool_defs.is_empty()).then(|| Value::Array(tool_defs));
+
+    // Tool loop: call Ollama; if it asks for a built-in tool, run it and feed the
+    // result back; caller (passthrough) tool calls are returned unexecuted. Only
+    // the final, no-tool round streams the answer (tool rounds have no content).
+    const MAX_TOOL_ROUNDS: usize = 5;
     let first_token = Arc::new(AtomicBool::new(false));
-    let result = {
-        let first_token = first_token.clone();
-        let stop_loading = stop_loading.clone();
-        let tx = tx.clone();
-        state
-            .ollama
-            .chat_stream(&model, Value::Array(messages), pending.think, cancel, move |delta| {
-                if !first_token.swap(true, Ordering::Relaxed) {
-                    stop_loading.notify_one(); // first delta (thinking or content) → drop loading
-                }
-                let _ = match delta {
-                    ChatDelta::Content(s) => tx.send(StreamDelta::Content(s.to_string())),
-                    ChatDelta::Thinking(s) => tx.send(StreamDelta::Thinking(s.to_string())),
-                };
-            })
-            .await
-    };
+    let mut prompt_total: u32 = 0;
+    let mut completion_total: u32 = 0;
+    let mut tool_activity: Vec<Value> = Vec::new();
+    let mut passthrough_calls: Vec<Value> = Vec::new();
+    let mut final_content = String::new();
+    let mut final_thinking = String::new();
+    let mut loop_err: Option<anyhow::Error> = None;
+
+    for round in 0..MAX_TOOL_ROUNDS {
+        let result = {
+            let first_token = first_token.clone();
+            let stop_loading = stop_loading.clone();
+            let tx = tx.clone();
+            state
+                .ollama
+                .chat_stream(
+                    &model,
+                    Value::Array(messages.clone()),
+                    pending.think,
+                    tools_value.as_ref(),
+                    cancel.clone(),
+                    move |delta| {
+                        if !first_token.swap(true, Ordering::Relaxed) {
+                            stop_loading.notify_one();
+                        }
+                        let _ = match delta {
+                            ChatDelta::Content(s) => tx.send(StreamDelta::Content(s.to_string())),
+                            ChatDelta::Thinking(s) => tx.send(StreamDelta::Thinking(s.to_string())),
+                        };
+                    },
+                )
+                .await
+        };
+
+        let out = match result {
+            Ok(o) => o,
+            Err(e) => {
+                loop_err = Some(e);
+                break;
+            }
+        };
+        prompt_total += out.prompt_tokens.unwrap_or(0);
+        completion_total += out.completion_tokens.unwrap_or(0);
+
+        // No tool calls (or cancelled) → this round's text is the final answer.
+        if out.tool_calls.is_empty() || cancel.load(Ordering::Relaxed) {
+            final_content = out.content;
+            final_thinking = out.thinking;
+            break;
+        }
+
+        let content = out.content;
+        let thinking = out.thinking;
+        let (builtin, passthrough): (Vec<ToolCall>, Vec<ToolCall>) =
+            out.tool_calls.into_iter().partition(|c| tools::is_builtin(&c.name));
+
+        // Caller (passthrough) tool calls are returned unexecuted for the API.
+        if !passthrough.is_empty() {
+            for (i, c) in passthrough.iter().enumerate() {
+                passthrough_calls.push(json!({
+                    "id": format!("call_{round}_{i}"),
+                    "type": "function",
+                    "function": { "name": c.name, "arguments": c.arguments.to_string() },
+                }));
+            }
+            final_content = content;
+            final_thinking = thinking;
+            break;
+        }
+
+        // Execute built-in tools: echo an assistant tool_calls message, then one
+        // tool result per call, and loop so the model can use them.
+        let assistant_calls: Vec<Value> = builtin.iter().map(|c| c.to_request_value()).collect();
+        messages.push(json!({ "role": "assistant", "content": "", "tool_calls": assistant_calls }));
+        for call in &builtin {
+            let _ = tx.send(StreamDelta::Tool(call.name.clone(), call.arguments.to_string()));
+            let (result_text, activity, summary) = run_builtin(state, &token, &pending.id, call).await;
+            let _ = tx.send(StreamDelta::ToolResult(call.name.clone(), summary));
+            if let Some(a) = activity {
+                tool_activity.push(a);
+            }
+            messages.push(json!({ "role": "tool", "tool_name": call.name, "content": result_text }));
+        }
+        // Hit the round cap without a final answer: persist what we have.
+        if round == MAX_TOOL_ROUNDS - 1 {
+            final_content = content;
+            final_thinking = thinking;
+        }
+    }
+
     state.cancels.lock().await.remove(&pending.id);
     drop(tx);
     // Ensure the heartbeat stops even if the turn ended before any token.
@@ -222,8 +342,11 @@ pub async fn process(state: &Arc<AppState>, pending: ChatPending) -> Result<()> 
     }
     let last_seq = broadcaster.await.unwrap_or(0);
 
-    let outcome = match result {
-        Ok(out) => {
+    let tool_calls_json = (!passthrough_calls.is_empty()).then(|| Value::Array(passthrough_calls));
+    let tool_activity_json = (!tool_activity.is_empty()).then(|| Value::Array(tool_activity));
+
+    let outcome = match loop_err {
+        None => {
             if ws_ready {
                 state
                     .realtime
@@ -231,23 +354,25 @@ pub async fn process(state: &Arc<AppState>, pending: ChatPending) -> Result<()> 
                     .await
                     .ok();
             }
-            let thinking = (!out.thinking.is_empty()).then_some(out.thinking.as_str());
+            let thinking = (!final_thinking.is_empty()).then_some(final_thinking.as_str());
             state
                 .supabase
                 .update_chat_message(
                     &token,
                     &pending.id,
                     "done",
-                    Some(&out.content),
+                    Some(&final_content),
                     thinking,
                     None,
-                    out.prompt_tokens,
-                    out.completion_tokens,
+                    Some(prompt_total),
+                    Some(completion_total),
+                    tool_calls_json.as_ref(),
+                    tool_activity_json.as_ref(),
                 )
                 .await?;
             Ok(())
         }
-        Err(e) => {
+        Some(e) => {
             let msg = e.to_string();
             if ws_ready {
                 state
@@ -262,7 +387,7 @@ pub async fn process(state: &Arc<AppState>, pending: ChatPending) -> Result<()> 
             }
             state
                 .supabase
-                .update_chat_message(&token, &pending.id, "error", None, None, Some(&msg), None, None)
+                .update_chat_message(&token, &pending.id, "error", None, None, Some(&msg), None, None, None, None)
                 .await
                 .ok();
             Err(e)
@@ -273,4 +398,84 @@ pub async fn process(state: &Arc<AppState>, pending: ChatPending) -> Result<()> 
         state.realtime.leave(&chan).await;
     }
     outcome
+}
+
+/// Execute a single built-in tool call. Returns `(tool_message_content, activity,
+/// short_summary)`. `activity` is a `ToolActivity` JSON row persisted for the web
+/// to render citations; the content string is fed back to the model as the tool's
+/// result. Errors are returned as content (so the model can react) rather than
+/// failing the turn.
+async fn run_builtin(
+    state: &Arc<AppState>,
+    token: &str,
+    message_id: &str,
+    call: &ToolCall,
+) -> (String, Option<Value>, String) {
+    match call.name.as_str() {
+        tools::WEB_SEARCH => {
+            let query = call
+                .arguments
+                .get("query")
+                .and_then(|q| q.as_str())
+                .unwrap_or("")
+                .to_string();
+            let count = call
+                .arguments
+                .get("count")
+                .and_then(|c| c.as_u64())
+                .unwrap_or(5)
+                .clamp(1, 10) as u32;
+            if query.is_empty() {
+                return ("web_search error: missing 'query'".into(), None, "no query".into());
+            }
+            match state.supabase.web_search(token, message_id, &query, count).await {
+                Ok(WebSearchOutcome::Results(results)) => {
+                    let text = if results.is_empty() {
+                        "No results.".to_string()
+                    } else {
+                        results
+                            .iter()
+                            .enumerate()
+                            .map(|(i, r)| format!("[{}] {}\n{}\n{}", i + 1, r.title, r.url, r.snippet))
+                            .collect::<Vec<_>>()
+                            .join("\n\n")
+                    };
+                    let citations: Vec<Value> = results
+                        .iter()
+                        .map(|r| json!({ "title": r.title, "url": r.url, "snippet": r.snippet }))
+                        .collect();
+                    let n = results.len();
+                    let activity = json!({ "name": tools::WEB_SEARCH, "query": query, "citations": citations });
+                    (text, Some(activity), format!("{n} result{}", if n == 1 { "" } else { "s" }))
+                }
+                Ok(WebSearchOutcome::NoKey) => (
+                    "web_search is unavailable: no Brave Search API key is configured. \
+                     Ask the user to add one in Settings."
+                        .into(),
+                    None,
+                    "no API key".into(),
+                ),
+                Err(e) => (format!("web_search failed: {e}"), None, "search failed".into()),
+            }
+        }
+        tools::WEB_FETCH => {
+            let url = call
+                .arguments
+                .get("url")
+                .and_then(|u| u.as_str())
+                .unwrap_or("")
+                .to_string();
+            if url.is_empty() {
+                return ("web_fetch error: missing 'url'".into(), None, "no url".into());
+            }
+            match tools::web_fetch(&state.http, &url).await {
+                Ok(text) => {
+                    let activity = json!({ "name": tools::WEB_FETCH, "query": url, "citations": [] });
+                    (text, Some(activity), "fetched".into())
+                }
+                Err(e) => (format!("web_fetch failed: {e}"), None, "fetch failed".into()),
+            }
+        }
+        other => (format!("unknown tool: {other}"), None, "unknown".into()),
+    }
 }

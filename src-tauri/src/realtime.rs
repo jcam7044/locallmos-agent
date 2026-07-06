@@ -285,6 +285,8 @@ async fn handle_change(state: &Arc<AppState>, v: &Value) {
                     .to_string(),
                 model: record.get("model").and_then(Value::as_str).map(str::to_string),
                 think: record.get("think").and_then(Value::as_bool).unwrap_or(false),
+                web_search: record.get("web_search").and_then(Value::as_bool).unwrap_or(false),
+                request_tools: record.get("request_tools").filter(|v| !v.is_null()).cloned(),
             };
             if pending.id.is_empty() {
                 return;

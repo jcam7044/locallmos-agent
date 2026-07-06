@@ -103,6 +103,11 @@ export function App() {
           >
             {busy ? "Enrolling…" : "Enroll this rig"}
           </button>
+          <p style={{ ...label, marginTop: 12, marginBottom: 0 }}>
+            This tray app stores credentials for the current user, separate from a
+            headless system service. For an always-on rig, run the service instead
+            (see SERVICE.md).
+          </p>
         </div>
       ) : (
         <div style={{ ...card, marginTop: 16 }}>

@@ -30,6 +30,12 @@ impl AgentConfig {
             _ => dirs::config_dir().context("no config dir")?.join("locallmos-agent"),
         };
         std::fs::create_dir_all(&dir).ok();
+        // Log the resolved dir once so it's discoverable which credentials store is
+        // in use. The tray GUI (per-user config dir) and a headless service (its
+        // own LOCALLMOS_CONFIG_DIR, e.g. /etc/locallmos-agent) are independent — see
+        // SERVICE.md. This line makes a mismatch obvious in the agent's logs.
+        static LOGGED: std::sync::Once = std::sync::Once::new();
+        LOGGED.call_once(|| tracing::info!("agent config dir: {}", dir.display()));
         Ok(dir.join("config.json"))
     }
 

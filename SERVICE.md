@@ -17,6 +17,24 @@ The service runs as **root** by default so it can restart the runtime (`systemct
 Credentials (`config.json`) and Supabase settings share a config dir via
 `LOCALLMOS_CONFIG_DIR` so the `service` and `enroll` invocations agree.
 
+### Config location — GUI vs service
+
+The two run modes resolve **different** config dirs unless you tell them
+otherwise, so credentials enrolled in one are not visible to the other:
+
+- **Headless service / CLI enroll** use `LOCALLMOS_CONFIG_DIR` (the installers
+  set it, e.g. `/etc/locallmos-agent` on Linux/macOS, `C:\ProgramData\locallmos-agent`
+  on Windows).
+- **Tray GUI** has no such env by default, so it falls back to the per-user OS
+  config dir (`~/.config/locallmos-agent`, `~/Library/Application Support/locallmos-agent`,
+  or `%APPDATA%\locallmos-agent`).
+
+This is intentional: the tray app is a per-user, workstation convenience while the
+service is a system-wide daemon. Pick one mode per machine. If you want the GUI and
+the service to share one enrollment, launch the GUI with the same
+`LOCALLMOS_CONFIG_DIR` the service uses. The agent logs its resolved config dir at
+startup (`agent config dir: …`) so you can confirm which store is active.
+
 ---
 
 ## Linux (systemd)

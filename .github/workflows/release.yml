@@ -48,10 +48,11 @@ jobs:
 
       # Version comes from package.json "packageManager" — no `version:` key here.
       - uses: pnpm/action-setup@v4
+      # No `cache: pnpm` — that requires a committed pnpm-lock.yaml, which the
+      # standalone repo doesn't have. Caching 3 deps isn't worth it.
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: pnpm
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Set version from tag

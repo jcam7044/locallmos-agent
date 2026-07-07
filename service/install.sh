@@ -15,13 +15,16 @@
 set -eu
 
 # ---- defaults (override via flags or env) ---------------------------------
-REPO="${LOCALLMOS_REPO:-jcam7044/locallmos}"     # GitHub owner/repo hosting releases
+REPO="${LOCALLMOS_REPO:-jcam7044/locallmos-agent}" # GitHub owner/repo hosting releases
 CHANNEL="${LOCALLMOS_CHANNEL:-stable}"
 VERSION="latest"                                  # or an explicit vX.Y.Z tag
 NAME="$(hostname 2>/dev/null || echo my-rig)"
 CODE=""
-SUPABASE_URL="${LOCALLMOS_SUPABASE_URL:-}"
-ANON_KEY="${LOCALLMOS_SUPABASE_ANON_KEY:-}"
+# Production locallmos.com backend baked in as defaults (both are public values —
+# the anon key ships in the web bundle and is gated by RLS). Override with
+# --supabase-url / --anon-key or the LOCALLMOS_SUPABASE_* env vars.
+SUPABASE_URL="${LOCALLMOS_SUPABASE_URL:-https://fvpjkpfshbvszbcknkqq.supabase.co}"
+ANON_KEY="${LOCALLMOS_SUPABASE_ANON_KEY:-eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZ2cGprcGZzaGJ2c3piY2tua3FxIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODI5NzI3MjYsImV4cCI6MjA5ODU0ODcyNn0.b0FDzCAweH6VIwcumLKjNP959unJCUN_egZpb7KdCwg}"
 
 # minisign public key matching release CI's signing key. Keep in sync with
 # RELEASE_PUBLIC_KEY in apps/agent/src-tauri/src/updater.rs.

@@ -1,6 +1,6 @@
 [Unit]
 Description=LocalLMOS Agent (local LLM rig monitor/controller)
-Documentation=https://github.com/jcam7044/locallmos
+Documentation=https://github.com/jcam7044/locallmos-agent
 After=network-online.target
 Wants=network-online.target
 

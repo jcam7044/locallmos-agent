@@ -26,11 +26,13 @@ use std::time::Duration;
 
 use config::AgentConfig;
 use monitor::Monitor;
-use runtime::ollama::OllamaAdapter;
+use runtime::ollama::{ChatDelta, OllamaAdapter};
+use runtime::RuntimeAdapter;
+use serde_json::{json, Value};
 use settings::Settings;
 use status::AgentStatus;
 use supabase::Supabase;
-use tauri::State;
+use tauri::{Emitter, State};
 use tauri_plugin_autostart::MacosLauncher;
 use tokio::sync::Mutex;
 
@@ -100,6 +102,87 @@ async fn enroll(
     name: String,
 ) -> Result<(), String> {
     worker::enroll(state.inner(), &code, &name)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Local mode (no account): the tray drives these directly, so the app is a
+// useful local LLM control panel without ever enrolling to the cloud.
+// ---------------------------------------------------------------------------
+
+/// Live local snapshot: runtime state, available models, and system telemetry.
+/// Does not touch Supabase — works fully offline / unenrolled.
+#[tauri::command]
+async fn local_status(state: State<'_, Arc<AppState>>) -> Result<Value, String> {
+    let snap = state.ollama.snapshot().await;
+    let telemetry = {
+        let mut mon = state.monitor.lock().await;
+        mon.sample().await
+    };
+    Ok(json!({
+        "runtime": {
+            "kind": snap.kind,
+            "version": snap.version,
+            "state": snap.state,
+            "endpoint": snap.endpoint,
+        },
+        "models": snap.models.iter().map(|m| json!({
+            "name": m.name,
+            "sizeBytes": m.size_bytes,
+            "quantization": m.quantization,
+            "loaded": m.loaded,
+            "capabilities": m.capabilities,
+        })).collect::<Vec<_>>(),
+        "telemetry": {
+            "cpuPct": telemetry.cpu_utilization_pct,
+            "memoryUsedBytes": telemetry.memory_used_bytes,
+            "memoryTotalBytes": telemetry.memory_total_bytes,
+            "gpus": telemetry.gpus,
+        },
+    }))
+}
+
+/// Load/keep a model resident in the runtime.
+#[tauri::command]
+async fn load_model(state: State<'_, Arc<AppState>>, model: String) -> Result<(), String> {
+    state.ollama.load_model(&model).await.map_err(|e| e.to_string())
+}
+
+/// Restart the local runtime service.
+#[tauri::command]
+async fn restart_runtime(state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    state.ollama.restart().await.map_err(|e| e.to_string())
+}
+
+/// Stream a local chat turn. `messages` is Ollama's chat array
+/// (`[{"role","content"}, …]`). Content deltas are emitted as `local-chat-delta`
+/// events; the assembled reply is returned.
+#[tauri::command]
+async fn local_chat(
+    app: tauri::AppHandle,
+    state: State<'_, Arc<AppState>>,
+    model: String,
+    messages: Value,
+) -> Result<String, String> {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let out = state
+        .ollama
+        .chat_stream(&model, messages, false, None, cancel, |delta| {
+            if let ChatDelta::Content(s) = delta {
+                let _ = app.emit("local-chat-delta", s);
+            }
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(out.content)
+}
+
+/// Check GitHub Releases directly (no account) and self-update if a newer version
+/// exists. Returns the new version when it updated, `None` when already current.
+#[tauri::command]
+async fn local_update() -> Result<Option<String>, String> {
+    crate::updater::self_update_from_github()
         .await
         .map_err(|e| e.to_string())
 }
@@ -256,7 +339,15 @@ fn run_gui() {
                 api.prevent_close();
             }
         })
-        .invoke_handler(tauri::generate_handler![get_status, enroll])
+        .invoke_handler(tauri::generate_handler![
+            get_status,
+            enroll,
+            local_status,
+            load_model,
+            restart_runtime,
+            local_chat,
+            local_update
+        ])
         .run(tauri::generate_context!())
         .expect("error while running LocalLMOS agent");
 }

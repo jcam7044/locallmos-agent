@@ -23,10 +23,107 @@ use std::time::Duration;
 const RELEASE_PUBLIC_KEY: &str =
     "RWR+94+uka+PJB5Wbmak5GN2J+eZjIgoj3PGFH4dAoqhBuCfIFjBy6u7";
 
+/// Public GitHub repo that hosts agent releases (for the account-less local
+/// update path). Keep in sync with `install.sh`'s REPO default.
+const RELEASE_REPO: &str = "jcam7044/locallmos-agent";
+
 /// "{os}-{arch}" — matches Rust's std::env::consts and the keys CI writes into
 /// `agent_releases.artifacts` (e.g. "linux-x86_64", "macos-aarch64").
 fn platform_key() -> String {
     format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
+}
+
+/// Release asset name for this platform (matches the CI staging step).
+fn asset_name() -> String {
+    let base = format!("locallmos-agent-{}", platform_key());
+    if cfg!(target_os = "windows") {
+        format!("{base}.exe")
+    } else {
+        base
+    }
+}
+
+/// Account-less self-update: query the public GitHub Releases API directly (no
+/// Supabase / device JWT), and if the latest release is newer, download + verify
+/// + swap + restart. Returns `Some(version)` when updated, `None` if current.
+/// Used by local (unenrolled) installs; connected rigs use the command path.
+pub async fn self_update_from_github() -> Result<Option<String>> {
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .build()?;
+    // GitHub's API requires a User-Agent.
+    let ua = concat!("locallmos-agent/", env!("CARGO_PKG_VERSION"));
+    let rel: Value = client
+        .get(format!(
+            "https://api.github.com/repos/{RELEASE_REPO}/releases/latest"
+        ))
+        .header("User-Agent", ua)
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+
+    let latest = rel
+        .get("tag_name")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim_start_matches('v');
+    if !is_newer(latest, AGENT_VERSION) {
+        return Ok(None);
+    }
+
+    let assets = rel
+        .get("assets")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let url_of = |name: &str| -> Option<String> {
+        assets
+            .iter()
+            .find(|a| a.get("name").and_then(Value::as_str) == Some(name))
+            .and_then(|a| a.get("browser_download_url"))
+            .and_then(Value::as_str)
+            .map(String::from)
+    };
+    let name = asset_name();
+    let bin_url = url_of(&name).ok_or_else(|| anyhow!("release has no asset {name}"))?;
+    let sha_url = url_of(&format!("{name}.sha256")).ok_or_else(|| anyhow!("missing {name}.sha256"))?;
+    let sig_url = url_of(&format!("{name}.minisig")).ok_or_else(|| anyhow!("missing {name}.minisig"))?;
+
+    let fetch_text = |u: String| {
+        let client = client.clone();
+        async move {
+            client
+                .get(&u)
+                .header("User-Agent", ua)
+                .send()
+                .await?
+                .error_for_status()?
+                .text()
+                .await
+                .map_err(anyhow::Error::from)
+        }
+    };
+    let sha256 = fetch_text(sha_url)
+        .await?
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    let sig = fetch_text(sig_url).await?;
+
+    let bytes = download_and_verify(&ReleaseArtifact {
+        url: bin_url,
+        sha256,
+        sig,
+    })
+    .await?;
+    swap_binary(&bytes)?;
+    tracing::info!("local self-update {} -> {}; restarting", AGENT_VERSION, latest);
+    schedule_restart();
+    Ok(Some(latest.to_string()))
 }
 
 /// Handle an `update_agent` command payload: `{ version, channel }`.

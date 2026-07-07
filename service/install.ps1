@@ -10,14 +10,17 @@
 # startup task runs the agent in a relaunch loop so a self-update (which exits
 # cleanly) comes back up on the new binary without a reboot.
 
+# Production locallmos.com backend is baked in as the default (both values are
+# public — the anon key ships in the web bundle and is gated by RLS). Override
+# with -SupabaseUrl / -AnonKey or the LOCALLMOS_SUPABASE_* env vars.
 param(
-  [string]$Repo        = $(if ($env:LOCALLMOS_REPO) { $env:LOCALLMOS_REPO } else { "jcam7044/locallmos" }),
+  [string]$Repo        = $(if ($env:LOCALLMOS_REPO) { $env:LOCALLMOS_REPO } else { "jcam7044/locallmos-agent" }),
   [string]$Channel     = "stable",
   [string]$Version     = "latest",
   [string]$Name        = $env:COMPUTERNAME,
   [string]$Code        = "",
-  [string]$SupabaseUrl = $env:LOCALLMOS_SUPABASE_URL,
-  [string]$AnonKey     = $env:LOCALLMOS_SUPABASE_ANON_KEY
+  [string]$SupabaseUrl = $(if ($env:LOCALLMOS_SUPABASE_URL) { $env:LOCALLMOS_SUPABASE_URL } else { "https://fvpjkpfshbvszbcknkqq.supabase.co" }),
+  [string]$AnonKey     = $(if ($env:LOCALLMOS_SUPABASE_ANON_KEY) { $env:LOCALLMOS_SUPABASE_ANON_KEY } else { "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZ2cGprcGZzaGJ2c3piY2tua3FxIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODI5NzI3MjYsImV4cCI6MjA5ODU0ODcyNn0.b0FDzCAweH6VIwcumLKjNP959unJCUN_egZpb7KdCwg" })
 )
 
 $ErrorActionPreference = "Stop"

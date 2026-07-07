@@ -1,0 +1,141 @@
+name: Release
+
+# Publish signed agent binaries on a version tag, then mirror the release into
+# Supabase (agent_releases) so the web app and self-updater can discover it.
+#
+# Required repository secrets:
+#   MINISIGN_SECRET_KEY   — passwordless minisign secret key (the public half is
+#                           embedded in src-tauri/src/updater.rs).
+#   SUPABASE_URL          — https://<ref>.supabase.co
+#   SUPABASE_SERVICE_KEY  — service_role key (only used by this workflow).
+#
+# Tag with the version: `git tag v0.1.0 && git push --tags`. The version is
+# derived from the tag by scripts/set-version.mjs — do not hand-edit version files.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux-x86_64
+            bin: locallmos-agent
+          - os: macos-14
+            platform: macos-aarch64
+            bin: locallmos-agent
+          - os: windows-latest
+            platform: windows-x86_64
+            bin: locallmos-agent.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux system deps
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
+            libayatana-appindicator3-dev librsvg2-dev
+
+      # Version comes from package.json "packageManager" — no `version:` key here.
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Set version from tag
+        run: node scripts/set-version.mjs "${{ github.ref_name }}"
+
+      - name: Build frontend (embedded by tauri::generate_context!)
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+
+      - name: Build release binary
+        run: cargo build --release --manifest-path src-tauri/Cargo.toml
+
+      - name: Stage artifact
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "src-tauri/target/release/${{ matrix.bin }}" \
+             "dist/locallmos-agent-${{ matrix.platform }}${{ matrix.bin == 'locallmos-agent.exe' && '.exe' || '' }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.platform }}
+          path: dist/*
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: staged
+          merge-multiple: true
+
+      - name: Install minisign
+        run: sudo apt-get update && sudo apt-get install -y minisign jq
+
+      - name: Sign + checksum all artifacts
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$MINISIGN_SECRET_KEY" > minisign.key
+          cd staged
+          for f in locallmos-agent-*; do
+            case "$f" in *.sha256|*.minisig) continue ;; esac
+            sha256sum "$f" | awk '{print $1}' > "$f.sha256"
+            minisign -S -s ../minisign.key -m "$f" -x "$f.minisig"
+          done
+
+      - name: Create GitHub Release + upload assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: staged/*
+
+      - name: Mirror release into Supabase
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#v}"
+          BASE="https://github.com/$REPO/releases/download/$TAG"
+          cd staged
+
+          artifacts='{}'
+          for f in locallmos-agent-*; do
+            case "$f" in *.sha256|*.minisig) continue ;; esac
+            key="${f#locallmos-agent-}"; key="${key%.exe}"
+            sha="$(cat "$f.sha256")"
+            sig="$(cat "$f.minisig")"
+            artifacts="$(jq -n --argjson a "$artifacts" --arg k "$key" \
+              --arg url "$BASE/$f" --arg sha "$sha" --arg sig "$sig" \
+              '$a + {($k): {url:$url, sha256:$sha, sig:$sig}}')"
+          done
+
+          body="$(jq -n --arg v "$VERSION" --argjson art "$artifacts" \
+            '{channel:"stable", version:$v, artifacts:$art}')"
+
+          curl -fsS -X POST "$SUPABASE_URL/rest/v1/agent_releases" \
+            -H "apikey: $SUPABASE_SERVICE_KEY" \
+            -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
+            -H "Content-Type: application/json" \
+            -H "Prefer: resolution=merge-duplicates" \
+            -d "$body"

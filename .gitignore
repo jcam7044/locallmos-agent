@@ -1,0 +1,20 @@
+# Rust / Tauri build output
+/src-tauri/target
+target/
+
+# Node
+node_modules/
+dist/
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# Release signing key — never commit
+minisign.key
+*.key
+
+# OS
+.DS_Store
+Thumbs.db

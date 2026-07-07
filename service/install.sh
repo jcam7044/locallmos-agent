@@ -1,5 +1,6 @@
-#!/usr/bin/env bash
-# LocalLMOS agent installer (Linux + macOS).
+#!/bin/sh
+# LocalLMOS agent installer (Linux + macOS). POSIX sh — runs under dash when
+# invoked as `curl … | sh` (the shebang is ignored in that case anyway).
 #
 #   curl -fsSL https://get.locallmos.os/install.sh | sh -s -- \
 #     --supabase-url https://<ref>.supabase.co --anon-key <ANON> \
@@ -9,7 +10,9 @@
 # installs it to /usr/local/bin, sets up the service (systemd on Linux, launchd
 # on macOS), and enrolls the rig. Ongoing updates are handled by the agent
 # itself (self-update), so there is no package manager to keep in sync.
-set -euo pipefail
+# POSIX sh only: no `pipefail` (dash lacks it); `-e` still aborts on the `curl -f`
+# download failures and on a checksum mismatch.
+set -eu
 
 # ---- defaults (override via flags or env) ---------------------------------
 REPO="${LOCALLMOS_REPO:-jcam7044/locallmos}"     # GitHub owner/repo hosting releases
@@ -56,11 +59,14 @@ esac
 PLATFORM="$OS-$ARCH"
 ASSET="locallmos-agent-$PLATFORM"
 
-# Reject targets CI doesn't publish yet, so users get a clear message instead of
-# a confusing 404 on download. Keep in sync with the release.yml build matrix.
+# Reject targets CI doesn't publish, so users get a clear message instead of a
+# confusing 404 on download. Keep in sync with the release.yml build matrix.
 case "$PLATFORM" in
-  linux-x86_64|macos-x86_64|macos-aarch64) ;;
-  *) echo "no prebuilt agent for $PLATFORM yet — see the release matrix." >&2; exit 1 ;;
+  linux-x86_64|macos-aarch64) ;;
+  macos-x86_64)
+    echo "LocalLMOS provides Apple Silicon (arm64) macOS builds only — Intel Macs are not supported." >&2
+    exit 1 ;;
+  *) echo "no prebuilt agent for $PLATFORM — see the release matrix." >&2; exit 1 ;;
 esac
 
 # GitHub's /releases/latest/download/<asset> redirects to the newest release's
@@ -170,7 +176,7 @@ if sudo test -f "$CONFIG_DIR/config.json" && sudo grep -q '"refresh_secret"' "$C
 elif [ -n "$CODE" ]; then
   echo "==> Enrolling as '$NAME'"
   sudo env LOCALLMOS_CONFIG_DIR="$CONFIG_DIR" \
-    bash -c "set -a; . '$CONFIG_DIR/agent.env'; set +a; '$BIN_DST' enroll --code '$CODE' --name '$NAME'"
+    sh -c "set -a; . '$CONFIG_DIR/agent.env'; set +a; '$BIN_DST' enroll --code '$CODE' --name '$NAME'"
 else
   echo "!! No --code given. Generate a pairing code in the dashboard, then run:"
   echo "   sudo env LOCALLMOS_CONFIG_DIR=$CONFIG_DIR $BIN_DST enroll --code <CODE> --name '$NAME'"

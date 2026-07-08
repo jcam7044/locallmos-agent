@@ -51,6 +51,8 @@ curl -fsSL https://locallmos.com/install.sh | sh -s -- --service --code <CODE> -
 pkill -x locallmos-agent 2>/dev/null || true
 sudo rm -f /usr/local/bin/locallmos-agent
 sudo rm -rf "/Applications/LocaLLMOS Agent.app" 2>/dev/null || true
+rm -f ~/.local/share/applications/os.locallmos.agent.desktop
+rm -f ~/.local/share/icons/hicolor/128x128/apps/os.locallmos.agent.png
 ```
 
 To also remove local enrollment and settings:

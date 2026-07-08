@@ -125,8 +125,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
 ```sh
 pnpm install
-pnpm build                              # build the tray UI (embedded by Tauri)
-cargo build --release --manifest-path src-tauri/Cargo.toml
+pnpm tauri build --no-bundle            # build the desktop binary with bundled UI assets
 ```
 
 To test the macOS desktop app bundle locally:

@@ -7,9 +7,9 @@
 #     --code <PAIRING_CODE> --name "My Rig"
 #
 # Downloads a prebuilt, signed agent binary from GitHub Releases, verifies it,
-# installs it to /usr/local/bin, sets up the service (systemd on Linux, launchd
-# on macOS), and enrolls the rig. Ongoing updates are handled by the agent
-# itself (self-update), so there is no package manager to keep in sync.
+# and installs it to /usr/local/bin. By default this is a desktop install: enroll
+# in the current user's config dir when --code is given, then launch the tray GUI.
+# Pass --service for a headless systemd/launchd install instead.
 # POSIX sh only: no `pipefail` (dash lacks it); `-e` still aborts on the `curl -f`
 # download failures and on a checksum mismatch.
 set -eu
@@ -20,6 +20,8 @@ CHANNEL="${LOCALLMOS_CHANNEL:-stable}"
 VERSION="latest"                                  # or an explicit vX.Y.Z tag
 NAME="$(hostname 2>/dev/null || echo my-rig)"
 CODE=""
+MODE="${LOCALLMOS_INSTALL_MODE:-desktop}"          # desktop or service
+NO_LAUNCH="${LOCALLMOS_NO_LAUNCH:-0}"
 # Production locallmos.com backend baked in as defaults (both are public values —
 # the anon key ships in the web bundle and is gated by RLS). Override with
 # --supabase-url / --anon-key or the LOCALLMOS_SUPABASE_* env vars.
@@ -42,9 +44,22 @@ while [ $# -gt 0 ]; do
     --repo) REPO="$2"; shift 2 ;;
     --supabase-url) SUPABASE_URL="$2"; shift 2 ;;
     --anon-key) ANON_KEY="$2"; shift 2 ;;
+    --desktop) MODE="desktop"; shift ;;
+    --service|--headless) MODE="service"; shift ;;
+    --no-launch) NO_LAUNCH="1"; shift ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
+case "$MODE" in
+  desktop|service) ;;
+  *) echo "unknown install mode: $MODE (expected desktop or service)" >&2; exit 2 ;;
+esac
+if [ "$MODE" = "desktop" ] && [ "$(id -u)" = "0" ]; then
+  echo "desktop install must be run as your login user so the tray app can appear." >&2
+  echo "Run without sudo: curl -fsSL https://locallmos.com/install.sh | sh" >&2
+  echo "For a headless root service, pass --service." >&2
+  exit 1
+fi
 
 # ---- platform detection ("{os}-{arch}", matching CI asset names) ----------
 os="$(uname -s)"
@@ -114,22 +129,91 @@ fi
 
 echo "==> Installing to $BIN_DST"
 chmod +x "$TMP/agent"
+sudo mkdir -p /usr/local/bin
 sudo install -m 0755 "$TMP/agent" "$BIN_DST"
 
-echo "==> Writing $CONFIG_DIR/agent.env"
-sudo mkdir -p "$CONFIG_DIR"
-if [ ! -f "$CONFIG_DIR/agent.env" ]; then
-  sudo tee "$CONFIG_DIR/agent.env" >/dev/null <<EOF
+user_config_file() {
+  if [ "$OS" = "macos" ]; then
+    printf '%s\n' "$HOME/Library/Application Support/locallmos-agent/config.json"
+  else
+    printf '%s\n' "${XDG_CONFIG_HOME:-$HOME/.config}/locallmos-agent/config.json"
+  fi
+}
+
+launch_desktop() {
+  if [ "$NO_LAUNCH" = "1" ]; then
+    echo "==> Installed. Launch with: $BIN_DST"
+    return
+  fi
+  if [ "$OS" = "linux" ] && [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ]; then
+    echo "!! No Linux graphical session detected (DISPLAY/WAYLAND_DISPLAY is empty)."
+    echo "   Installed. Launch from your desktop session with: $BIN_DST"
+    return
+  fi
+  if [ "$OS" = "linux" ] && command -v ldd >/dev/null 2>&1; then
+    missing="$(ldd "$BIN_DST" 2>/dev/null | awk '/not found/ {print $1}' | tr '\n' ' ')"
+    if [ -n "$missing" ]; then
+      echo "!! Missing desktop runtime libraries: $missing"
+      echo "   Install your distro's WebKitGTK/GTK/AppIndicator packages, then run: $BIN_DST"
+      return
+    fi
+  fi
+
+  echo "==> Launching LocalLMOS Agent"
+  env LOCALLMOS_SUPABASE_URL="$SUPABASE_URL" \
+      LOCALLMOS_SUPABASE_ANON_KEY="$ANON_KEY" \
+      nohup "$BIN_DST" >/dev/null 2>&1 &
+  pid=$!
+  sleep 2
+  if kill -0 "$pid" 2>/dev/null; then
+    echo "==> Done. LocalLMOS Agent is running in your desktop session."
+  else
+    echo "!! Installed, but the desktop app exited during launch."
+    echo "   Run this to see the error: $BIN_DST"
+  fi
+}
+
+desktop_service_notice() {
+  if [ "$OS" = "linux" ] && [ -f /etc/systemd/system/locallmos-agent.service ]; then
+    echo "!! A headless systemd service is already installed."
+    echo "   Keep it for server mode, or remove it with: sudo systemctl disable --now locallmos-agent"
+  elif [ "$OS" = "macos" ] && [ -f /Library/LaunchDaemons/os.locallmos.agent.plist ]; then
+    echo "!! A headless launchd daemon is already installed."
+    echo "   Keep it for server mode, or remove it with: sudo launchctl unload -w /Library/LaunchDaemons/os.locallmos.agent.plist"
+  fi
+}
+
+# ---- desktop install -------------------------------------------------------
+if [ "$MODE" = "desktop" ]; then
+  desktop_service_notice
+  USER_CONFIG="$(user_config_file)"
+  if [ -f "$USER_CONFIG" ] && grep -q '"refresh_secret"' "$USER_CONFIG"; then
+    echo "==> Already enrolled — skipping enrollment"
+  elif [ -n "$CODE" ]; then
+    echo "==> Enrolling desktop app as '$NAME'"
+    env LOCALLMOS_SUPABASE_URL="$SUPABASE_URL" \
+        LOCALLMOS_SUPABASE_ANON_KEY="$ANON_KEY" \
+        "$BIN_DST" enroll --code "$CODE" --name "$NAME"
+  else
+    echo "==> No --code given. Opening the tray app for local mode and pairing."
+  fi
+  launch_desktop
+else
+  echo "==> Writing $CONFIG_DIR/agent.env"
+  sudo mkdir -p "$CONFIG_DIR"
+  if [ ! -f "$CONFIG_DIR/agent.env" ]; then
+    sudo tee "$CONFIG_DIR/agent.env" >/dev/null <<EOF
 LOCALLMOS_SUPABASE_URL=$SUPABASE_URL
 LOCALLMOS_SUPABASE_ANON_KEY=$ANON_KEY
 EOF
-  sudo chmod 0600 "$CONFIG_DIR/agent.env"
-fi
+    sudo chmod 0600 "$CONFIG_DIR/agent.env"
+  fi
 
-# ---- service install -------------------------------------------------------
-if [ "$OS" = "linux" ]; then
-  echo "==> Installing systemd unit"
-  sudo tee /etc/systemd/system/locallmos-agent.service >/dev/null <<'EOF'
+  # ---- service install -----------------------------------------------------
+  SERVICE_READY=0
+  if [ "$OS" = "linux" ]; then
+    echo "==> Installing systemd unit"
+    sudo tee /etc/systemd/system/locallmos-agent.service >/dev/null <<'EOF'
 [Unit]
 Description=LocalLMOS Agent (local LLM rig monitor/controller)
 After=network-online.target
@@ -149,10 +233,10 @@ User=root
 [Install]
 WantedBy=multi-user.target
 EOF
-  sudo systemctl daemon-reload
-else
-  echo "==> Installing launchd daemon"
-  sudo tee /Library/LaunchDaemons/os.locallmos.agent.plist >/dev/null <<EOF
+    sudo systemctl daemon-reload
+  else
+    echo "==> Installing launchd daemon"
+    sudo tee /Library/LaunchDaemons/os.locallmos.agent.plist >/dev/null <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
@@ -171,28 +255,37 @@ else
   <key>StandardErrorPath</key><string>/var/log/locallmos-agent.log</string>
 </dict></plist>
 EOF
-fi
+  fi
 
-# ---- enroll ----------------------------------------------------------------
-if sudo test -f "$CONFIG_DIR/config.json" && sudo grep -q '"refresh_secret"' "$CONFIG_DIR/config.json"; then
-  echo "==> Already enrolled — skipping enrollment"
-elif [ -n "$CODE" ]; then
-  echo "==> Enrolling as '$NAME'"
-  sudo env LOCALLMOS_CONFIG_DIR="$CONFIG_DIR" \
-    sh -c "set -a; . '$CONFIG_DIR/agent.env'; set +a; '$BIN_DST' enroll --code '$CODE' --name '$NAME'"
-else
-  echo "!! No --code given. Generate a pairing code in the dashboard, then run:"
-  echo "   sudo env LOCALLMOS_CONFIG_DIR=$CONFIG_DIR $BIN_DST enroll --code <CODE> --name '$NAME'"
-fi
+  # ---- enroll --------------------------------------------------------------
+  if sudo test -f "$CONFIG_DIR/config.json" && sudo grep -q '"refresh_secret"' "$CONFIG_DIR/config.json"; then
+    echo "==> Already enrolled — skipping enrollment"
+    SERVICE_READY=1
+  elif [ -n "$CODE" ]; then
+    echo "==> Enrolling as '$NAME'"
+    sudo env LOCALLMOS_CONFIG_DIR="$CONFIG_DIR" \
+      LOCALLMOS_SUPABASE_URL="$SUPABASE_URL" \
+      LOCALLMOS_SUPABASE_ANON_KEY="$ANON_KEY" \
+      "$BIN_DST" enroll --code "$CODE" --name "$NAME"
+    SERVICE_READY=1
+  else
+    echo "!! No --code given. Generate a pairing code in the dashboard, then run:"
+    echo "   sudo env LOCALLMOS_CONFIG_DIR=$CONFIG_DIR LOCALLMOS_SUPABASE_URL=$SUPABASE_URL LOCALLMOS_SUPABASE_ANON_KEY=<ANON_KEY> $BIN_DST enroll --code <CODE> --name '$NAME'"
+  fi
 
-# ---- start -----------------------------------------------------------------
-if [ "$OS" = "linux" ]; then
-  sudo systemctl enable --now locallmos-agent
-  echo "==> Done. Logs: journalctl -u locallmos-agent -f"
-else
-  sudo launchctl unload -w /Library/LaunchDaemons/os.locallmos.agent.plist 2>/dev/null || true
-  sudo launchctl load -w /Library/LaunchDaemons/os.locallmos.agent.plist
-  echo "==> Done. Logs: tail -f /var/log/locallmos-agent.log"
+  # ---- start ---------------------------------------------------------------
+  if [ "$SERVICE_READY" = "1" ]; then
+    if [ "$OS" = "linux" ]; then
+      sudo systemctl enable --now locallmos-agent
+      echo "==> Done. Service logs: journalctl -u locallmos-agent -f"
+    else
+      sudo launchctl unload -w /Library/LaunchDaemons/os.locallmos.agent.plist 2>/dev/null || true
+      sudo launchctl load -w /Library/LaunchDaemons/os.locallmos.agent.plist
+      echo "==> Done. Service logs: tail -f /var/log/locallmos-agent.log"
+    fi
+  else
+    echo "==> Service installed but not started because this rig is not enrolled."
+  fi
 fi
 
 # ---- runtime check ---------------------------------------------------------

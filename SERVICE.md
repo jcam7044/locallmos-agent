@@ -39,6 +39,13 @@ startup (`agent config dir: …`) so you can confirm which store is active.
 
 ## Linux (systemd)
 
+The public installer defaults to the desktop tray app. Pass `--service` for a
+headless system service:
+
+```bash
+curl -fsSL https://locallmos.com/install.sh | sh -s -- --service --code <PAIRING_CODE> --name "Basement 3090"
+```
+
 Scripted:
 
 ```bash
@@ -86,6 +93,13 @@ Uninstall: `./uninstall-service.sh` (add `--purge` to also remove credentials).
 
 ## macOS (launchd)
 
+The public installer defaults to the desktop tray app. Pass `--service` for a
+headless launchd daemon:
+
+```bash
+curl -fsSL https://locallmos.com/install.sh | sh -s -- --service --code <PAIRING_CODE> --name "Mac Studio"
+```
+
 ```bash
 cargo build --release --manifest-path apps/agent/src-tauri/Cargo.toml
 sudo install -m755 apps/agent/src-tauri/target/release/locallmos-agent /usr/local/bin/
@@ -107,6 +121,13 @@ Logs: `/var/log/locallmos-agent.log`. Unload: `sudo launchctl unload -w /Library
 ---
 
 ## Windows
+
+The public installer defaults to the desktop tray app. Pass `-Service` for a
+headless SYSTEM startup task:
+
+```powershell
+& ([scriptblock]::Create((irm https://locallmos.com/install.ps1))) -Service -Code <CODE> -Name "Windows Rig"
+```
 
 Build `apps\agent\src-tauri\target\release\locallmos-agent.exe`, then either:
 

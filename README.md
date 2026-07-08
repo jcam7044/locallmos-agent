@@ -21,13 +21,83 @@ irm https://locallmos.com/install.ps1 | iex
 ```
 
 This installs a signed binary to `/usr/local/bin` (or `%ProgramFiles%\LocalLMOS`),
-sets up a service, and — when you pass a pairing code — enrolls the rig. Binaries
-are verified by SHA-256 and [minisign](https://jedisct1.github.io/minisign/)
+launches the tray app, and — when you pass a pairing code — enrolls the rig.
+Binaries are verified by SHA-256 and [minisign](https://jedisct1.github.io/minisign/)
 signature; the agent re-verifies every self-update against an embedded public key.
 
 To install and enroll in one step (pairing code from the dashboard):
 ```sh
 curl -fsSL https://locallmos.com/install.sh | sh -s -- --code <CODE> --name "My Rig"
+```
+
+```powershell
+& ([scriptblock]::Create((irm https://locallmos.com/install.ps1))) -Code <CODE> -Name "My Rig"
+```
+
+For a dedicated headless rig, install the system service instead:
+```sh
+curl -fsSL https://locallmos.com/install.sh | sh -s -- --service --code <CODE> --name "My Rig"
+```
+
+```powershell
+& ([scriptblock]::Create((irm https://locallmos.com/install.ps1))) -Service -Code <CODE> -Name "My Rig"
+```
+
+## Uninstall
+
+**Linux / macOS desktop install:**
+```sh
+pkill -x locallmos-agent 2>/dev/null || true
+sudo rm -f /usr/local/bin/locallmos-agent
+```
+
+To also remove local enrollment and settings:
+```sh
+# Linux
+rm -rf ~/.config/locallmos-agent
+
+# macOS
+rm -rf "$HOME/Library/Application Support/locallmos-agent"
+```
+
+**Linux headless service:**
+```sh
+sudo systemctl disable --now locallmos-agent 2>/dev/null || true
+sudo rm -f /etc/systemd/system/locallmos-agent.service /usr/local/bin/locallmos-agent
+sudo systemctl daemon-reload
+```
+
+To also purge service credentials:
+```sh
+sudo rm -rf /etc/locallmos-agent
+```
+
+**macOS headless daemon:**
+```sh
+sudo launchctl unload -w /Library/LaunchDaemons/os.locallmos.agent.plist 2>/dev/null || true
+sudo rm -f /Library/LaunchDaemons/os.locallmos.agent.plist /usr/local/bin/locallmos-agent
+```
+
+To also purge service credentials:
+```sh
+sudo rm -rf /etc/locallmos-agent
+```
+
+**Windows (elevated PowerShell):**
+```powershell
+Stop-Process -Name locallmos-agent -Force -ErrorAction SilentlyContinue
+Stop-ScheduledTask -TaskName "LocalLMOS Agent" -ErrorAction SilentlyContinue
+Unregister-ScheduledTask -TaskName "LocalLMOS Agent" -Confirm:$false -ErrorAction SilentlyContinue
+Remove-Item "$env:ProgramFiles\LocalLMOS" -Recurse -Force -ErrorAction SilentlyContinue
+```
+
+To also remove enrollment, settings, and machine environment variables:
+```powershell
+Remove-Item "$env:APPDATA\locallmos-agent" -Recurse -Force -ErrorAction SilentlyContinue
+Remove-Item "$env:ProgramData\locallmos-agent" -Recurse -Force -ErrorAction SilentlyContinue
+[Environment]::SetEnvironmentVariable("LOCALLMOS_CONFIG_DIR", $null, "Machine")
+[Environment]::SetEnvironmentVariable("LOCALLMOS_SUPABASE_URL", $null, "Machine")
+[Environment]::SetEnvironmentVariable("LOCALLMOS_SUPABASE_ANON_KEY", $null, "Machine")
 ```
 
 ## Modes

@@ -10,7 +10,8 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "typecheck": "tsc --noEmit",
-    "lint": "tsc --noEmit"
+    "lint": "tsc --noEmit",
+    "agent": "tauri dev"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.1.1",

@@ -17,7 +17,7 @@ curl -fsSL https://locallmos.com/install.sh | sh
 
 **Windows (elevated PowerShell):**
 ```powershell
-irm https://locallmos.com/install.ps1 | iex
+iex ((curl.exe -fsSL https://locallmos.com/install.ps1) -join "`n")
 ```
 
 This installs a signed binary to `/usr/local/bin` on Linux, a `.app` bundle to
@@ -32,7 +32,7 @@ curl -fsSL https://locallmos.com/install.sh | sh -s -- --code <CODE> --name "My 
 ```
 
 ```powershell
-& ([scriptblock]::Create((irm https://locallmos.com/install.ps1))) -Code <CODE> -Name "My Rig"
+& ([scriptblock]::Create(((curl.exe -fsSL https://locallmos.com/install.ps1) -join "`n"))) -Code <CODE> -Name "My Rig"
 ```
 
 For a dedicated headless rig, install the system service instead:
@@ -41,7 +41,7 @@ curl -fsSL https://locallmos.com/install.sh | sh -s -- --service --code <CODE> -
 ```
 
 ```powershell
-& ([scriptblock]::Create((irm https://locallmos.com/install.ps1))) -Service -Code <CODE> -Name "My Rig"
+& ([scriptblock]::Create(((curl.exe -fsSL https://locallmos.com/install.ps1) -join "`n"))) -Service -Code <CODE> -Name "My Rig"
 ```
 
 ## Uninstall

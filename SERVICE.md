@@ -126,7 +126,7 @@ The public installer defaults to the desktop tray app. Pass `-Service` for a
 headless SYSTEM startup task:
 
 ```powershell
-& ([scriptblock]::Create((irm https://locallmos.com/install.ps1))) -Service -Code <CODE> -Name "Windows Rig"
+& ([scriptblock]::Create(((curl.exe -fsSL https://locallmos.com/install.ps1) -join "`n"))) -Service -Code <CODE> -Name "Windows Rig"
 ```
 
 Build `apps\agent\src-tauri\target\release\locallmos-agent.exe`, then either:

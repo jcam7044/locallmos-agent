@@ -1,6 +1,6 @@
 # LocalLMOS agent installer (Windows). Run in an elevated PowerShell:
 #
-#   irm https://get.locallmos.os/install.ps1 | iex           # desktop install
+#   iex ((curl.exe -fsSL https://locallmos.com/install.ps1) -join "`n")
 # or:
 #   .\install.ps1 -SupabaseUrl https://<ref>.supabase.co -AnonKey <ANON> `
 #     -Code <PAIRING_CODE> -Name "My Rig"

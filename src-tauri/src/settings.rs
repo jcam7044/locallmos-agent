@@ -15,11 +15,15 @@ pub struct Settings {
     pub update_check_secs: u64,
 }
 
+const DEFAULT_SUPABASE_URL: &str = "https://fvpjkpfshbvszbcknkqq.supabase.co";
+const DEFAULT_SUPABASE_ANON_KEY: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZ2cGprcGZzaGJ2c3piY2tua3FxIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODI5NzI3MjYsImV4cCI6MjA5ODU0ODcyNn0.b0FDzCAweH6VIwcumLKjNP959unJCUN_egZpb7KdCwg";
+
 impl Settings {
     pub fn from_env() -> Self {
         let supabase_url = std::env::var("LOCALLMOS_SUPABASE_URL")
-            .unwrap_or_else(|_| "http://localhost:54321".to_string());
-        let anon_key = std::env::var("LOCALLMOS_SUPABASE_ANON_KEY").unwrap_or_default();
+            .unwrap_or_else(|_| DEFAULT_SUPABASE_URL.to_string());
+        let anon_key = std::env::var("LOCALLMOS_SUPABASE_ANON_KEY")
+            .unwrap_or_else(|_| DEFAULT_SUPABASE_ANON_KEY.to_string());
         Self {
             supabase_url: supabase_url.trim_end_matches('/').to_string(),
             anon_key,

@@ -75,7 +75,9 @@ case "$arch" in
   *) echo "unsupported arch: $arch" >&2; exit 1 ;;
 esac
 PLATFORM="$OS-$ARCH"
-ASSET="locallmos-agent-$PLATFORM"
+RAW_ASSET="locallmos-agent-$PLATFORM"
+ASSET="$RAW_ASSET"
+INSTALL_KIND="raw"
 
 # Reject targets CI doesn't publish, so users get a clear message instead of a
 # confusing 404 on download. Keep in sync with the release.yml build matrix.
@@ -86,6 +88,10 @@ case "$PLATFORM" in
     exit 1 ;;
   *) echo "no prebuilt agent for $PLATFORM — see the release matrix." >&2; exit 1 ;;
 esac
+if [ "$OS" = "macos" ] && [ "$MODE" = "desktop" ]; then
+  ASSET="$RAW_ASSET.app.zip"
+  INSTALL_KIND="macos_app"
+fi
 
 # GitHub's /releases/latest/download/<asset> redirects to the newest release's
 # asset, so we need no API token or jq. A pinned version uses the tag path.
@@ -102,7 +108,16 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
 echo "==> Downloading $ASSET ($VERSION)"
-curl -fsSL "$BASE/$ASSET" -o "$TMP/agent"
+if ! curl -fsSL "$BASE/$ASSET" -o "$TMP/agent"; then
+  if [ "$INSTALL_KIND" = "macos_app" ]; then
+    echo "!! macOS app bundle artifact not found; falling back to raw agent binary."
+    ASSET="$RAW_ASSET"
+    INSTALL_KIND="raw"
+    curl -fsSL "$BASE/$ASSET" -o "$TMP/agent"
+  else
+    exit 1
+  fi
+fi
 curl -fsSL "$BASE/$ASSET.sha256" -o "$TMP/agent.sha256"
 curl -fsSL "$BASE/$ASSET.minisig" -o "$TMP/agent.minisig" || true
 
@@ -127,10 +142,33 @@ else
   echo "!! minisign not found — skipping signature check (checksum verified)."
 fi
 
-echo "==> Installing to $BIN_DST"
-chmod +x "$TMP/agent"
-sudo mkdir -p /usr/local/bin
-sudo install -m 0755 "$TMP/agent" "$BIN_DST"
+if [ "$INSTALL_KIND" = "macos_app" ]; then
+  APP_DST="/Applications/LocaLLMOS Agent.app"
+  echo "==> Installing app to $APP_DST"
+  need ditto
+  ditto -x -k "$TMP/agent" "$TMP/app"
+  APP_SRC="$TMP/app/LocaLLMOS Agent.app"
+  if [ ! -d "$APP_SRC" ]; then
+    echo "app bundle artifact did not contain LocaLLMOS Agent.app" >&2
+    exit 1
+  fi
+  sudo ditto "$APP_SRC" "$APP_DST"
+  sudo mkdir -p /usr/local/bin
+  APP_BIN="$APP_DST/Contents/MacOS/locallmos-agent"
+  if [ ! -x "$APP_BIN" ]; then
+    APP_BIN="$APP_DST/Contents/MacOS/LocaLLMOS Agent"
+  fi
+  if [ ! -x "$APP_BIN" ]; then
+    echo "could not find executable inside $APP_DST" >&2
+    exit 1
+  fi
+  sudo ln -sf "$APP_BIN" "$BIN_DST"
+else
+  echo "==> Installing to $BIN_DST"
+  chmod +x "$TMP/agent"
+  sudo mkdir -p /usr/local/bin
+  sudo install -m 0755 "$TMP/agent" "$BIN_DST"
+fi
 
 user_config_file() {
   if [ "$OS" = "macos" ]; then
@@ -157,6 +195,13 @@ launch_desktop() {
       echo "   Install your distro's WebKitGTK/GTK/AppIndicator packages, then run: $BIN_DST"
       return
     fi
+  fi
+  if [ "$OS" = "macos" ] && [ -d "/Applications/LocaLLMOS Agent.app" ]; then
+    echo "==> Launching LocalLMOS Agent"
+    open "/Applications/LocaLLMOS Agent.app"
+    sleep 2
+    echo "==> Done. LocalLMOS Agent is running in your desktop session."
+    return
   fi
 
   echo "==> Launching LocalLMOS Agent"

@@ -20,8 +20,9 @@ curl -fsSL https://locallmos.com/install.sh | sh
 irm https://locallmos.com/install.ps1 | iex
 ```
 
-This installs a signed binary to `/usr/local/bin` (or `%ProgramFiles%\LocalLMOS`),
-launches the tray app, and — when you pass a pairing code — enrolls the rig.
+This installs a signed binary to `/usr/local/bin` on Linux, a `.app` bundle to
+`/Applications` on macOS, or `%ProgramFiles%\LocalLMOS` on Windows. It launches
+the tray app and — when you pass a pairing code — enrolls the rig.
 Binaries are verified by SHA-256 and [minisign](https://jedisct1.github.io/minisign/)
 signature; the agent re-verifies every self-update against an embedded public key.
 
@@ -49,6 +50,7 @@ curl -fsSL https://locallmos.com/install.sh | sh -s -- --service --code <CODE> -
 ```sh
 pkill -x locallmos-agent 2>/dev/null || true
 sudo rm -f /usr/local/bin/locallmos-agent
+sudo rm -rf "/Applications/LocaLLMOS Agent.app" 2>/dev/null || true
 ```
 
 To also remove local enrollment and settings:
@@ -113,10 +115,25 @@ Remove-Item "$env:ProgramData\locallmos-agent" -Recurse -Force -ErrorAction Sile
 Requires Rust and [pnpm](https://pnpm.io). On Linux you also need the WebKitGTK
 stack (`libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev`).
 
+If `pnpm tauri ...` reports that it cannot run `cargo metadata`, install Rust
+and make sure Cargo is on your shell path:
+
+```sh
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+. "$HOME/.cargo/env"
+```
+
 ```sh
 pnpm install
 pnpm build                              # build the tray UI (embedded by Tauri)
 cargo build --release --manifest-path src-tauri/Cargo.toml
+```
+
+To test the macOS desktop app bundle locally:
+
+```sh
+pnpm tauri build --bundles app
+open "src-tauri/target/release/bundle/macos/LocaLLMOS Agent.app"
 ```
 
 The version is derived from the git tag at release time (`scripts/set-version.mjs`);

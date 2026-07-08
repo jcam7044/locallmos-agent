@@ -58,16 +58,17 @@ jobs:
       - name: Set version from tag
         run: node scripts/set-version.mjs "${{ github.ref_name }}"
 
-      # No committed lockfile in the standalone repo (the monorepo's lived at its
-      # root), so don't require a frozen one. Commit a pnpm-lock.yaml later for
-      # reproducible installs if desired.
       - name: Build frontend (embedded by tauri::generate_context!)
         run: |
-          pnpm install --no-frozen-lockfile
+          pnpm install --frozen-lockfile
           pnpm build
 
       - name: Build release binary
         run: cargo build --release --manifest-path src-tauri/Cargo.toml
+
+      - name: Build macOS app bundle
+        if: matrix.platform == 'macos-aarch64'
+        run: pnpm tauri build --bundles app
 
       - name: Stage artifact
         shell: bash
@@ -75,6 +76,11 @@ jobs:
           mkdir -p dist
           cp "src-tauri/target/release/${{ matrix.bin }}" \
              "dist/locallmos-agent-${{ matrix.platform }}${{ matrix.bin == 'locallmos-agent.exe' && '.exe' || '' }}"
+          if [[ "${{ matrix.platform }}" == "macos-aarch64" ]]; then
+            ditto -c -k --sequesterRsrc --keepParent \
+              "src-tauri/target/release/bundle/macos/LocaLLMOS Agent.app" \
+              "dist/locallmos-agent-${{ matrix.platform }}.app.zip"
+          fi
 
       - uses: actions/upload-artifact@v4
         with:

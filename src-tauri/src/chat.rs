@@ -263,6 +263,7 @@ pub async fn process(state: &Arc<AppState>, pending: ChatPending) -> Result<()> 
                     Value::Array(messages.clone()),
                     pending.think,
                     tools_value.as_ref(),
+                    None,
                     cancel.clone(),
                     move |delta| {
                         if !first_token.swap(true, Ordering::Relaxed) {

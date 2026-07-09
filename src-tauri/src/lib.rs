@@ -9,7 +9,9 @@
 //! and service modes; only the shell differs.
 
 mod chat;
+mod chat_store;
 mod config;
+mod local_chat;
 mod monitor;
 mod realtime;
 pub mod runtime;
@@ -26,13 +28,13 @@ use std::time::Duration;
 
 use config::AgentConfig;
 use monitor::Monitor;
-use runtime::ollama::{ChatDelta, OllamaAdapter};
+use runtime::ollama::OllamaAdapter;
 use runtime::RuntimeAdapter;
 use serde_json::{json, Value};
 use settings::Settings;
 use status::AgentStatus;
 use supabase::Supabase;
-use tauri::{Emitter, State};
+use tauri::State;
 use tauri_plugin_autostart::MacosLauncher;
 use tokio::sync::Mutex;
 
@@ -48,6 +50,8 @@ pub struct AppState {
     pub realtime: Arc<realtime::RealtimeHandle>,
     /// In-flight chat turns → cancel flag, for stop-generation.
     pub cancels: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    /// Serializes chat-session file writes (save vs rename vs delete).
+    pub chat_lock: Mutex<()>,
     /// Shared HTTP client, reused for the web_fetch tool (direct GET from the rig).
     pub http: reqwest::Client,
 }
@@ -83,6 +87,7 @@ fn build_state() -> Arc<AppState> {
         monitor: Mutex::new(Monitor::new()),
         realtime: Arc::new(realtime::RealtimeHandle::new()),
         cancels: Mutex::new(HashMap::new()),
+        chat_lock: Mutex::new(()),
         http,
     })
 }
@@ -155,27 +160,112 @@ async fn restart_runtime(state: State<'_, Arc<AppState>>) -> Result<(), String> 
     state.ollama.restart().await.map_err(|e| e.to_string())
 }
 
-/// Stream a local chat turn. `messages` is Ollama's chat array
-/// (`[{"role","content"}, …]`). Content deltas are emitted as `local-chat-delta`
-/// events; the assembled reply is returned.
+/// Run one persisted local chat turn. Deltas stream as `local-chat` events
+/// (payloads carry `requestId`); the final assistant message is returned and
+/// already saved to the session file.
 #[tauri::command]
-async fn local_chat(
+async fn local_chat_send(
     app: tauri::AppHandle,
     state: State<'_, Arc<AppState>>,
+    session_id: String,
+    request_id: String,
+    content: String,
+    attachments: Option<Vec<chat_store::Attachment>>,
+    regenerate: Option<bool>,
+) -> Result<chat_store::StoredMessage, String> {
+    local_chat::send(
+        app,
+        state.inner().clone(),
+        session_id,
+        request_id,
+        content,
+        attachments.unwrap_or_default(),
+        regenerate.unwrap_or(false),
+    )
+    .await
+}
+
+/// Stop an in-flight local chat turn; the partial reply is still persisted.
+#[tauri::command]
+async fn local_chat_cancel(
+    state: State<'_, Arc<AppState>>,
+    request_id: String,
+) -> Result<(), String> {
+    if let Some(flag) = state.cancels.lock().await.get(&request_id) {
+        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    Ok(())
+}
+
+// --- Persistent chat sessions (local, on-disk) ------------------------------
+
+#[tauri::command]
+async fn chat_list_sessions(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<chat_store::SessionMeta>, String> {
+    let _guard = state.chat_lock.lock().await;
+    chat_store::list().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn chat_create_session(
+    state: State<'_, Arc<AppState>>,
     model: String,
-    messages: Value,
-) -> Result<String, String> {
-    let cancel = Arc::new(AtomicBool::new(false));
-    let out = state
-        .ollama
-        .chat_stream(&model, messages, false, None, cancel, |delta| {
-            if let ChatDelta::Content(s) = delta {
-                let _ = app.emit("local-chat-delta", s);
-            }
-        })
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok(out.content)
+) -> Result<chat_store::ChatSession, String> {
+    let _guard = state.chat_lock.lock().await;
+    let session = chat_store::ChatSession::new(model);
+    chat_store::save(&session).map_err(|e| e.to_string())?;
+    Ok(session)
+}
+
+#[tauri::command]
+async fn chat_get_session(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+) -> Result<chat_store::ChatSession, String> {
+    let _guard = state.chat_lock.lock().await;
+    chat_store::load(&id).map_err(|e| e.to_string())
+}
+
+/// Rename keeps `updated_at` untouched so the sidebar order doesn't jump.
+#[tauri::command]
+async fn chat_rename_session(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+    title: String,
+) -> Result<(), String> {
+    let _guard = state.chat_lock.lock().await;
+    let mut session = chat_store::load(&id).map_err(|e| e.to_string())?;
+    session.title = title;
+    chat_store::save(&session).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn chat_delete_session(state: State<'_, Arc<AppState>>, id: String) -> Result<(), String> {
+    let _guard = state.chat_lock.lock().await;
+    chat_store::delete(&id).map_err(|e| e.to_string())
+}
+
+/// Patch a session's model + generation settings (toggles, system prompt, …).
+#[tauri::command]
+async fn chat_update_settings(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+    model: String,
+    settings: chat_store::SessionSettings,
+) -> Result<(), String> {
+    let _guard = state.chat_lock.lock().await;
+    let mut session = chat_store::load(&id).map_err(|e| e.to_string())?;
+    session.model = model;
+    session.settings = settings;
+    chat_store::save(&session).map_err(|e| e.to_string())
+}
+
+/// Read a locally dropped file (drag-drop delivers paths, not contents) into a
+/// chat attachment: images inline as base64, UTF-8 files as capped text.
+#[tauri::command]
+async fn read_dropped_file(path: String) -> Result<chat_store::Attachment, String> {
+    chat_store::attachment_from_path(&path).map_err(|e| e.to_string())
 }
 
 /// Check GitHub Releases directly (no account) and self-update if a newer version
@@ -345,8 +435,16 @@ fn run_gui() {
             local_status,
             load_model,
             restart_runtime,
-            local_chat,
-            local_update
+            local_chat_send,
+            local_chat_cancel,
+            local_update,
+            chat_list_sessions,
+            chat_create_session,
+            chat_get_session,
+            chat_rename_session,
+            chat_delete_session,
+            chat_update_settings,
+            read_dropped_file
         ])
         .run(tauri::generate_context!())
         .expect("error while running LocalLMOS agent");

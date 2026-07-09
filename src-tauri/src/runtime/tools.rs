@@ -16,39 +16,50 @@ pub fn is_builtin(name: &str) -> bool {
     name == WEB_SEARCH || name == WEB_FETCH
 }
 
-/// Ollama `tools` array for the built-in web tools.
-pub fn builtin_defs() -> Value {
-    json!([
-        {
-            "type": "function",
-            "function": {
-                "name": WEB_SEARCH,
-                "description": "Search the web for up-to-date information. Returns a list of results with titles, URLs, and snippets.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "query": { "type": "string", "description": "The search query." },
-                        "count": { "type": "integer", "description": "Number of results (1-10).", "default": 5 }
-                    },
-                    "required": ["query"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": WEB_FETCH,
-                "description": "Fetch a web page by URL and return its readable text content. Use after web_search to read a promising result.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "url": { "type": "string", "description": "The absolute URL to fetch." }
-                    },
-                    "required": ["url"]
-                }
+fn web_search_def() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": WEB_SEARCH,
+            "description": "Search the web for up-to-date information. Returns a list of results with titles, URLs, and snippets.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "The search query." },
+                    "count": { "type": "integer", "description": "Number of results (1-10).", "default": 5 }
+                },
+                "required": ["query"]
             }
         }
-    ])
+    })
+}
+
+fn web_fetch_def() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": WEB_FETCH,
+            "description": "Fetch a web page by URL and return its readable text content. Use after web_search to read a promising result.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": { "type": "string", "description": "The absolute URL to fetch." }
+                },
+                "required": ["url"]
+            }
+        }
+    })
+}
+
+/// Ollama `tools` array for the built-in web tools.
+pub fn builtin_defs() -> Value {
+    json!([web_search_def(), web_fetch_def()])
+}
+
+/// Just `web_fetch` — the tool set for unenrolled rigs, where `web_search`
+/// (which relays through the cloud edge function) is unavailable.
+pub fn fetch_only_defs() -> Value {
+    json!([web_fetch_def()])
 }
 
 /// Max characters of extracted page text handed back to the model.

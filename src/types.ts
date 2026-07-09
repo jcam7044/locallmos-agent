@@ -34,8 +34,6 @@ export type LocalStatus = {
   };
 };
 
-export type ChatMsg = { role: "user" | "assistant"; content: string };
-
 // --- Persistent chat sessions (mirror src-tauri/src/chat_store.rs) ---------
 
 export type SessionSettings = {
@@ -85,6 +83,14 @@ export type ChatSession = {
   settings: SessionSettings;
   messages: StoredMessage[];
 };
+
+/** Streamed delta events emitted by the backend on the "local-chat" event. */
+export type LocalChatEvent = { requestId: string; sessionId: string } & (
+  | { type: "content"; delta: string }
+  | { type: "thinking"; delta: string }
+  | { type: "tool"; name: string; arguments: string }
+  | { type: "tool_result"; name: string; summary: string }
+);
 
 export function newUserMessage(content: string, attachments: Attachment[] = []): StoredMessage {
   return {

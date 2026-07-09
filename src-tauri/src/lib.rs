@@ -11,6 +11,7 @@
 mod chat;
 mod chat_store;
 mod config;
+mod local_chat;
 mod monitor;
 mod realtime;
 pub mod runtime;
@@ -27,13 +28,13 @@ use std::time::Duration;
 
 use config::AgentConfig;
 use monitor::Monitor;
-use runtime::ollama::{ChatDelta, OllamaAdapter};
+use runtime::ollama::OllamaAdapter;
 use runtime::RuntimeAdapter;
 use serde_json::{json, Value};
 use settings::Settings;
 use status::AgentStatus;
 use supabase::Supabase;
-use tauri::{Emitter, State};
+use tauri::State;
 use tauri_plugin_autostart::MacosLauncher;
 use tokio::sync::Mutex;
 
@@ -159,27 +160,41 @@ async fn restart_runtime(state: State<'_, Arc<AppState>>) -> Result<(), String> 
     state.ollama.restart().await.map_err(|e| e.to_string())
 }
 
-/// Stream a local chat turn. `messages` is Ollama's chat array
-/// (`[{"role","content"}, …]`). Content deltas are emitted as `local-chat-delta`
-/// events; the assembled reply is returned.
+/// Run one persisted local chat turn. Deltas stream as `local-chat` events
+/// (payloads carry `requestId`); the final assistant message is returned and
+/// already saved to the session file.
 #[tauri::command]
-async fn local_chat(
+async fn local_chat_send(
     app: tauri::AppHandle,
     state: State<'_, Arc<AppState>>,
-    model: String,
-    messages: Value,
-) -> Result<String, String> {
-    let cancel = Arc::new(AtomicBool::new(false));
-    let out = state
-        .ollama
-        .chat_stream(&model, messages, false, None, cancel, |delta| {
-            if let ChatDelta::Content(s) = delta {
-                let _ = app.emit("local-chat-delta", s);
-            }
-        })
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok(out.content)
+    session_id: String,
+    request_id: String,
+    content: String,
+    attachments: Option<Vec<chat_store::Attachment>>,
+    regenerate: Option<bool>,
+) -> Result<chat_store::StoredMessage, String> {
+    local_chat::send(
+        app,
+        state.inner().clone(),
+        session_id,
+        request_id,
+        content,
+        attachments.unwrap_or_default(),
+        regenerate.unwrap_or(false),
+    )
+    .await
+}
+
+/// Stop an in-flight local chat turn; the partial reply is still persisted.
+#[tauri::command]
+async fn local_chat_cancel(
+    state: State<'_, Arc<AppState>>,
+    request_id: String,
+) -> Result<(), String> {
+    if let Some(flag) = state.cancels.lock().await.get(&request_id) {
+        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    Ok(())
 }
 
 // --- Persistent chat sessions (local, on-disk) ------------------------------
@@ -413,7 +428,8 @@ fn run_gui() {
             local_status,
             load_model,
             restart_runtime,
-            local_chat,
+            local_chat_send,
+            local_chat_cancel,
             local_update,
             chat_list_sessions,
             chat_create_session,

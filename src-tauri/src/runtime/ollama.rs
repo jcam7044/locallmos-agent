@@ -123,6 +123,11 @@ impl OllamaAdapter {
         self.capabilities(model).await.iter().any(|c| c == "tools")
     }
 
+    /// Whether `model` advertises reasoning ("thinking") support.
+    pub async fn model_supports_thinking(&self, model: &str) -> bool {
+        self.capabilities(model).await.iter().any(|c| c == "thinking")
+    }
+
     async fn version(&self) -> Option<String> {
         let resp = self
             .http
@@ -167,6 +172,7 @@ impl OllamaAdapter {
         messages: Value,
         think: bool,
         tools: Option<&Value>,
+        options: Option<&Value>,
         cancel: Arc<AtomicBool>,
         mut on_delta: F,
     ) -> Result<ChatOutput> {
@@ -178,6 +184,12 @@ impl OllamaAdapter {
         });
         if think {
             body["think"] = Value::Bool(true);
+        }
+        // Generation options (temperature, num_ctx, …) when the caller has any.
+        if let Some(o) = options {
+            if o.as_object().map(|m| !m.is_empty()).unwrap_or(false) {
+                body["options"] = o.clone();
+            }
         }
         // Only advertise tools when the round has any — otherwise a plain chat.
         if let Some(t) = tools {

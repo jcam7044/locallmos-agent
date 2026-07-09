@@ -1,11 +1,12 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   AgentStatus,
-  ChatMsg,
+  Attachment,
   ChatSession,
   LocalStatus,
   SessionMeta,
   SessionSettings,
+  StoredMessage,
 } from "./types";
 
 export const getLocalStatus = () => invoke<LocalStatus>("local_status");
@@ -14,8 +15,16 @@ export const loadModel = (model: string) => invoke("load_model", { model });
 export const restartRuntime = () => invoke("restart_runtime");
 export const localUpdate = () => invoke<string | null>("local_update");
 export const enroll = (code: string, name: string) => invoke("enroll", { code, name });
-export const localChat = (model: string, messages: ChatMsg[]) =>
-  invoke<string>("local_chat", { model, messages });
+export const localChatSend = (args: {
+  sessionId: string;
+  requestId: string;
+  content: string;
+  attachments?: Attachment[];
+  regenerate?: boolean;
+}) => invoke<StoredMessage>("local_chat_send", args);
+
+export const localChatCancel = (requestId: string) =>
+  invoke("local_chat_cancel", { requestId });
 
 export const chatListSessions = () => invoke<SessionMeta[]>("chat_list_sessions");
 export const chatCreateSession = (model: string) =>

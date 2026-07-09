@@ -1,5 +1,8 @@
-import { useState } from "react";
-import { buttonStyle, inputStyle } from "../styles";
+import { useRef, useState } from "react";
+import { buttonStyle, inputStyle, secondaryButton } from "../styles";
+import { AttachmentChip } from "./AttachmentChip";
+import { FILE_ACCEPT } from "./attachments";
+import type { Attachment } from "../types";
 
 export function Composer({
   disabled,
@@ -9,6 +12,13 @@ export function Composer({
   think,
   canThink,
   onToggleThink,
+  webTools,
+  canWebTools,
+  webToolsHint,
+  onToggleWebTools,
+  attachments,
+  onAddFiles,
+  onRemoveAttachment,
 }: {
   disabled: boolean;
   streaming: boolean;
@@ -17,18 +27,33 @@ export function Composer({
   think: boolean;
   canThink: boolean;
   onToggleThink: () => void;
+  webTools: boolean;
+  canWebTools: boolean;
+  webToolsHint?: string;
+  onToggleWebTools: () => void;
+  attachments: Attachment[];
+  onAddFiles: (files: FileList) => void;
+  onRemoveAttachment: (index: number) => void;
 }) {
   const [input, setInput] = useState("");
+  const fileInput = useRef<HTMLInputElement>(null);
 
   const send = () => {
     const text = input.trim();
-    if (!text || disabled || streaming) return;
+    if ((!text && attachments.length === 0) || disabled || streaming) return;
     setInput("");
     onSend(text);
   };
 
   return (
     <div>
+      {attachments.length > 0 && (
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 6 }}>
+          {attachments.map((a, i) => (
+            <AttachmentChip key={i} attachment={a} onRemove={() => onRemoveAttachment(i)} />
+          ))}
+        </div>
+      )}
       <div style={{ display: "flex", gap: 6, marginBottom: 6 }}>
         <TogglePill
           on={think && canThink}
@@ -38,8 +63,36 @@ export function Composer({
         >
           💭 Think
         </TogglePill>
+        {canWebTools && (
+          <TogglePill
+            on={webTools}
+            title={webToolsHint ?? "Let the model search and fetch the web"}
+            onClick={onToggleWebTools}
+          >
+            🌐 Web
+          </TogglePill>
+        )}
       </div>
       <div style={{ display: "flex", gap: 8, alignItems: "flex-end" }}>
+        <input
+          ref={fileInput}
+          type="file"
+          multiple
+          accept={FILE_ACCEPT}
+          style={{ display: "none" }}
+          onChange={(e) => {
+            if (e.target.files?.length) onAddFiles(e.target.files);
+            e.target.value = "";
+          }}
+        />
+        <button
+          onClick={() => fileInput.current?.click()}
+          disabled={disabled}
+          title="Attach images or text files (or drop them anywhere)"
+          style={{ ...secondaryButton, padding: "8px 10px", flexShrink: 0 }}
+        >
+          📎
+        </button>
         <textarea
           placeholder="Message  (Enter to send, Shift+Enter for a new line)"
           value={input}
@@ -68,7 +121,7 @@ export function Composer({
         ) : (
           <button
             onClick={send}
-            disabled={disabled || streaming || !input.trim()}
+            disabled={disabled || streaming || (!input.trim() && attachments.length === 0)}
             style={buttonStyle}
           >
             Send

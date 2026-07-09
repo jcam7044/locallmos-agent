@@ -67,7 +67,11 @@ export function App() {
           <ConnectCloud status={status} onEnrolled={refresh} />
         </>
       ) : (
-        <ChatView models={local?.models ?? []} running={running} />
+        <ChatView
+          models={local?.models ?? []}
+          running={running}
+          enrolled={status?.enrolled ?? false}
+        />
       )}
 
       {error && <p style={{ color: "#f87171", fontSize: 12, marginTop: 12 }}>{error}</p>}

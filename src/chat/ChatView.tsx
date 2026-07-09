@@ -1,4 +1,6 @@
 import { useEffect, useRef, useState } from "react";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
+import type { UnlistenFn } from "@tauri-apps/api/event";
 import {
   chatCreateSession,
   chatDeleteSession,
@@ -8,15 +10,18 @@ import {
   chatUpdateSettings,
   localChatCancel,
   localChatSend,
+  readDroppedFile,
 } from "../api";
 import { card, label, secondaryButton } from "../styles";
 import {
   newUserMessage,
+  type Attachment,
   type ChatSession,
   type LocalModel,
   type SessionMeta,
   type SessionSettings,
 } from "../types";
+import { fileToAttachment } from "./attachments";
 import { Composer } from "./Composer";
 import { Conversation } from "./Conversation";
 import { ModelPicker } from "./ModelPicker";
@@ -24,7 +29,15 @@ import { SessionSettingsPanel } from "./SessionSettingsPanel";
 import { Sidebar } from "./Sidebar";
 import { useChatStream } from "./useChatStream";
 
-export function ChatView({ models, running }: { models: LocalModel[]; running: boolean }) {
+export function ChatView({
+  models,
+  running,
+  enrolled,
+}: {
+  models: LocalModel[];
+  running: boolean;
+  enrolled: boolean;
+}) {
   const [sessions, setSessions] = useState<SessionMeta[]>([]);
   const [active, setActive] = useState<ChatSession | null>(null);
   const [streaming, setStreaming] = useState(false);
@@ -109,10 +122,57 @@ export function ChatView({ models, running }: { models: LocalModel[]; running: b
 
   const selectedModel = models.find((m) => m.name === active?.model);
   const canThink = selectedModel?.capabilities.includes("thinking") ?? false;
+  const canVision = selectedModel?.capabilities.includes("vision") ?? false;
+  const canWebTools = selectedModel?.capabilities.includes("tools") ?? false;
+  const canVisionRef = useRef(canVision);
+  canVisionRef.current = canVision;
+
+  // --- Attachments -----------------------------------------------------------
+  const [pending, setPending] = useState<Attachment[]>([]);
+
+  const addAttachment = (a: Attachment) => {
+    if (a.kind === "image" && !canVisionRef.current) {
+      setError(`${a.name}: the selected model doesn't support images.`);
+      return;
+    }
+    setPending((p) => [...p, a]);
+    setError(null);
+  };
+
+  const addFiles = (files: FileList) => {
+    for (const f of Array.from(files)) {
+      fileToAttachment(f).then(addAttachment, (e) => setError(String(e)));
+    }
+  };
+
+  // Native drag-drop delivers file *paths* (Tauri intercepts HTML5 drops);
+  // the backend reads them into attachments.
+  useEffect(() => {
+    let unlisten: UnlistenFn | undefined;
+    let disposed = false;
+    void getCurrentWebview()
+      .onDragDropEvent((e) => {
+        if (e.payload.type !== "drop") return;
+        for (const path of e.payload.paths) {
+          readDroppedFile(path).then(addAttachment, (err) => setError(String(err)));
+        }
+      })
+      .then((un) => {
+        if (disposed) un();
+        else unlisten = un;
+      });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
 
   // Run one turn: optimistic local update, stream, then re-sync from disk
   // (canonical messages, auto-title, updated ordering).
-  const runTurn = async (session: ChatSession, args: { content: string; regenerate?: boolean }) => {
+  const runTurn = async (
+    session: ChatSession,
+    args: { content: string; attachments?: Attachment[]; regenerate?: boolean },
+  ) => {
     const requestId = crypto.randomUUID();
     activeRequest.current = requestId;
     setError(null);
@@ -155,9 +215,11 @@ export function ChatView({ models, running }: { models: LocalModel[]; running: b
       setError("No model selected.");
       return;
     }
+    const attachments = pending;
+    setPending([]);
     // Optimistic user message; the backend persists the same thing.
-    setActive({ ...session, messages: [...session.messages, newUserMessage(text)] });
-    await runTurn(session, { content: text });
+    setActive({ ...session, messages: [...session.messages, newUserMessage(text, attachments)] });
+    await runTurn(session, { content: text, attachments });
   };
 
   const regenerate = async () => {
@@ -251,6 +313,17 @@ export function ChatView({ models, running }: { models: LocalModel[]; running: b
           think={active?.settings.think ?? false}
           canThink={canThink}
           onToggleThink={() => patchSettings({ think: !(active?.settings.think ?? false) })}
+          webTools={active?.settings.webTools ?? false}
+          canWebTools={canWebTools}
+          webToolsHint={
+            enrolled
+              ? "Let the model search and fetch the web"
+              : "Page fetch works offline; web search needs a cloud connection"
+          }
+          onToggleWebTools={() => patchSettings({ webTools: !(active?.settings.webTools ?? false) })}
+          attachments={pending}
+          onAddFiles={addFiles}
+          onRemoveAttachment={(i) => setPending((p) => p.filter((_, idx) => idx !== i))}
         />
         {error && <p style={{ color: "#f87171", fontSize: 12, marginTop: 8 }}>{error}</p>}
       </div>

@@ -261,6 +261,13 @@ async fn chat_update_settings(
     chat_store::save(&session).map_err(|e| e.to_string())
 }
 
+/// Read a locally dropped file (drag-drop delivers paths, not contents) into a
+/// chat attachment: images inline as base64, UTF-8 files as capped text.
+#[tauri::command]
+async fn read_dropped_file(path: String) -> Result<chat_store::Attachment, String> {
+    chat_store::attachment_from_path(&path).map_err(|e| e.to_string())
+}
+
 /// Check GitHub Releases directly (no account) and self-update if a newer version
 /// exists. Returns the new version when it updated, `None` when already current.
 #[tauri::command]
@@ -436,7 +443,8 @@ fn run_gui() {
             chat_get_session,
             chat_rename_session,
             chat_delete_session,
-            chat_update_settings
+            chat_update_settings,
+            read_dropped_file
         ])
         .run(tauri::generate_context!())
         .expect("error while running LocalLMOS agent");

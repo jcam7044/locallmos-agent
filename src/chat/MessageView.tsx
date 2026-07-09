@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { label } from "../styles";
+import { AttachmentChip } from "./AttachmentChip";
 import { Markdown } from "./Markdown";
 import { ThinkingBlock } from "./ThinkingBlock";
 import type { StoredMessage } from "../types";
@@ -31,6 +32,21 @@ export function MessageView({
 
   return (
     <div style={{ marginBottom: 10, textAlign: user ? "right" : "left" }}>
+      {message.attachments.length > 0 && (
+        <div
+          style={{
+            display: "flex",
+            flexWrap: "wrap",
+            gap: 6,
+            marginBottom: 4,
+            justifyContent: user ? "flex-end" : "flex-start",
+          }}
+        >
+          {message.attachments.map((a, i) => (
+            <AttachmentChip key={i} attachment={a} />
+          ))}
+        </div>
+      )}
       {!user && message.thinking && (
         <ThinkingBlock
           thinking={message.thinking}

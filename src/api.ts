@@ -26,6 +26,9 @@ export const localChatSend = (args: {
 export const localChatCancel = (requestId: string) =>
   invoke("local_chat_cancel", { requestId });
 
+export const readDroppedFile = (path: string) =>
+  invoke<Attachment>("read_dropped_file", { path });
+
 export const chatListSessions = () => invoke<SessionMeta[]>("chat_list_sessions");
 export const chatCreateSession = (model: string) =>
   invoke<ChatSession>("chat_create_session", { model });

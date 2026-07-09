@@ -167,6 +167,76 @@ pub fn delete(id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Cap on inlined text-file content (chars); larger files are truncated.
+pub const TEXT_ATTACHMENT_CAP: usize = 32 * 1024;
+/// Cap on image attachment size (bytes) — inline base64 in the session JSON.
+const IMAGE_ATTACHMENT_CAP: u64 = 15 * 1024 * 1024;
+
+const IMAGE_EXTS: &[(&str, &str)] = &[
+    ("png", "image/png"),
+    ("jpg", "image/jpeg"),
+    ("jpeg", "image/jpeg"),
+    ("webp", "image/webp"),
+    ("gif", "image/gif"),
+];
+
+/// Build an `Attachment` from a local file path (native drag-drop hands the
+/// webview paths, not file contents). Kind is sniffed from the extension:
+/// known image types are inlined as base64, anything else is treated as text
+/// (with a UTF-8 validity check so binaries are rejected).
+pub fn attachment_from_path(path: &str) -> Result<Attachment> {
+    use base64::Engine;
+
+    let p = std::path::Path::new(path);
+    let name = p
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("file")
+        .to_string();
+    let ext = p
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+
+    if let Some((_, mime)) = IMAGE_EXTS.iter().find(|(e, _)| *e == ext) {
+        let meta = std::fs::metadata(p).context("cannot read file")?;
+        if meta.len() > IMAGE_ATTACHMENT_CAP {
+            anyhow::bail!("image too large (max 15 MB)");
+        }
+        let bytes = std::fs::read(p).context("cannot read file")?;
+        return Ok(Attachment {
+            kind: "image".into(),
+            name,
+            mime: mime.to_string(),
+            size_bytes: bytes.len() as u64,
+            data: Some(base64::engine::general_purpose::STANDARD.encode(bytes)),
+            text: None,
+        });
+    }
+
+    let bytes = std::fs::read(p).context("cannot read file")?;
+    let size = bytes.len() as u64;
+    let mut text = String::from_utf8(bytes)
+        .map_err(|_| anyhow::anyhow!("unsupported file type (not an image or UTF-8 text)"))?;
+    if text.len() > TEXT_ATTACHMENT_CAP {
+        let mut end = TEXT_ATTACHMENT_CAP;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+        text.push_str("\n…[truncated]");
+    }
+    Ok(Attachment {
+        kind: "text".into(),
+        name,
+        mime: "text/plain".into(),
+        size_bytes: size,
+        data: None,
+        text: Some(text),
+    })
+}
+
 /// Session title derived from the first user message: first line, cut at a
 /// word boundary near 48 chars.
 pub fn derive_title(content: &str) -> String {

@@ -1,3 +1,4 @@
+import { ThinkingBlock } from "./ThinkingBlock";
 import type { StoredMessage } from "../types";
 
 export function MessageView({
@@ -10,6 +11,13 @@ export function MessageView({
   const user = message.role === "user";
   return (
     <div style={{ marginBottom: 10, textAlign: user ? "right" : "left" }}>
+      {!user && message.thinking && (
+        <ThinkingBlock
+          thinking={message.thinking}
+          streaming={streaming}
+          hasContent={message.content.length > 0}
+        />
+      )}
       <span
         style={{
           display: "inline-block",
@@ -24,7 +32,7 @@ export function MessageView({
           border: user ? "none" : "1px solid #1f2937",
         }}
       >
-        {message.content || (streaming ? "…" : "")}
+        {message.content || (streaming && !message.thinking ? "…" : "")}
         {message.cancelled && (
           <span style={{ color: "#94a3b8", fontStyle: "italic" }}> (stopped)</span>
         )}

@@ -9,11 +9,18 @@ import {
   localChatCancel,
   localChatSend,
 } from "../api";
-import { card, label } from "../styles";
-import { newUserMessage, type ChatSession, type LocalModel, type SessionMeta } from "../types";
+import { card, label, secondaryButton } from "../styles";
+import {
+  newUserMessage,
+  type ChatSession,
+  type LocalModel,
+  type SessionMeta,
+  type SessionSettings,
+} from "../types";
 import { Composer } from "./Composer";
 import { Conversation } from "./Conversation";
 import { ModelPicker } from "./ModelPicker";
+import { SessionSettingsPanel } from "./SessionSettingsPanel";
 import { Sidebar } from "./Sidebar";
 import { useChatStream } from "./useChatStream";
 
@@ -22,8 +29,10 @@ export function ChatView({ models, running }: { models: LocalModel[]; running: b
   const [active, setActive] = useState<ChatSession | null>(null);
   const [streaming, setStreaming] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const { stream, begin, end } = useChatStream();
   const activeRequest = useRef<string | null>(null);
+  const saveTimer = useRef<number | undefined>(undefined);
 
   const defaultModel = () => (models.find((m) => m.loaded) ?? models[0])?.name ?? "";
 
@@ -86,6 +95,20 @@ export function ChatView({ models, running }: { models: LocalModel[]; running: b
     setActive(next);
     chatUpdateSettings(next.id, model, next.settings).catch((e) => setError(String(e)));
   };
+
+  // Debounced so typing in the system-prompt field doesn't write per keystroke.
+  const patchSettings = (patch: Partial<SessionSettings>) => {
+    if (!active) return;
+    const next = { ...active, settings: { ...active.settings, ...patch } };
+    setActive(next);
+    window.clearTimeout(saveTimer.current);
+    saveTimer.current = window.setTimeout(() => {
+      chatUpdateSettings(next.id, next.model, next.settings).catch((e) => setError(String(e)));
+    }, 400);
+  };
+
+  const selectedModel = models.find((m) => m.name === active?.model);
+  const canThink = selectedModel?.capabilities.includes("thinking") ?? false;
 
   const send = async (text: string) => {
     if (streaming) return;
@@ -169,11 +192,38 @@ export function ChatView({ models, running }: { models: LocalModel[]; running: b
         <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
           <ModelPicker models={models} value={active?.model ?? defaultModel()} onChange={setModel} />
           {active && (
-            <span style={{ ...label, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+            <span
+              style={{
+                ...label,
+                flex: 1,
+                minWidth: 0,
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+                whiteSpace: "nowrap",
+              }}
+            >
               {active.title}
             </span>
           )}
+          {active && (
+            <button
+              onClick={() => setSettingsOpen((o) => !o)}
+              title="Session settings"
+              style={{
+                ...secondaryButton,
+                marginLeft: "auto",
+                flexShrink: 0,
+                ...(settingsOpen ? { borderColor: "rgba(56,189,248,0.6)", color: "#38bdf8" } : {}),
+              }}
+            >
+              ⚙
+            </button>
+          )}
         </div>
+
+        {settingsOpen && active && (
+          <SessionSettingsPanel settings={active.settings} onChange={patchSettings} />
+        )}
 
         <Conversation
           messages={active?.messages ?? []}
@@ -185,6 +235,9 @@ export function ChatView({ models, running }: { models: LocalModel[]; running: b
           streaming={streaming}
           onSend={(t) => void send(t)}
           onStop={stop}
+          think={active?.settings.think ?? false}
+          canThink={canThink}
+          onToggleThink={() => patchSettings({ think: !(active?.settings.think ?? false) })}
         />
         {error && <p style={{ color: "#f87171", fontSize: 12, marginTop: 8 }}>{error}</p>}
       </div>

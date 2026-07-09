@@ -37,6 +37,10 @@ export function App() {
         padding: 16,
         maxWidth: tab === "chat" ? undefined : 480,
         margin: "0 auto",
+        boxSizing: "border-box",
+        ...(tab === "chat"
+          ? { height: "100vh", display: "flex", flexDirection: "column", overflow: "hidden" }
+          : {}),
       }}
     >
       <header style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
@@ -58,12 +62,13 @@ export function App() {
       </nav>
 
       {tab === "dashboard" ? (
-        <Dashboard local={local} running={running} onChanged={refresh} />
+        <>
+          <Dashboard local={local} running={running} onChanged={refresh} />
+          <ConnectCloud status={status} onEnrolled={refresh} />
+        </>
       ) : (
         <ChatView models={local?.models ?? []} running={running} />
       )}
-
-      <ConnectCloud status={status} onEnrolled={refresh} />
 
       {error && <p style={{ color: "#f87171", fontSize: 12, marginTop: 12 }}>{error}</p>}
     </div>

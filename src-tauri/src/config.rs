@@ -17,26 +17,31 @@ pub struct AgentConfig {
     pub rig_name: Option<String>,
 }
 
+/// Resolved agent config dir (credentials, chat sessions, …), created on demand.
+pub fn config_dir() -> Result<PathBuf> {
+    // Allow an explicit override so a system service and CLI enrollment
+    // (which may run as different users) can share the same config file.
+    let dir = match std::env::var("LOCALLMOS_CONFIG_DIR") {
+        Ok(d) if !d.is_empty() => PathBuf::from(d),
+        _ => dirs::config_dir().context("no config dir")?.join("locallmos-agent"),
+    };
+    std::fs::create_dir_all(&dir).ok();
+    // Log the resolved dir once so it's discoverable which credentials store is
+    // in use. The tray GUI (per-user config dir) and a headless service (its
+    // own LOCALLMOS_CONFIG_DIR, e.g. /etc/locallmos-agent) are independent — see
+    // SERVICE.md. This line makes a mismatch obvious in the agent's logs.
+    static LOGGED: std::sync::Once = std::sync::Once::new();
+    LOGGED.call_once(|| tracing::info!("agent config dir: {}", dir.display()));
+    Ok(dir)
+}
+
 impl AgentConfig {
     pub fn is_enrolled(&self) -> bool {
         self.rig_id.is_some() && self.refresh_secret.is_some()
     }
 
     fn path() -> Result<PathBuf> {
-        // Allow an explicit override so a system service and CLI enrollment
-        // (which may run as different users) can share the same config file.
-        let dir = match std::env::var("LOCALLMOS_CONFIG_DIR") {
-            Ok(d) if !d.is_empty() => PathBuf::from(d),
-            _ => dirs::config_dir().context("no config dir")?.join("locallmos-agent"),
-        };
-        std::fs::create_dir_all(&dir).ok();
-        // Log the resolved dir once so it's discoverable which credentials store is
-        // in use. The tray GUI (per-user config dir) and a headless service (its
-        // own LOCALLMOS_CONFIG_DIR, e.g. /etc/locallmos-agent) are independent — see
-        // SERVICE.md. This line makes a mismatch obvious in the agent's logs.
-        static LOGGED: std::sync::Once = std::sync::Once::new();
-        LOGGED.call_once(|| tracing::info!("agent config dir: {}", dir.display()));
-        Ok(dir.join("config.json"))
+        Ok(config_dir()?.join("config.json"))
     }
 
     pub fn load() -> Self {

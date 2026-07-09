@@ -9,6 +9,7 @@
 //! and service modes; only the shell differs.
 
 mod chat;
+mod chat_store;
 mod config;
 mod monitor;
 mod realtime;
@@ -48,6 +49,8 @@ pub struct AppState {
     pub realtime: Arc<realtime::RealtimeHandle>,
     /// In-flight chat turns → cancel flag, for stop-generation.
     pub cancels: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    /// Serializes chat-session file writes (save vs rename vs delete).
+    pub chat_lock: Mutex<()>,
     /// Shared HTTP client, reused for the web_fetch tool (direct GET from the rig).
     pub http: reqwest::Client,
 }
@@ -83,6 +86,7 @@ fn build_state() -> Arc<AppState> {
         monitor: Mutex::new(Monitor::new()),
         realtime: Arc::new(realtime::RealtimeHandle::new()),
         cancels: Mutex::new(HashMap::new()),
+        chat_lock: Mutex::new(()),
         http,
     })
 }
@@ -176,6 +180,70 @@ async fn local_chat(
         .await
         .map_err(|e| e.to_string())?;
     Ok(out.content)
+}
+
+// --- Persistent chat sessions (local, on-disk) ------------------------------
+
+#[tauri::command]
+async fn chat_list_sessions(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<chat_store::SessionMeta>, String> {
+    let _guard = state.chat_lock.lock().await;
+    chat_store::list().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn chat_create_session(
+    state: State<'_, Arc<AppState>>,
+    model: String,
+) -> Result<chat_store::ChatSession, String> {
+    let _guard = state.chat_lock.lock().await;
+    let session = chat_store::ChatSession::new(model);
+    chat_store::save(&session).map_err(|e| e.to_string())?;
+    Ok(session)
+}
+
+#[tauri::command]
+async fn chat_get_session(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+) -> Result<chat_store::ChatSession, String> {
+    let _guard = state.chat_lock.lock().await;
+    chat_store::load(&id).map_err(|e| e.to_string())
+}
+
+/// Rename keeps `updated_at` untouched so the sidebar order doesn't jump.
+#[tauri::command]
+async fn chat_rename_session(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+    title: String,
+) -> Result<(), String> {
+    let _guard = state.chat_lock.lock().await;
+    let mut session = chat_store::load(&id).map_err(|e| e.to_string())?;
+    session.title = title;
+    chat_store::save(&session).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn chat_delete_session(state: State<'_, Arc<AppState>>, id: String) -> Result<(), String> {
+    let _guard = state.chat_lock.lock().await;
+    chat_store::delete(&id).map_err(|e| e.to_string())
+}
+
+/// Patch a session's model + generation settings (toggles, system prompt, …).
+#[tauri::command]
+async fn chat_update_settings(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+    model: String,
+    settings: chat_store::SessionSettings,
+) -> Result<(), String> {
+    let _guard = state.chat_lock.lock().await;
+    let mut session = chat_store::load(&id).map_err(|e| e.to_string())?;
+    session.model = model;
+    session.settings = settings;
+    chat_store::save(&session).map_err(|e| e.to_string())
 }
 
 /// Check GitHub Releases directly (no account) and self-update if a newer version
@@ -346,7 +414,13 @@ fn run_gui() {
             load_model,
             restart_runtime,
             local_chat,
-            local_update
+            local_update,
+            chat_list_sessions,
+            chat_create_session,
+            chat_get_session,
+            chat_rename_session,
+            chat_delete_session,
+            chat_update_settings
         ])
         .run(tauri::generate_context!())
         .expect("error while running LocalLMOS agent");

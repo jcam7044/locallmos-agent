@@ -47,6 +47,7 @@ export function MessageView({
           ))}
         </div>
       )}
+      {!user && <ToolActivity activity={message.toolActivity} />}
       {!user && message.thinking && (
         <ThinkingBlock
           thinking={message.thinking}
@@ -89,6 +90,41 @@ export function MessageView({
           {tokens && <span style={{ ...label, fontSize: 11 }}>{tokens}</span>}
         </div>
       )}
+    </div>
+  );
+}
+
+type ToolActivityRow = {
+  name?: string;
+  query?: string;
+  citations?: { title?: string; url?: string }[];
+};
+
+/** Persisted tool usage (web searches/fetches with citations) for a reply. */
+function ToolActivity({ activity }: { activity: unknown }) {
+  if (!Array.isArray(activity) || activity.length === 0) return null;
+  return (
+    <div style={{ marginBottom: 6 }}>
+      {(activity as ToolActivityRow[]).map((row, i) => (
+        <div key={i} style={{ ...label, fontSize: 11, margin: "2px 0" }}>
+          ⚙ {row.name ?? "tool"}
+          {row.query ? `: ${row.query}` : ""}
+          {(row.citations ?? []).slice(0, 5).map((c, j) =>
+            c.url ? (
+              <a
+                key={j}
+                href={c.url}
+                target="_blank"
+                rel="noreferrer"
+                title={c.title ?? c.url}
+                style={{ color: "#38bdf8", marginLeft: 6 }}
+              >
+                [{j + 1}]
+              </a>
+            ) : null,
+          )}
+        </div>
+      ))}
     </div>
   );
 }

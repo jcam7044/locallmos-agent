@@ -7,10 +7,12 @@ import type { StreamState } from "./useChatStream";
 export function Conversation({
   messages,
   live,
+  onRegenerate,
 }: {
   messages: StoredMessage[];
   /** In-flight assistant reply being streamed, if any. */
   live: StreamState | null;
+  onRegenerate?: () => void;
 }) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const pinned = useRef(true);
@@ -47,7 +49,16 @@ export function Conversation({
       ) : (
         <>
           {messages.map((m, i) => (
-            <MessageView key={i} message={m} streaming={false} />
+            <MessageView
+              key={i}
+              message={m}
+              streaming={false}
+              onRegenerate={
+                !live && i === messages.length - 1 && m.role === "assistant"
+                  ? onRegenerate
+                  : undefined
+              }
+            />
           ))}
           {liveMessage && (
             <>

@@ -110,6 +110,33 @@ export function ChatView({ models, running }: { models: LocalModel[]; running: b
   const selectedModel = models.find((m) => m.name === active?.model);
   const canThink = selectedModel?.capabilities.includes("thinking") ?? false;
 
+  // Run one turn: optimistic local update, stream, then re-sync from disk
+  // (canonical messages, auto-title, updated ordering).
+  const runTurn = async (session: ChatSession, args: { content: string; regenerate?: boolean }) => {
+    const requestId = crypto.randomUUID();
+    activeRequest.current = requestId;
+    setError(null);
+    setStreaming(true);
+    begin(requestId, session.id);
+
+    try {
+      await localChatSend({ sessionId: session.id, requestId, ...args });
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      end();
+      setStreaming(false);
+      activeRequest.current = null;
+      try {
+        const fresh = await chatGetSession(session.id);
+        setActive((cur) => (cur && cur.id === session.id ? fresh : cur));
+      } catch {
+        /* session may have been deleted meanwhile */
+      }
+      void refreshList();
+    }
+  };
+
   const send = async (text: string) => {
     if (streaming) return;
     let session = active;
@@ -128,32 +155,17 @@ export function ChatView({ models, running }: { models: LocalModel[]; running: b
       setError("No model selected.");
       return;
     }
-
-    const requestId = crypto.randomUUID();
-    activeRequest.current = requestId;
-    setError(null);
     // Optimistic user message; the backend persists the same thing.
     setActive({ ...session, messages: [...session.messages, newUserMessage(text)] });
-    setStreaming(true);
-    begin(requestId, session.id);
+    await runTurn(session, { content: text });
+  };
 
-    try {
-      await localChatSend({ sessionId: session.id, requestId, content: text });
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      end();
-      setStreaming(false);
-      activeRequest.current = null;
-      // Re-sync from disk: canonical messages, auto-title, updated ordering.
-      try {
-        const fresh = await chatGetSession(session.id);
-        setActive((cur) => (cur && cur.id === session.id ? fresh : cur));
-      } catch {
-        /* session may have been deleted meanwhile */
-      }
-      void refreshList();
-    }
+  const regenerate = async () => {
+    if (!active || streaming) return;
+    if (active.messages[active.messages.length - 1]?.role !== "assistant") return;
+    // Optimistically drop the reply being regenerated; the backend does the same.
+    setActive({ ...active, messages: active.messages.slice(0, -1) });
+    await runTurn(active, { content: "", regenerate: true });
   };
 
   const stop = () => {
@@ -228,6 +240,7 @@ export function ChatView({ models, running }: { models: LocalModel[]; running: b
         <Conversation
           messages={active?.messages ?? []}
           live={streaming && stream?.sessionId === active?.id ? stream : null}
+          onRegenerate={() => void regenerate()}
         />
 
         <Composer

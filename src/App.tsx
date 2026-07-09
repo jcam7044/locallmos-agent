@@ -3,9 +3,11 @@ import { getAgentStatus, getLocalStatus } from "./api";
 import { ChatView } from "./chat/ChatView";
 import { ConnectCloud, Dashboard } from "./dashboard/Dashboard";
 import type { AgentStatus, LocalStatus } from "./types";
+import { useTabWindowSize, type Tab } from "./useTabWindowSize";
 
 export function App() {
-  const [tab, setTab] = useState<"dashboard" | "chat">("dashboard");
+  const [tab, setTab] = useState<Tab>("dashboard");
+  useTabWindowSize(tab);
   const [local, setLocal] = useState<LocalStatus | null>(null);
   const [status, setStatus] = useState<AgentStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -30,7 +32,13 @@ export function App() {
   const running = local?.runtime.state === "running";
 
   return (
-    <div style={{ padding: 16, maxWidth: 480, margin: "0 auto" }}>
+    <div
+      style={{
+        padding: 16,
+        maxWidth: tab === "chat" ? undefined : 480,
+        margin: "0 auto",
+      }}
+    >
       <header style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
         <h1 style={{ fontSize: 17, fontWeight: 700, margin: 0 }}>
           Loca<span style={{ color: "#38bdf8" }}>LLM</span>OS

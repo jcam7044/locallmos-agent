@@ -8,6 +8,24 @@ Run it **standalone** as a local control panel for your own models, or **connect
 to the cloud** to manage a fleet of rigs, share models, build teams, orchestrate
 agents, and expose OpenAI-compatible endpoints from the LocalLMOS dashboard.
 
+## Quick Start
+
+1. Sign in at [locallmos.com](https://locallmos.com) and create or select a rig.
+2. Copy the pairing code from the LocalLMOS dashboard.
+3. Install the agent with the command for your operating system below.
+4. Launch LocalLMOS Agent, enroll with the pairing code, and confirm the rig shows
+   as online in the dashboard.
+5. Start managing local runtimes, models, and OpenAI-compatible endpoints from
+   the desktop tray app or the LocalLMOS dashboard.
+
+Add screenshots to `docs/screenshots/` as the flow is captured:
+
+
+![LocalLMOS dashboard pairing code](docs/screenshots/dashboard-pairing-code.png)
+![LocalLMOS Agent tray app](docs/screenshots/agent-tray-app.png)
+![Connected rig in LocalLMOS](docs/screenshots/connected-rig.png)
+
+
 ## Install
 
 **Linux / macOS (Apple Silicon):**

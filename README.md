@@ -22,6 +22,9 @@ agents, and expose OpenAI-compatible endpoints from the LocalLMOS dashboard.
 ![LocalLMOS dashboard pairing code](docs/screenshots/dashboard-pairing-code.png)
 ![LocalLMOS Agent tray app](docs/screenshots/agent-tray-app.png)
 ![Connected rig in LocalLMOS](docs/screenshots/connected-rig.png)
+![LocalLMOS AI Rig Fleet](docs/screenshots/fleet.png)
+![LocalLMOS AI Agent Edit](docs/screenshots/agent-edit.png)
+![Connect Rig chat in LocalLMOS](docs/screenshots/chat.png)
 
 
 ## Install

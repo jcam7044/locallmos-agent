@@ -6,10 +6,65 @@
 //! calls one, `chat.rs` executes it and feeds the result back.
 
 use anyhow::{anyhow, Result};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 pub const WEB_SEARCH: &str = "web_search";
 pub const WEB_FETCH: &str = "web_fetch";
+
+/// Server-authored hosted-tool capability attached to a pending chat turn.
+/// Credentials are deliberately absent; the agent sends the call to tool-exec.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct PlatformTool {
+    pub id: String,
+    pub provider: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub parameters: Value,
+    #[serde(default)]
+    pub execution: String,
+    #[serde(default, rename = "approvalRequired")]
+    pub approval_required: bool,
+}
+
+/// Decode only well-formed, hosted platform tools. Rejecting malformed entries
+/// here prevents a compromised/misconfigured payload from becoming a model tool.
+pub fn platform_tools(value: Option<&Value>) -> Vec<PlatformTool> {
+    value
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| serde_json::from_value::<PlatformTool>(item.clone()).ok())
+                .filter(|tool| {
+                    !tool.id.is_empty()
+                        && !tool.name.is_empty()
+                        && tool.execution == "hosted"
+                        && tool.parameters.is_object()
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/** Ollama definitions for server-authorized hosted tools. */
+pub fn platform_defs(tools: &[PlatformTool]) -> Vec<Value> {
+    tools
+        .iter()
+        .map(|tool| {
+            json!({
+                "type": "function",
+                "function": {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": tool.parameters,
+                }
+            })
+        })
+        .collect()
+}
 
 /// True for tools the agent executes itself (vs. passthrough/caller tools).
 pub fn is_builtin(name: &str) -> bool {
@@ -191,5 +246,24 @@ mod tests {
         assert!(is_builtin(WEB_SEARCH));
         assert!(is_builtin(WEB_FETCH));
         assert!(!is_builtin("calculator"));
+    }
+
+    #[test]
+    fn accepts_only_well_formed_hosted_platform_tools() {
+        let payload = json!([
+            {
+                "id": "brave.web_search", "provider": "brave", "name": "web_search",
+                "description": "search", "parameters": {"type": "object"}, "execution": "hosted"
+            },
+            {
+                "id": "local.shell", "provider": "local", "name": "shell",
+                "parameters": {"type": "object"}, "execution": "local"
+            },
+            {"id": "bad", "provider": "x", "name": "bad", "parameters": [], "execution": "hosted"}
+        ]);
+        let tools = platform_tools(Some(&payload));
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].id, "brave.web_search");
+        assert_eq!(platform_defs(&tools)[0]["function"]["name"], "web_search");
     }
 }

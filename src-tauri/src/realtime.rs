@@ -287,6 +287,11 @@ async fn handle_change(state: &Arc<AppState>, v: &Value) {
                 think: record.get("think").and_then(Value::as_bool).unwrap_or(false),
                 web_search: record.get("web_search").and_then(Value::as_bool).unwrap_or(false),
                 request_tools: record.get("request_tools").filter(|v| !v.is_null()).cloned(),
+                tool_protocol_version: record
+                    .get("tool_protocol_version")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0) as u32,
+                platform_tools: record.get("platform_tools").filter(|v| !v.is_null()).cloned(),
             };
             if pending.id.is_empty() {
                 return;

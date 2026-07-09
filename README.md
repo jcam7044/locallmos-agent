@@ -18,8 +18,6 @@ agents, and expose OpenAI-compatible endpoints from the LocalLMOS dashboard.
 5. Start managing local runtimes, models, and OpenAI-compatible endpoints from
    the desktop tray app or the LocalLMOS dashboard.
 
-Add screenshots to `docs/screenshots/` as the flow is captured:
-
 
 ![LocalLMOS dashboard pairing code](docs/screenshots/dashboard-pairing-code.png)
 ![LocalLMOS Agent tray app](docs/screenshots/agent-tray-app.png)

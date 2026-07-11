@@ -96,6 +96,12 @@ pub struct ChatPending {
     /// Caller-supplied (passthrough) tool definitions, from the API.
     #[serde(default)]
     pub request_tools: Option<Value>,
+    /// Versioned server-to-agent tool protocol. Zero keeps legacy behavior.
+    #[serde(default)]
+    pub tool_protocol_version: u32,
+    /// Immutable server-authorized tool schemas for this exact assistant turn.
+    #[serde(default)]
+    pub platform_tools: Option<Value>,
 }
 
 /// A file attached to a chat message (embedded via PostgREST).
@@ -487,7 +493,7 @@ impl Supabase {
         let resp = self
             .auth(
                 self.http.get(format!(
-                    "{}/chat_messages?rig_id=eq.{rig_id}&status=eq.pending&role=eq.assistant&select=id,conversation_id,model,think,web_search,request_tools&order=created_at.asc",
+                    "{}/chat_messages?rig_id=eq.{rig_id}&status=eq.pending&role=eq.assistant&select=id,conversation_id,model,think,web_search,request_tools,tool_protocol_version,platform_tools&order=created_at.asc",
                     self.rest
                 )),
                 token,
@@ -620,6 +626,53 @@ impl Supabase {
             .unwrap_or_default();
         Ok(WebSearchOutcome::Results(results))
     }
+
+    /// Execute a server-authorized hosted tool. The device presents only its
+    /// JWT plus the turn/call identifiers; provider credentials never leave the
+    /// control plane. `tool_call_id` is stable across transport retries.
+    pub async fn execute_tool(
+        &self,
+        token: &str,
+        message_id: &str,
+        tool_call_id: &str,
+        tool_id: &str,
+        arguments: &Value,
+    ) -> Result<ToolExecOutcome> {
+        let resp = self
+            .auth(self.http.post(format!("{}/tool-exec", self.functions)), token)
+            .json(&json!({
+                "messageId": message_id,
+                "toolCallId": tool_call_id,
+                "toolId": tool_id,
+                "arguments": arguments,
+            }))
+            .send()
+            .await?;
+        let status = resp.status();
+        let body: Value = resp.json().await.unwrap_or_else(|_| json!({}));
+        if !status.is_success() {
+            let code = body.get("code").and_then(Value::as_str).unwrap_or("tool_gateway_error");
+            let detail = body
+                .get("detail")
+                .or_else(|| body.get("error"))
+                .and_then(Value::as_str)
+                .unwrap_or("tool gateway rejected the request");
+            return Err(anyhow!("{code}: {detail}"));
+        }
+        let content = body
+            .get("toolResult")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("tool gateway returned no toolResult"))?
+            .to_string();
+        let activity = body.get("activity").cloned();
+        let summary = activity
+            .as_ref()
+            .and_then(|a| a.get("summary"))
+            .and_then(Value::as_str)
+            .unwrap_or("completed")
+            .to_string();
+        Ok(ToolExecOutcome { content, activity, summary })
+    }
 }
 
 /// A single web result from the `web-search` edge function.
@@ -634,6 +687,13 @@ pub struct WebResult {
 pub enum WebSearchOutcome {
     Results(Vec<WebResult>),
     NoKey,
+}
+
+/// Sanitized result returned by the hosted tool gateway for model context/UI.
+pub struct ToolExecOutcome {
+    pub content: String,
+    pub activity: Option<Value>,
+    pub summary: String,
 }
 
 async fn ensure_ok(resp: reqwest::Response, ctx: &str) -> Result<()> {

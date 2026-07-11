@@ -29,6 +29,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Notify;
+use uuid::Uuid;
 
 /// A streamed delta batched by the broadcaster into a `token`/`thinking` event,
 /// or a discrete tool-progress event flushed immediately.
@@ -221,19 +222,35 @@ pub async fn process(state: &Arc<AppState>, pending: ChatPending) -> Result<()> 
         None
     };
 
-    // Assemble the tools to advertise this turn: the built-in web tools (when the
-    // turn requested them and the model supports tool calls) plus any caller
-    // passthrough tools (API function calling).
+    // Assemble tool schemas. Protocol v1 uses only the immutable server-authored
+    // platform snapshot; protocol v0 retains the legacy Brave/web-fetch path for
+    // older control planes during the agent rollout.
     let model_tools = state.ollama.model_supports_tools(&model).await;
+    let platform_tools = if pending.tool_protocol_version >= 1 {
+        tools::platform_tools(pending.platform_tools.as_ref())
+    } else {
+        Vec::new()
+    };
     let mut tool_defs: Vec<Value> = Vec::new();
     if model_tools {
-        if pending.web_search {
+        if !platform_tools.is_empty() {
+            tool_defs.extend(tools::platform_defs(&platform_tools));
+        } else if pending.web_search {
             if let Some(arr) = tools::builtin_defs().as_array() {
                 tool_defs.extend(arr.iter().cloned());
             }
         }
         if let Some(reqt) = pending.request_tools.as_ref().and_then(|v| v.as_array()) {
-            tool_defs.extend(reqt.iter().cloned());
+            // A caller-defined function must not shadow a platform capability.
+            for def in reqt {
+                let name = def
+                    .get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(Value::as_str);
+                if !platform_tools.iter().any(|tool| Some(tool.name.as_str()) == name) {
+                    tool_defs.push(def.clone());
+                }
+            }
         }
     }
     let tools_value = (!tool_defs.is_empty()).then(|| Value::Array(tool_defs));
@@ -297,8 +314,19 @@ pub async fn process(state: &Arc<AppState>, pending: ChatPending) -> Result<()> 
 
         let content = out.content;
         let thinking = out.thinking;
-        let (builtin, passthrough): (Vec<ToolCall>, Vec<ToolCall>) =
-            out.tool_calls.into_iter().partition(|c| tools::is_builtin(&c.name));
+        let mut platform_calls: Vec<(ToolCall, tools::PlatformTool)> = Vec::new();
+        let mut builtin: Vec<ToolCall> = Vec::new();
+        let mut passthrough: Vec<ToolCall> = Vec::new();
+        for call in out.tool_calls {
+            if let Some(tool) = platform_tools.iter().find(|tool| tool.name == call.name) {
+                platform_calls.push((call, tool.clone()));
+            } else if pending.tool_protocol_version == 0 && tools::is_builtin(&call.name) {
+                builtin.push(call);
+            } else {
+                // Never execute a tool merely because the model invented a name.
+                passthrough.push(call);
+            }
+        }
 
         // Caller (passthrough) tool calls are returned unexecuted for the API.
         if !passthrough.is_empty() {
@@ -316,8 +344,30 @@ pub async fn process(state: &Arc<AppState>, pending: ChatPending) -> Result<()> 
 
         // Execute built-in tools: echo an assistant tool_calls message, then one
         // tool result per call, and loop so the model can use them.
-        let assistant_calls: Vec<Value> = builtin.iter().map(|c| c.to_request_value()).collect();
+        let assistant_calls: Vec<Value> = platform_calls
+            .iter()
+            .map(|(c, _)| c.to_request_value())
+            .chain(builtin.iter().map(|c| c.to_request_value()))
+            .collect();
         messages.push(json!({ "role": "assistant", "content": "", "tool_calls": assistant_calls }));
+        for (call, tool) in &platform_calls {
+            let invocation_id = Uuid::new_v4().to_string();
+            let _ = tx.send(StreamDelta::Tool(call.name.clone(), call.arguments.to_string()));
+            let (result_text, activity, summary) = run_platform_tool(
+                state,
+                &token,
+                &pending.id,
+                &invocation_id,
+                tool,
+                call,
+            )
+            .await;
+            let _ = tx.send(StreamDelta::ToolResult(call.name.clone(), summary));
+            if let Some(a) = activity {
+                tool_activity.push(a);
+            }
+            messages.push(json!({ "role": "tool", "tool_name": call.name, "content": result_text }));
+        }
         for call in &builtin {
             let _ = tx.send(StreamDelta::Tool(call.name.clone(), call.arguments.to_string()));
             let (result_text, activity, summary) = run_builtin(state, &token, &pending.id, call).await;
@@ -399,6 +449,52 @@ pub async fn process(state: &Arc<AppState>, pending: ChatPending) -> Result<()> 
         state.realtime.leave(&chan).await;
     }
     outcome
+}
+
+/// Execute a server-authorized hosted platform tool through the cloud gateway.
+/// Errors become model-visible tool content so a single provider failure does
+/// not discard the whole answer.
+async fn run_platform_tool(
+    state: &Arc<AppState>,
+    token: &str,
+    message_id: &str,
+    invocation_id: &str,
+    tool: &tools::PlatformTool,
+    call: &ToolCall,
+) -> (String, Option<Value>, String) {
+    match state
+        .supabase
+        .execute_tool(token, message_id, invocation_id, &tool.id, &call.arguments)
+        .await
+    {
+        Ok(result) => {
+            let activity = result.activity.or_else(|| {
+                Some(json!({
+                    "name": call.name,
+                    "toolId": tool.id,
+                    "provider": tool.provider,
+                    "invocationId": invocation_id,
+                    "status": "succeeded",
+                    "summary": result.summary,
+                    "citations": [],
+                }))
+            });
+            (result.content, activity, result.summary)
+        }
+        Err(e) => {
+            let summary = "tool failed".to_string();
+            let activity = json!({
+                "name": call.name,
+                "toolId": tool.id,
+                "provider": tool.provider,
+                "invocationId": invocation_id,
+                "status": "failed",
+                "summary": summary,
+                "citations": [],
+            });
+            (format!("{} failed: {e}", call.name), Some(activity), summary)
+        }
+    }
 }
 
 /// Execute a single built-in tool call. Returns `(tool_message_content, activity,

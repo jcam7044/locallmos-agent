@@ -1,9 +1,7 @@
-//! Built-in tools the agent executes for a chat turn: `web_search` (relayed
-//! through the cloud `web-search` edge function, so the per-user Brave key never
-//! reaches the rig) and `web_fetch` (a direct GET from the rig, no key needed).
-//!
-//! The JSON-schema definitions here are sent to Ollama as `tools`; when the model
-//! calls one, `chat.rs` executes it and feeds the result back.
+//! Legacy built-in tools the agent executes for compatibility turns. New hosted
+//! tools, including the Web Research Pack's `web_fetch_page`, arrive in a
+//! server-authored platform snapshot and are relayed through `tool-exec`; the
+//! agent never implements provider fetching or receives credentials for them.
 
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
@@ -256,14 +254,19 @@ mod tests {
                 "description": "search", "parameters": {"type": "object"}, "execution": "hosted"
             },
             {
+                "id": "web.fetch_page", "provider": "web", "name": "web_fetch_page",
+                "description": "read", "parameters": {"type": "object"}, "execution": "hosted"
+            },
+            {
                 "id": "local.shell", "provider": "local", "name": "shell",
                 "parameters": {"type": "object"}, "execution": "local"
             },
             {"id": "bad", "provider": "x", "name": "bad", "parameters": [], "execution": "hosted"}
         ]);
         let tools = platform_tools(Some(&payload));
-        assert_eq!(tools.len(), 1);
+        assert_eq!(tools.len(), 2);
         assert_eq!(tools[0].id, "brave.web_search");
-        assert_eq!(platform_defs(&tools)[0]["function"]["name"], "web_search");
+        assert_eq!(tools[1].id, "web.fetch_page");
+        assert_eq!(platform_defs(&tools)[1]["function"]["name"], "web_fetch_page");
     }
 }

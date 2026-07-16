@@ -21,6 +21,12 @@ pub struct OllamaAdapter {
     /// Per-model capabilities from `/api/show`, cached so we don't re-query on
     /// every telemetry snapshot (model metadata rarely changes).
     caps_cache: Mutex<HashMap<String, Vec<String>>>,
+    /// Per-model: does the chat template actually render `.Tools`? Cached like
+    /// `caps_cache`. This is the ground truth for native tool-calling — a model
+    /// can advertise the "tools" capability yet ship a template (e.g. a bare
+    /// `{{ .Prompt }}`) that never injects the tool schema, in which case the
+    /// agent must fall back to prompt-injected tools.
+    tool_template_cache: Mutex<HashMap<String, bool>>,
 }
 
 #[derive(Deserialize)]
@@ -71,6 +77,7 @@ impl OllamaAdapter {
             http,
             keep_alive,
             caps_cache: Mutex::new(HashMap::new()),
+            tool_template_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -121,6 +128,50 @@ impl OllamaAdapter {
     /// capabilities). Used to decide whether to advertise tools for a turn.
     pub async fn model_supports_tools(&self, model: &str) -> bool {
         self.capabilities(model).await.iter().any(|c| c == "tools")
+    }
+
+    /// Whether `model`'s chat template actually renders `.Tools` — i.e. Ollama
+    /// will inject the tool schema and parse native `tool_calls`. Unlike
+    /// `model_supports_tools` (which trusts the advertised capability), this
+    /// inspects the template itself, so a model with a stripped/passthrough
+    /// template is correctly treated as *not* natively tool-capable and routed
+    /// through prompt-injected tools instead. Cached, best-effort (unreachable
+    /// Ollama returns false → the safe prompt-injection path).
+    pub async fn template_supports_tools(&self, model: &str) -> bool {
+        if let Some(v) = self.tool_template_cache.lock().await.get(model) {
+            return *v;
+        }
+        #[derive(Deserialize)]
+        struct ShowResp {
+            #[serde(default)]
+            template: String,
+        }
+        let template = match self
+            .http
+            .post(format!("{}/api/show", self.base))
+            .json(&serde_json::json!({ "model": model }))
+            .send()
+            .await
+        {
+            Ok(resp) => resp
+                .json::<ShowResp>()
+                .await
+                .map(|s| s.template)
+                .unwrap_or_default(),
+            // Don't cache a transient failure; retry on the next turn.
+            Err(_) => return false,
+        };
+        if template.is_empty() {
+            return false;
+        }
+        // Go-template field access for the tool list, e.g. `{{ .Tools }}` or
+        // `range .Tools`. Whitespace-insensitive: match the `.Tools` selector.
+        let supported = template.contains(".Tools");
+        self.tool_template_cache
+            .lock()
+            .await
+            .insert(model.to_string(), supported);
+        supported
     }
 
     /// Whether `model` advertises reasoning ("thinking") support.

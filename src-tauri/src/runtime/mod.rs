@@ -3,6 +3,7 @@
 //! sync, reconcile, or command layers.
 
 pub mod ollama;
+pub mod tool_protocol;
 pub mod tools;
 
 use serde::Serialize;

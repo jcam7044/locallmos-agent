@@ -1,6 +1,9 @@
 //! Ollama adapter over its local HTTP API (default http://127.0.0.1:11434).
 
 use super::{ModelInfo, RuntimeAdapter, RuntimeSnapshot};
+// Shared streaming types now live in `runtime::mod`; re-export so existing
+// `crate::runtime::ollama::{ChatDelta, ChatOutput, ToolCall}` imports keep working.
+pub use super::{ChatDelta, ChatOutput, ToolCall};
 use anyhow::{anyhow, Result};
 use futures_util::StreamExt;
 use serde::Deserialize;
@@ -345,40 +348,6 @@ impl OllamaAdapter {
             tool_calls,
         })
     }
-}
-
-/// A streamed delta from a chat turn — reasoning ("thinking") or answer content.
-pub enum ChatDelta<'a> {
-    Content(&'a str),
-    Thinking(&'a str),
-}
-
-/// A tool call the model requested during a round. `arguments` is Ollama's parsed
-/// argument object; `name` is the function name.
-#[derive(Clone, Debug)]
-pub struct ToolCall {
-    pub name: String,
-    pub arguments: Value,
-}
-
-impl ToolCall {
-    /// Rebuild the tool_call object to echo back in the assistant message that
-    /// precedes the tool results (Ollama request format).
-    pub fn to_request_value(&self) -> Value {
-        serde_json::json!({ "function": { "name": self.name, "arguments": self.arguments } })
-    }
-}
-
-/// The assembled result of a chat turn.
-pub struct ChatOutput {
-    pub content: String,
-    pub thinking: String,
-    /// Ollama token counts from the final `done` line; `None` if the turn was
-    /// cancelled or the stream ended without one.
-    pub prompt_tokens: Option<u32>,
-    pub completion_tokens: Option<u32>,
-    /// Tool calls the model requested this round (empty when it answered directly).
-    pub tool_calls: Vec<ToolCall>,
 }
 
 impl RuntimeAdapter for OllamaAdapter {

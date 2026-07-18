@@ -103,11 +103,11 @@ pub async fn send(
     }
     let options = (!opts.is_empty()).then(|| Value::Object(opts));
 
-    let think = session.settings.think && state.ollama.model_supports_thinking(&model).await;
+    let think = session.settings.think && state.runtime.model_supports_thinking(&model).await;
 
     // Built-in web tools when enabled and the model can call tools. Unenrolled
     // rigs get web_fetch only — web_search relays through the cloud.
-    let tools_value = if session.settings.web_tools && state.ollama.model_supports_tools(&model).await
+    let tools_value = if session.settings.web_tools && state.runtime.model_supports_tools(&model).await
     {
         let enrolled = state.config.lock().await.is_enrolled();
         Some(if enrolled { tools::builtin_defs() } else { tools::fetch_only_defs() })
@@ -193,7 +193,7 @@ async fn run_turn(
             let request_id = request_id.to_string();
             let session_id = session_id.to_string();
             state
-                .ollama
+                .runtime
                 .chat_stream(
                     model,
                     Value::Array(messages.clone()),

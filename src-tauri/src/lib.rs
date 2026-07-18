@@ -28,8 +28,7 @@ use std::time::Duration;
 
 use config::AgentConfig;
 use monitor::Monitor;
-use runtime::ollama::OllamaAdapter;
-use runtime::RuntimeAdapter;
+use runtime::Runtime;
 use serde_json::{json, Value};
 use settings::Settings;
 use status::AgentStatus;
@@ -45,7 +44,8 @@ pub struct AppState {
     pub supabase: Supabase,
     pub config: Mutex<AgentConfig>,
     pub status: Mutex<AgentStatus>,
-    pub ollama: OllamaAdapter,
+    /// The active local LLM runtime (Ollama or llama.cpp), chosen at startup.
+    pub runtime: Runtime,
     pub monitor: Mutex<Monitor>,
     pub realtime: Arc<realtime::RealtimeHandle>,
     /// In-flight chat turns → cancel flag, for stop-generation.
@@ -76,14 +76,14 @@ fn build_state() -> Arc<AppState> {
         rig_name: cfg.rig_name.clone(),
         ..Default::default()
     };
-    let ollama = OllamaAdapter::new(http.clone());
+    let runtime = Runtime::from_env(http.clone());
 
     Arc::new(AppState {
         settings,
         supabase,
         config: Mutex::new(cfg),
         status: Mutex::new(status),
-        ollama,
+        runtime,
         monitor: Mutex::new(Monitor::new()),
         realtime: Arc::new(realtime::RealtimeHandle::new()),
         cancels: Mutex::new(HashMap::new()),
@@ -120,7 +120,7 @@ async fn enroll(
 /// Does not touch Supabase — works fully offline / unenrolled.
 #[tauri::command]
 async fn local_status(state: State<'_, Arc<AppState>>) -> Result<Value, String> {
-    let snap = state.ollama.snapshot().await;
+    let snap = state.runtime.snapshot().await;
     let telemetry = {
         let mut mon = state.monitor.lock().await;
         mon.sample().await
@@ -151,13 +151,13 @@ async fn local_status(state: State<'_, Arc<AppState>>) -> Result<Value, String> 
 /// Load/keep a model resident in the runtime.
 #[tauri::command]
 async fn load_model(state: State<'_, Arc<AppState>>, model: String) -> Result<(), String> {
-    state.ollama.load_model(&model).await.map_err(|e| e.to_string())
+    state.runtime.load_model(&model).await.map_err(|e| e.to_string())
 }
 
 /// Restart the local runtime service.
 #[tauri::command]
 async fn restart_runtime(state: State<'_, Arc<AppState>>) -> Result<(), String> {
-    state.ollama.restart().await.map_err(|e| e.to_string())
+    state.runtime.restart().await.map_err(|e| e.to_string())
 }
 
 /// Run one persisted local chat turn. Deltas stream as `local-chat` events

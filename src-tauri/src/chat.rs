@@ -229,7 +229,7 @@ pub async fn process(state: &Arc<AppState>, pending: ChatPending) -> Result<()> 
     // (tens of seconds for large models). Heartbeat a "loading" ping so the web
     // shows a loading state instead of looking hung; stop it on the first token.
     let stop_loading = Arc::new(Notify::new());
-    let loading_task = if ws_ready && !state.ollama.is_model_loaded(&model).await {
+    let loading_task = if ws_ready && !state.runtime.is_model_loaded(&model).await {
         let state = state.clone();
         let chan = chan.clone();
         let stop = stop_loading.clone();
@@ -285,7 +285,7 @@ pub async fn process(state: &Arc<AppState>, pending: ChatPending) -> Result<()> 
     // drops). For those, inject the tools into the system prompt and parse
     // `<tool_call>` blocks ourselves — keeping the feature model-agnostic.
     let native_tools =
-        !tool_defs.is_empty() && state.ollama.template_supports_tools(&model).await;
+        !tool_defs.is_empty() && state.runtime.template_supports_tools(&model).await;
     let prompt_tool_mode = !tool_defs.is_empty() && !native_tools;
     if prompt_tool_mode {
         let manifest = tool_protocol::manifest_system_prompt(&tool_defs);
@@ -308,6 +308,17 @@ pub async fn process(state: &Arc<AppState>, pending: ChatPending) -> Result<()> 
             }
         }
     }
+    // Names of the tools we offered — used in prompt mode to tell a real tool
+    // call from a JSON-shaped answer. Captured before `tool_defs` is consumed.
+    let tool_names: Vec<String> = tool_defs
+        .iter()
+        .filter_map(|d| {
+            d.get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(Value::as_str)
+        })
+        .map(str::to_string)
+        .collect();
     let tools_value = native_tools.then(|| Value::Array(tool_defs));
 
     // Tool loop: call Ollama; if it asks for a built-in tool, run it and feed the
@@ -333,7 +344,7 @@ pub async fn process(state: &Arc<AppState>, pending: ChatPending) -> Result<()> 
             // raw content still accumulates in `out.content` for parsing.
             let mut filter = tool_protocol::ToolCallStreamFilter::new();
             state
-                .ollama
+                .runtime
                 .chat_stream(
                     &model,
                     Value::Array(messages.clone()),
@@ -377,7 +388,20 @@ pub async fn process(state: &Arc<AppState>, pending: ChatPending) -> Result<()> 
         // Recover text-format tool calls the model emitted as content (native
         // `tool_calls` is always empty in prompt-injection mode).
         if prompt_tool_mode {
-            out.tool_calls = tool_protocol::parse_text_tool_calls(&out.content);
+            out.tool_calls = tool_protocol::parse_text_tool_calls(&out.content, &tool_names);
+            if out.tool_calls.is_empty() {
+                // Surface the raw output so an unrecognised call format is
+                // diagnosable from the terminal without a debug build.
+                tracing::info!(
+                    chat = %pending.id,
+                    round,
+                    content = %out.content.trim(),
+                    "prompt-tool round parsed no tool call"
+                );
+            } else {
+                let names: Vec<&str> = out.tool_calls.iter().map(|c| c.name.as_str()).collect();
+                tracing::info!(chat = %pending.id, round, ?names, "parsed tool call(s) from text");
+            }
         }
 
         // No tool calls (or cancelled) → this round's text is the final answer.

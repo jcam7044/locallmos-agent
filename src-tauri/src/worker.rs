@@ -3,7 +3,6 @@
 //! reboot) shared with the runtime adapters.
 
 use crate::config::AgentConfig;
-use crate::runtime::RuntimeAdapter;
 use crate::status::AgentStatus;
 use crate::supabase::CredentialsRevoked;
 use crate::AppState;
@@ -196,7 +195,7 @@ async fn telemetry_tick(state: &Arc<AppState>) -> Result<()> {
         .await?;
 
     // Runtime + model state.
-    let snap = state.ollama.snapshot().await;
+    let snap = state.runtime.snapshot().await;
     state.supabase.upsert_runtime(&token, &rid, &snap).await?;
     state.supabase.upsert_models(&token, &rid, &snap).await?;
 
@@ -272,10 +271,10 @@ async fn execute(state: &Arc<AppState>, kind: &str, payload: &Value) -> (bool, V
             if model.is_empty() {
                 Err(anyhow!("set_model: missing model"))
             } else {
-                state.ollama.load_model(model).await.map(|_| json!({ "model": model }))
+                state.runtime.load_model(model).await.map(|_| json!({ "model": model }))
             }
         }
-        "restart_runtime" => state.ollama.restart().await.map(|_| json!({})),
+        "restart_runtime" => state.runtime.restart().await.map(|_| json!({})),
         "reboot_machine" => {
             let delay = payload.get("delaySeconds").and_then(|v| v.as_u64()).unwrap_or(0);
             reboot(delay).map(|_| json!({ "scheduled": true }))
@@ -310,13 +309,13 @@ async fn reconcile_tick(state: &Arc<AppState>) -> Result<()> {
     let rid = rig_id(state).await.ok_or_else(|| anyhow!("not enrolled"))?;
     let desired = state.supabase.fetch_desired(&token, &rid).await?;
 
-    let snap = state.ollama.snapshot().await;
+    let snap = state.runtime.snapshot().await;
 
     // Restart the runtime if it should be running but isn't.
     let want_running = desired.desired_runtime_state.as_deref() != Some("stopped");
     if want_running && snap.state != "running" {
         tracing::info!("reconcile: runtime down, restarting");
-        state.ollama.restart().await.ok();
+        state.runtime.restart().await.ok();
         return Ok(()); // reassess next tick
     }
 
@@ -325,7 +324,7 @@ async fn reconcile_tick(state: &Arc<AppState>) -> Result<()> {
         let loaded = snap.models.iter().any(|m| m.name == model && m.loaded);
         if !loaded {
             tracing::info!("reconcile: loading desired model {model}");
-            state.ollama.load_model(model).await.ok();
+            state.runtime.load_model(model).await.ok();
         }
     }
     Ok(())

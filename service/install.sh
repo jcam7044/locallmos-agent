@@ -22,6 +22,12 @@ NAME="$(hostname 2>/dev/null || echo my-rig)"
 CODE=""
 MODE="${LOCALLMOS_INSTALL_MODE:-desktop}"          # desktop or service
 NO_LAUNCH="${LOCALLMOS_NO_LAUNCH:-0}"
+# Which local LLM engine the rig runs. "ollama" (default) leaves current installs
+# unchanged; "llamacpp" provisions llama-server (native, grammar-constrained tool
+# calling) and points the agent at it.
+RUNTIME="${LOCALLMOS_RUNTIME:-ollama}"
+LLAMACPP_REPO="${LOCALLMOS_LLAMACPP_REPO:-ggml-org/llama.cpp}"
+LLAMACPP_VERSION="${LOCALLMOS_LLAMACPP_VERSION:-b10068}" # pinned release tag, or "latest"
 # Production locallmos.com backend baked in as defaults (both are public values —
 # the anon key ships in the web bundle and is gated by RLS). Override with
 # --supabase-url / --anon-key or the LOCALLMOS_SUPABASE_* env vars.
@@ -46,6 +52,8 @@ while [ $# -gt 0 ]; do
     --anon-key) ANON_KEY="$2"; shift 2 ;;
     --desktop) MODE="desktop"; shift ;;
     --service|--headless) MODE="service"; shift ;;
+    --runtime) RUNTIME="$2"; shift 2 ;;
+    --llamacpp-version) LLAMACPP_VERSION="$2"; shift 2 ;;
     --no-launch) NO_LAUNCH="1"; shift ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
@@ -53,6 +61,10 @@ done
 case "$MODE" in
   desktop|service) ;;
   *) echo "unknown install mode: $MODE (expected desktop or service)" >&2; exit 2 ;;
+esac
+case "$RUNTIME" in
+  ollama|llamacpp) ;;
+  *) echo "unknown runtime: $RUNTIME (expected ollama or llamacpp)" >&2; exit 2 ;;
 esac
 if [ "$MODE" = "desktop" ] && [ "$(id -u)" = "0" ]; then
   echo "desktop install must be run as your login user so the tray app can appear." >&2
@@ -206,7 +218,7 @@ EOF
 Type=Application
 Name=LocalLMOS Agent
 Comment=Monitor and control local LLM runtimes
-Exec=$BIN_DST
+Exec=${RUNTIME_ENV:+env $RUNTIME_ENV }$BIN_DST
 Icon=os.locallmos.agent
 Terminal=false
 Categories=Utility;Network;
@@ -249,8 +261,10 @@ launch_desktop() {
   fi
 
   echo "==> Launching LocalLMOS Agent"
+  # shellcheck disable=SC2086 # RUNTIME_ENV is intentionally word-split into env args
   env LOCALLMOS_SUPABASE_URL="$SUPABASE_URL" \
       LOCALLMOS_SUPABASE_ANON_KEY="$ANON_KEY" \
+      $RUNTIME_ENV \
       nohup "$BIN_DST" >/dev/null 2>&1 &
   pid=$!
   sleep 2
@@ -271,6 +285,33 @@ desktop_service_notice() {
     echo "   Keep it for server mode, or remove it with: sudo launchctl unload -w /Library/LaunchDaemons/os.locallmos.agent.plist"
   fi
 }
+
+# ---- llama.cpp provisioning ------------------------------------------------
+# Provisioning lives in service/lib-llamacpp.sh, shared with install-service.sh
+# so they can't drift. From a checkout it's beside this script; when piped via
+# `curl | sh` there's no local copy, so fetch it from the repo.
+if [ "$RUNTIME" = "llamacpp" ]; then
+  _here="$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd)"
+  if [ -n "$_here" ] && [ -f "$_here/lib-llamacpp.sh" ]; then
+    . "$_here/lib-llamacpp.sh"
+  else
+    LIB_REF="${LOCALLMOS_LIB_REF:-main}"
+    echo "==> Fetching llama.cpp provisioning helper ($REPO@$LIB_REF)"
+    curl -fsSL "https://raw.githubusercontent.com/$REPO/$LIB_REF/service/lib-llamacpp.sh" \
+      -o "$TMP/lib-llamacpp.sh" \
+      || { echo "could not fetch lib-llamacpp.sh" >&2; exit 1; }
+    . "$TMP/lib-llamacpp.sh"
+  fi
+fi
+
+# Provision before the mode-specific install so the env is ready for both the
+# systemd unit (agent.env) and the desktop launch. RUNTIME_ENV is the launch-time
+# env prefix used by desktop mode.
+RUNTIME_ENV=""
+if [ "$RUNTIME" = "llamacpp" ]; then
+  provision_llamacpp
+  RUNTIME_ENV="LOCALLMOS_RUNTIME=llamacpp LOCALLMOS_LLAMACPP_BIN=$LLAMA_BIN LOCALLMOS_LLAMACPP_MODELS_DIR=$MODELS_DIR LOCALLMOS_LLAMACPP_NGL=999"
+fi
 
 # ---- desktop install -------------------------------------------------------
 if [ "$MODE" = "desktop" ]; then
@@ -297,6 +338,16 @@ LOCALLMOS_SUPABASE_URL=$SUPABASE_URL
 LOCALLMOS_SUPABASE_ANON_KEY=$ANON_KEY
 EOF
     sudo chmod 0600 "$CONFIG_DIR/agent.env"
+  fi
+  # Point the service at the provisioned llama.cpp engine (idempotent).
+  if [ "$RUNTIME" = "llamacpp" ] \
+    && ! sudo grep -q '^LOCALLMOS_RUNTIME=' "$CONFIG_DIR/agent.env" 2>/dev/null; then
+    sudo tee -a "$CONFIG_DIR/agent.env" >/dev/null <<EOF
+LOCALLMOS_RUNTIME=llamacpp
+LOCALLMOS_LLAMACPP_BIN=$LLAMA_BIN
+LOCALLMOS_LLAMACPP_MODELS_DIR=$MODELS_DIR
+LOCALLMOS_LLAMACPP_NGL=999
+EOF
   fi
 
   # ---- service install -----------------------------------------------------
@@ -379,7 +430,11 @@ EOF
 fi
 
 # ---- runtime check ---------------------------------------------------------
-if ! command -v ollama >/dev/null 2>&1; then
+if [ "$RUNTIME" = "llamacpp" ]; then
+  echo
+  echo "==> Runtime: llama.cpp (llama-server) — $LLAMA_BIN"
+  echo "   Add a .gguf to $MODELS_DIR, then select it in the dashboard."
+elif ! command -v ollama >/dev/null 2>&1; then
   echo
   echo "!! Ollama was not detected on this machine."
   echo "   LocalLMOS uses Ollama to run models locally. Install it:"

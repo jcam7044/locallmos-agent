@@ -58,6 +58,25 @@ This builds a release binary, installs it to `/usr/local/bin`, writes
 `/etc/locallmos-agent/agent.env` (fill in your Supabase URL + anon key),
 installs the unit, enrolls, and enables the service.
 
+### Choosing the runtime
+
+By default the agent drives **Ollama**. To run **llama.cpp** instead — which gives
+native, grammar-constrained tool calling (the same mechanism Codex/OpenCode rely
+on) — pass `--runtime llamacpp`:
+
+```bash
+curl -fsSL https://locallmos.com/install.sh | sh -s -- \
+  --service --runtime llamacpp --code <PAIRING_CODE> --name "Basement 3090"
+```
+
+The installer auto-detects your hardware, downloads a prebuilt `llama-server`
+(accelerated Vulkan build where a GPU is present, else CPU) into
+`/opt/locallmos/llama`, creates a models directory at `/var/lib/locallmos/models`,
+and writes the `LOCALLMOS_RUNTIME=llamacpp` + `LOCALLMOS_LLAMACPP_*` vars into
+`agent.env`. Drop a `.gguf` into the models directory, then select it in the
+dashboard. Pin a specific engine build with `--llamacpp-version bNNNNN` (default:
+a known-good pinned release; `latest` resolves the newest).
+
 Manual equivalent:
 
 ```bash

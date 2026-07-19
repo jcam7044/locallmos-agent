@@ -259,7 +259,7 @@ impl LlamaServerAdapter {
 
         let mut body = json!({
             "model": model,
-            "messages": messages,
+            "messages": to_openai_messages(&messages),
             "stream": true,
             "stream_options": { "include_usage": true },
             // Qwen-style templates honor this under --jinja to toggle reasoning.
@@ -368,6 +368,76 @@ impl RuntimeAdapter for LlamaServerAdapter {
         }
         Ok(())
     }
+}
+
+/// Translate the canonical (Ollama-shaped) message history into the OpenAI wire
+/// format llama-server requires. `chat.rs` echoes tool calls as Ollama does —
+/// `{"function":{name,arguments}}` with an object `arguments`, and tool results
+/// with a `tool_name` — which the OpenAI endpoint rejects ("Missing tool call
+/// type"). Here each assistant tool call gains an `id` + `type:"function"` and a
+/// string `arguments`, and each following tool result gets the matching
+/// `tool_call_id`. Non-tool messages pass through unchanged.
+fn to_openai_messages(messages: &Value) -> Value {
+    let Some(arr) = messages.as_array() else {
+        return messages.clone();
+    };
+    let mut out: Vec<Value> = Vec::with_capacity(arr.len());
+    // Ids assigned to an assistant's tool calls, consumed in order by the tool
+    // results that follow (chat.rs appends them in the same order).
+    let mut pending: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+    let mut n = 0usize;
+    for msg in arr {
+        match msg.get("role").and_then(Value::as_str) {
+            Some("assistant") if msg.get("tool_calls").is_some() => {
+                let calls = msg.get("tool_calls").and_then(Value::as_array);
+                let new_calls: Vec<Value> = calls
+                    .into_iter()
+                    .flatten()
+                    .map(|tc| {
+                        let func = tc.get("function").unwrap_or(tc);
+                        let name = func.get("name").and_then(Value::as_str).unwrap_or("");
+                        let args = match func.get("arguments") {
+                            Some(Value::String(s)) => s.clone(),
+                            Some(v) => serde_json::to_string(v).unwrap_or_else(|_| "{}".into()),
+                            None => "{}".into(),
+                        };
+                        let id = tc
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                            .unwrap_or_else(|| {
+                                n += 1;
+                                format!("call_{n}")
+                            });
+                        pending.push_back(id.clone());
+                        json!({
+                            "id": id,
+                            "type": "function",
+                            "function": { "name": name, "arguments": args },
+                        })
+                    })
+                    .collect();
+                out.push(json!({
+                    "role": "assistant",
+                    "content": msg.get("content").cloned().unwrap_or_else(|| json!("")),
+                    "tool_calls": new_calls,
+                }));
+            }
+            Some("tool") => {
+                let id = pending.pop_front().unwrap_or_else(|| {
+                    n += 1;
+                    format!("call_{n}")
+                });
+                out.push(json!({
+                    "role": "tool",
+                    "tool_call_id": id,
+                    "content": msg.get("content").cloned().unwrap_or_else(|| json!("")),
+                }));
+            }
+            _ => out.push(msg.clone()),
+        }
+    }
+    Value::Array(out)
 }
 
 /// Default models dir when unset — matches the installer's desktop provisioning
@@ -606,6 +676,30 @@ mod tests {
         assert_eq!(content, "answer");
         assert_eq!(thinking, "thinking...");
         assert_eq!(out.thinking, "thinking...");
+    }
+
+    #[test]
+    fn openai_messages_add_tool_call_ids_type_and_string_args() {
+        let msgs = json!([
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "",
+             "tool_calls": [{"function": {"name": "web_search", "arguments": {"query": "x"}}}]},
+            {"role": "tool", "tool_name": "web_search", "content": "results"},
+        ]);
+        let arr = to_openai_messages(&msgs);
+        let arr = arr.as_array().unwrap();
+        // user passes through unchanged
+        assert_eq!(arr[0]["content"], "hi");
+        // assistant tool call gains id + type + string arguments
+        let tc = &arr[1]["tool_calls"][0];
+        assert_eq!(tc["type"], "function");
+        assert_eq!(tc["function"]["name"], "web_search");
+        assert!(tc["function"]["arguments"].is_string(), "arguments must be a JSON string");
+        let id = tc["id"].as_str().unwrap();
+        // tool result carries the matching tool_call_id and drops tool_name
+        assert_eq!(arr[2]["role"], "tool");
+        assert_eq!(arr[2]["tool_call_id"], id);
+        assert!(arr[2].get("tool_name").is_none());
     }
 
     #[test]

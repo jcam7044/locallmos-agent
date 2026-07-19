@@ -100,16 +100,18 @@ pub enum Runtime {
 }
 
 impl Runtime {
-    /// Build the runtime for this rig from `LOCALLMOS_RUNTIME` (default "ollama"
+    /// Build the runtime for this rig from a kind string ("ollama" default
     /// during the transition; unknown values fall back to Ollama with a warning).
-    pub fn from_env(http: reqwest::Client) -> Self {
-        match std::env::var("LOCALLMOS_RUNTIME").unwrap_or_default().as_str() {
+    /// The caller resolves precedence (env `LOCALLMOS_RUNTIME` > persisted config
+    /// > default) — see `build_state`.
+    pub fn from_kind(http: reqwest::Client, kind: &str) -> Self {
+        match kind {
             "llamacpp" | "llama_cpp" | "llama.cpp" => {
                 Runtime::LlamaCpp(LlamaServerAdapter::new(http))
             }
             "" | "ollama" => Runtime::Ollama(OllamaAdapter::new(http)),
             other => {
-                tracing::warn!("unknown LOCALLMOS_RUNTIME {other:?}, using ollama");
+                tracing::warn!("unknown runtime {other:?}, using ollama");
                 Runtime::Ollama(OllamaAdapter::new(http))
             }
         }
@@ -175,6 +177,15 @@ impl Runtime {
         match self {
             Runtime::Ollama(a) => a.endpoint(),
             Runtime::LlamaCpp(a) => a.endpoint(),
+        }
+    }
+
+    /// The directory GGUF models are served from, when the runtime has one the
+    /// user drops files into (llama.cpp). `None` for Ollama, which owns its store.
+    pub fn models_dir(&self) -> Option<String> {
+        match self {
+            Runtime::Ollama(_) => None,
+            Runtime::LlamaCpp(a) => a.models_dir(),
         }
     }
 

@@ -15,6 +15,11 @@ pub struct AgentConfig {
     /// Unix seconds at which `token` expires.
     pub token_expires_at: Option<i64>,
     pub rig_name: Option<String>,
+    /// User-selected local runtime ("ollama" | "llamacpp"). Chosen from the tray
+    /// GUI; consulted at startup unless `LOCALLMOS_RUNTIME` is set (env wins, for
+    /// installer/service-managed rigs). `None` → default ("ollama").
+    #[serde(default)]
+    pub runtime: Option<String>,
 }
 
 /// Resolved agent config dir (credentials, chat sessions, …), created on demand.

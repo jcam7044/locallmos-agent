@@ -71,8 +71,16 @@ impl LlamaServerAdapter {
             base: format!("http://{host}:{port}"),
             host,
             port,
-            bin: std::env::var("LOCALLMOS_LLAMACPP_BIN").unwrap_or_else(|_| "llama-server".into()),
-            models_dir: std::env::var("LOCALLMOS_LLAMACPP_MODELS_DIR").unwrap_or_default(),
+            // Fall back to the installer's conventional paths when unset, so a
+            // GUI-switched rig (no env) still finds its provisioned engine/models.
+            bin: std::env::var("LOCALLMOS_LLAMACPP_BIN")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(default_bin),
+            models_dir: std::env::var("LOCALLMOS_LLAMACPP_MODELS_DIR")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(default_models_dir),
             ngl: std::env::var("LOCALLMOS_LLAMACPP_NGL").unwrap_or_else(|_| "999".into()),
             ctx: std::env::var("LOCALLMOS_LLAMACPP_CTX").unwrap_or_else(|_| "8192".into()),
             extra_args,
@@ -89,6 +97,11 @@ impl LlamaServerAdapter {
 
     pub fn endpoint(&self) -> &str {
         &self.base
+    }
+
+    /// The configured GGUF directory, if any (users drop models here).
+    pub fn models_dir(&self) -> Option<String> {
+        (!self.models_dir.is_empty()).then(|| self.models_dir.clone())
     }
 
     // llama-server serves whatever model process it was launched with, and its
@@ -132,6 +145,12 @@ impl LlamaServerAdapter {
     /// Ensure a llama-server child is running and serving `model`, (re)spawning
     /// if none is running or a different model was requested.
     async fn ensure_running(&self, model: &str) -> Result<()> {
+        // Resolve the model file BEFORE touching the running process, so an
+        // unknown/stale request (e.g. a reconcile `desired_model` that isn't a
+        // local gguf) can never tear down a healthy server mid-load.
+        let gguf = self.resolve_gguf(model).ok_or_else(|| {
+            anyhow!("no .gguf for model {model:?} in {:?}", self.models_dir)
+        })?;
         {
             let mut guard = self.proc.lock().await;
             if let Some(p) = guard.as_mut() {
@@ -143,9 +162,6 @@ impl LlamaServerAdapter {
                 let _ = p.child.wait().await;
                 *guard = None;
             }
-            let gguf = self.resolve_gguf(model).ok_or_else(|| {
-                anyhow!("no .gguf for model {model:?} in {:?}", self.models_dir)
-            })?;
             let mut cmd = Command::new(&self.bin);
             cmd.arg("-m")
                 .arg(&gguf)
@@ -352,6 +368,48 @@ impl RuntimeAdapter for LlamaServerAdapter {
         }
         Ok(())
     }
+}
+
+/// Default models dir when unset — matches the installer's desktop provisioning
+/// path (`$XDG_DATA_HOME/locallmos/models`), so a GUI-switched rig finds models
+/// with no env configuration.
+fn default_models_dir() -> String {
+    dirs::data_dir()
+        .map(|p| p.join("locallmos").join("models").to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+/// Default llama-server path when unset: the provisioned binary under the user
+/// (`~/.local/opt/locallmos/llama`) or system (`/opt/locallmos/llama`) install
+/// dir, else bare "llama-server" (resolved on PATH).
+fn default_bin() -> String {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if let Some(home) = dirs::home_dir() {
+        roots.push(home.join(".local/opt/locallmos/llama"));
+    }
+    roots.push(PathBuf::from("/opt/locallmos/llama"));
+    for root in roots {
+        if let Some(bin) = find_llama_server(&root) {
+            return bin.to_string_lossy().into_owned();
+        }
+    }
+    "llama-server".into()
+}
+
+/// Find `llama-server` directly under `root` or one level down (the release
+/// tarball extracts into a `llama-<tag>/` subdir).
+fn find_llama_server(root: &Path) -> Option<PathBuf> {
+    let direct = root.join("llama-server");
+    if direct.is_file() {
+        return Some(direct);
+    }
+    for entry in std::fs::read_dir(root).ok()?.flatten() {
+        let cand = entry.path().join("llama-server");
+        if cand.is_file() {
+            return Some(cand);
+        }
+    }
+    None
 }
 
 fn stem(p: &Path) -> String {

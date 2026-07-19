@@ -24,7 +24,15 @@ export type LocalModel = {
 };
 
 export type LocalStatus = {
-  runtime: { kind: string; version: string | null; state: string; endpoint: string | null };
+  runtime: {
+    kind: string;
+    version: string | null;
+    state: string;
+    endpoint: string | null;
+    modelsDir: string | null;
+  };
+  /** Persisted runtime choice; may differ from the active `runtime.kind` until restart. */
+  configuredRuntime: string | null;
   models: LocalModel[];
   telemetry: {
     cpuPct: number | null;

@@ -76,7 +76,14 @@ fn build_state() -> Arc<AppState> {
         rig_name: cfg.rig_name.clone(),
         ..Default::default()
     };
-    let runtime = Runtime::from_env(http.clone());
+    // Runtime precedence: env `LOCALLMOS_RUNTIME` (installer/service-managed) wins,
+    // else the tray-GUI choice persisted in config, else the default.
+    let runtime_kind = std::env::var("LOCALLMOS_RUNTIME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| cfg.runtime.clone())
+        .unwrap_or_else(|| "ollama".into());
+    let runtime = Runtime::from_kind(http.clone(), &runtime_kind);
 
     Arc::new(AppState {
         settings,
@@ -125,13 +132,16 @@ async fn local_status(state: State<'_, Arc<AppState>>) -> Result<Value, String> 
         let mut mon = state.monitor.lock().await;
         mon.sample().await
     };
+    let configured_runtime = state.config.lock().await.runtime.clone();
     Ok(json!({
         "runtime": {
             "kind": snap.kind,
             "version": snap.version,
             "state": snap.state,
             "endpoint": snap.endpoint,
+            "modelsDir": state.runtime.models_dir(),
         },
+        "configuredRuntime": configured_runtime,
         "models": snap.models.iter().map(|m| json!({
             "name": m.name,
             "sizeBytes": m.size_bytes,
@@ -158,6 +168,42 @@ async fn load_model(state: State<'_, Arc<AppState>>, model: String) -> Result<()
 #[tauri::command]
 async fn restart_runtime(state: State<'_, Arc<AppState>>) -> Result<(), String> {
     state.runtime.restart().await.map_err(|e| e.to_string())
+}
+
+/// Persist the user's local-runtime choice ("ollama" | "llamacpp"). Takes effect
+/// on the next launch (the active `Runtime` is built at startup); the GUI prompts
+/// for a restart. No-op vs. env: if `LOCALLMOS_RUNTIME` is set it still wins.
+#[tauri::command]
+async fn set_runtime(state: State<'_, Arc<AppState>>, kind: String) -> Result<(), String> {
+    if kind != "ollama" && kind != "llamacpp" {
+        return Err(format!("unknown runtime: {kind}"));
+    }
+    let mut cfg = state.config.lock().await;
+    cfg.runtime = Some(kind);
+    cfg.save().map_err(|e| e.to_string())
+}
+
+/// Open the current runtime's models directory in the OS file manager (llama.cpp
+/// only — Ollama manages its own store).
+#[tauri::command]
+async fn open_models_dir(state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    let dir = state
+        .runtime
+        .models_dir()
+        .ok_or("this runtime has no models directory")?;
+    std::fs::create_dir_all(&dir).ok();
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else if cfg!(target_os = "windows") {
+        "explorer"
+    } else {
+        "xdg-open"
+    };
+    std::process::Command::new(opener)
+        .arg(&dir)
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// Run one persisted local chat turn. Deltas stream as `local-chat` events
@@ -435,6 +481,8 @@ fn run_gui() {
             local_status,
             load_model,
             restart_runtime,
+            set_runtime,
+            open_models_dir,
             local_chat_send,
             local_chat_cancel,
             local_update,

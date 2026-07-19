@@ -237,7 +237,9 @@ export function ChatView({
   if (!running) {
     return (
       <div style={{ ...card, marginTop: 12 }}>
-        <p style={{ ...label, margin: 0 }}>Start Ollama to chat with a local model.</p>
+        <p style={{ ...label, margin: 0 }}>
+          No local model running — load one from the Dashboard tab to chat.
+        </p>
       </div>
     );
   }

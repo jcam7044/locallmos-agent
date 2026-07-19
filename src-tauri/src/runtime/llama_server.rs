@@ -15,6 +15,7 @@ use super::{ChatDelta, ChatOutput, ModelInfo, RuntimeAdapter, RuntimeSnapshot, T
 use anyhow::{anyhow, Result};
 use futures_util::StreamExt;
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -154,6 +155,10 @@ impl LlamaServerAdapter {
         (!self.models_dir.is_empty()).then(|| self.models_dir.clone())
     }
 
+    pub fn context_size(&self) -> u64 {
+        self.ctx.parse().unwrap_or(8192)
+    }
+
     // llama-server serves whatever model process it was launched with, and its
     // decoding is grammar-constrained, so tools are always natively available.
     pub async fn model_supports_tools(&self, _model: &str) -> bool {
@@ -185,6 +190,15 @@ impl LlamaServerAdapter {
         }
         let ggufs = list_ggufs(&self.models_dir);
         let want = model.to_lowercase();
+        let root = Path::new(&self.models_dir);
+        if let Some(found) = ggufs.iter().find(|p| {
+            p.strip_prefix(root)
+                .ok()
+                .map(|r| r.to_string_lossy().replace('\\', "/").to_lowercase() == want)
+                .unwrap_or(false)
+        }) {
+            return Some(found.clone());
+        }
         ggufs
             .iter()
             .find(|p| stem(p).to_lowercase() == want)
@@ -283,16 +297,21 @@ impl LlamaServerAdapter {
         if self.thinking {
             caps.push("thinking".to_string());
         }
-        list_ggufs(&self.models_dir)
+        grouped_ggufs(&self.models_dir)
             .into_iter()
-            .map(|p| {
-                let name = stem(&p);
+            .map(|m| {
+                let name = m.display_name;
                 ModelInfo {
-                    size_bytes: std::fs::metadata(&p).ok().map(|m| m.len()),
-                    quantization: None,
-                    loaded: current == Some(name.as_str()),
+                    id: m.id.clone(),
+                    size_bytes: Some(m.size_bytes),
+                    quantization: quantization_from_name(&name),
+                    loaded: current == Some(m.id.as_str()) || current == Some(name.as_str()),
                     capabilities: caps.clone(),
                     name,
+                    source_repo: m.source_repo,
+                    revision: m.revision,
+                    variant_id: m.variant_id,
+                    files: m.files,
                 }
             })
             .collect()
@@ -574,7 +593,7 @@ fn to_openai_messages(messages: &Value) -> Value {
 /// Default models dir when unset — matches the installer's desktop provisioning
 /// path (`$XDG_DATA_HOME/locallmos/models`), so a GUI-switched rig finds models
 /// with no env configuration.
-fn default_models_dir() -> String {
+pub(crate) fn default_models_dir() -> String {
     dirs::data_dir()
         .map(|p| p.join("locallmos").join("models").to_string_lossy().into_owned())
         .unwrap_or_default()
@@ -624,13 +643,107 @@ fn list_ggufs(dir: &str) -> Vec<PathBuf> {
     if dir.is_empty() {
         return Vec::new();
     }
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    entries
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("gguf"))
-        .collect()
+    fn walk(path: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+        if depth > 6 {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(path) else { return };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            let Ok(kind) = entry.file_type() else { continue };
+            if kind.is_symlink() {
+                continue;
+            }
+            if kind.is_dir() {
+                walk(&p, depth + 1, out);
+            } else if p.extension().and_then(|s| s.to_str()) == Some("gguf")
+                && !p.file_name().and_then(|s| s.to_str()).unwrap_or_default().to_lowercase().contains("mmproj")
+            {
+                out.push(p);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(Path::new(dir), 0, &mut out);
+    out.sort();
+    out
+}
+
+#[derive(Default)]
+struct InstalledModel {
+    id: String,
+    display_name: String,
+    size_bytes: u64,
+    source_repo: Option<String>,
+    revision: Option<String>,
+    variant_id: Option<String>,
+    files: Vec<String>,
+}
+
+fn shard_base(stem: &str) -> String {
+    let Some((left, total)) = stem.rsplit_once("-of-") else { return stem.to_string() };
+    if total.len() != 5 || !total.chars().all(|c| c.is_ascii_digit()) {
+        return stem.to_string();
+    }
+    let Some((base, part)) = left.rsplit_once('-') else { return stem.to_string() };
+    if part.len() == 5 && part.chars().all(|c| c.is_ascii_digit()) {
+        base.to_string()
+    } else {
+        stem.to_string()
+    }
+}
+
+fn grouped_ggufs(dir: &str) -> Vec<InstalledModel> {
+    let root = Path::new(dir);
+    let mut groups: BTreeMap<String, InstalledModel> = BTreeMap::new();
+    for path in list_ggufs(dir) {
+        let rel = path.strip_prefix(root).unwrap_or(&path).to_string_lossy().replace('\\', "/");
+        let stem = stem(&path);
+        let base = shard_base(&stem);
+        let parent = path.parent().and_then(|p| p.strip_prefix(root).ok()).unwrap_or(Path::new(""));
+        let key = format!("{}/{}", parent.to_string_lossy(), base);
+        let entry = groups.entry(key).or_insert_with(|| {
+            let parts: Vec<_> = rel.split('/').collect();
+            let source_repo = if parts.len() >= 4 && parts[0] == "huggingface" {
+                Some(format!("{}/{}", parts[1], parts[2]))
+            } else {
+                None
+            };
+            InstalledModel {
+                id: rel.clone(),
+                display_name: base.clone(),
+                source_repo,
+                variant_id: Some(base.clone()),
+                ..Default::default()
+            }
+        });
+        entry.size_bytes += std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        entry.files.push(rel.clone());
+        if rel < entry.id {
+            entry.id = rel;
+        }
+        let manifest = path.parent().unwrap_or(root).join(format!("{base}.locallmos.json"));
+        if let Ok(value) = std::fs::read_to_string(manifest).and_then(|s| {
+            serde_json::from_str::<Value>(&s).map_err(std::io::Error::other)
+        }) {
+            entry.revision = value.get("revision").and_then(Value::as_str).map(str::to_string);
+            entry.variant_id = value.get("variantId").and_then(Value::as_str).map(str::to_string);
+        }
+    }
+    groups.into_values().collect()
+}
+
+fn quantization_from_name(name: &str) -> Option<String> {
+    let upper = name.to_uppercase();
+    for marker in ["UD-Q", "IQ", "Q", "BF16", "F16", "F32"] {
+        if let Some(i) = upper.rfind(marker) {
+            let q = upper[i..].trim_matches(|c: char| c == '-' || c == '_' || c == '.');
+            if q.len() >= 2 {
+                return Some(q.to_string());
+            }
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -731,6 +844,7 @@ fn finalize(state: StreamState) -> ChatOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     /// Feed a sequence of parsed SSE chunks and finalize.
     fn run(chunks: &[Value]) -> (String, String, ChatOutput) {
@@ -904,5 +1018,26 @@ mod tests {
         let (_c, _t, out) = run(&chunks);
         assert_eq!(out.tool_calls.len(), 1);
         assert!(out.tool_calls[0].arguments.is_object());
+    }
+
+    #[test]
+    fn recursive_scan_groups_hub_shards_and_skips_mmproj() {
+        let root = std::env::temp_dir().join(format!("locallmos-gguf-scan-{}", std::process::id()));
+        let repo = root.join("huggingface/owner/model");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("model-Q4_K_M-00001-of-00002.gguf"), [0u8; 3]).unwrap();
+        fs::write(repo.join("model-Q4_K_M-00002-of-00002.gguf"), [0u8; 5]).unwrap();
+        fs::write(repo.join("mmproj-model-f16.gguf"), [0u8; 7]).unwrap();
+        fs::write(repo.join("model-Q4_K_M.locallmos.json"), r#"{"revision":"abc","variantId":"model-Q4_K_M"}"#).unwrap();
+
+        let models = grouped_ggufs(root.to_str().unwrap());
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].size_bytes, 8);
+        assert_eq!(models[0].files.len(), 2);
+        assert_eq!(models[0].source_repo.as_deref(), Some("owner/model"));
+        assert_eq!(models[0].revision.as_deref(), Some("abc"));
+        assert!(models[0].id.ends_with("00001-of-00002.gguf"));
+        let _ = fs::remove_dir_all(root);
     }
 }

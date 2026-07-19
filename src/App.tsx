@@ -1,9 +1,10 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { getAgentStatus, getLocalStatus } from "./api";
 import { ChatView } from "./chat/ChatView";
 import { ConnectCloud, Dashboard } from "./dashboard/Dashboard";
 import type { AgentStatus, LocalStatus } from "./types";
 import { useTabWindowSize, type Tab } from "./useTabWindowSize";
+import { ModelsView } from "./models/ModelsView";
 
 export function App() {
   const [tab, setTab] = useState<Tab>("dashboard");
@@ -12,22 +13,22 @@ export function App() {
   const [status, setStatus] = useState<AgentStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  const refresh = async () => {
+  const refresh = useCallback(async () => {
     try {
       const [l, s] = await Promise.all([getLocalStatus(), getAgentStatus()]);
       setLocal(l);
       setStatus(s);
       setError(null);
     } catch (e) {
-      setError(String(e));
+      if ("__TAURI_INTERNALS__" in window || !import.meta.env.DEV) setError(String(e));
     }
-  };
+  }, []);
 
   useEffect(() => {
     void refresh();
     const t = setInterval(refresh, 3000);
     return () => clearInterval(t);
-  }, []);
+  }, [refresh]);
 
   const running = local?.runtime.state === "running";
 
@@ -35,10 +36,10 @@ export function App() {
     <div
       style={{
         padding: 16,
-        maxWidth: tab === "chat" ? undefined : 480,
+        maxWidth: tab === "dashboard" ? 480 : undefined,
         margin: "0 auto",
         boxSizing: "border-box",
-        ...(tab === "chat"
+        ...(tab === "chat" || tab === "models"
           ? { height: "100vh", display: "flex", flexDirection: "column", overflow: "hidden" }
           : {}),
       }}
@@ -56,6 +57,9 @@ export function App() {
         <TabButton active={tab === "dashboard"} onClick={() => setTab("dashboard")}>
           Dashboard
         </TabButton>
+        <TabButton active={tab === "models"} onClick={() => setTab("models")}>
+          Models
+        </TabButton>
         <TabButton active={tab === "chat"} onClick={() => setTab("chat")}>
           Chat
         </TabButton>
@@ -66,12 +70,14 @@ export function App() {
           <Dashboard local={local} running={running} onChanged={refresh} />
           <ConnectCloud status={status} onEnrolled={refresh} />
         </>
-      ) : (
+      ) : tab === "chat" ? (
         <ChatView
           models={local?.models ?? []}
           running={running}
           enrolled={status?.enrolled ?? false}
         />
+      ) : (
+        <ModelsView local={local} onChanged={refresh} />
       )}
 
       {error && <p style={{ color: "#f87171", fontSize: 12, marginTop: 12 }}>{error}</p>}

@@ -7,6 +7,9 @@ import type {
   SessionMeta,
   SessionSettings,
   StoredMessage,
+  DownloadState,
+  HubModelDetail,
+  HubModelPage,
 } from "./types";
 
 export const getLocalStatus = () => invoke<LocalStatus>("local_status");
@@ -15,6 +18,19 @@ export const loadModel = (model: string) => invoke("load_model", { model });
 export const restartRuntime = () => invoke("restart_runtime");
 export const setRuntime = (kind: string) => invoke("set_runtime", { kind });
 export const openModelsDir = () => invoke("open_models_dir");
+export const hubSearchModels = (args: {
+  query: string;
+  capability: string;
+  sort: string;
+  cursor?: string | null;
+}) => invoke<HubModelPage>("hub_search_models", args);
+export const hubGetModel = (repoId: string) =>
+  invoke<HubModelDetail>("hub_get_model", { repoId });
+export const hubGetAuthorAvatars = (authors: string[]) =>
+  invoke<Record<string, string>>("hub_get_author_avatars", { authors });
+export const hubStartDownload = (repoId: string, revision: string, variantId: string) =>
+  invoke<DownloadState>("hub_start_download", { repoId, revision, variantId });
+export const hubListDownloads = () => invoke<DownloadState[]>("hub_list_downloads");
 export const localUpdate = () => invoke<string | null>("local_update");
 export const enroll = (code: string, name: string) => invoke("enroll", { code, name });
 export const localChatSend = (args: {

@@ -47,7 +47,7 @@ export function ChatView({
   const activeRequest = useRef<string | null>(null);
   const saveTimer = useRef<number | undefined>(undefined);
 
-  const defaultModel = () => (models.find((m) => m.loaded) ?? models[0])?.name ?? "";
+  const defaultModel = () => (models.find((m) => m.loaded) ?? models[0])?.id ?? "";
 
   const refreshList = async () => {
     try {
@@ -120,7 +120,7 @@ export function ChatView({
     }, 400);
   };
 
-  const selectedModel = models.find((m) => m.name === active?.model);
+  const selectedModel = models.find((m) => m.id === active?.model || m.name === active?.model);
   const canThink = selectedModel?.capabilities.includes("thinking") ?? false;
   const canVision = selectedModel?.capabilities.includes("vision") ?? false;
   const canWebTools = selectedModel?.capabilities.includes("tools") ?? false;

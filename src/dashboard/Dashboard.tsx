@@ -189,7 +189,7 @@ export function Dashboard({
           <div style={{ marginTop: 6 }}>
             {(local?.models ?? []).map((m) => (
               <div
-                key={m.name}
+              key={m.id}
                 style={{
                   display: "flex",
                   alignItems: "center",
@@ -208,11 +208,11 @@ export function Dashboard({
                   <span style={{ color: "#34d399", fontSize: 12 }}>loaded</span>
                 ) : (
                   <button
-                    onClick={() => load(m.name)}
-                    disabled={busy === m.name}
+                    onClick={() => load(m.id)}
+                    disabled={busy === m.id}
                     style={secondaryButton}
                   >
-                    {busy === m.name ? "Loading…" : "Load"}
+                    {busy === m.id ? "Loading…" : "Load"}
                   </button>
                 )}
               </div>

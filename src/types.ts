@@ -16,11 +16,16 @@ export type AgentStatus = {
 };
 
 export type LocalModel = {
+  id: string;
   name: string;
   sizeBytes: number | null;
   quantization: string | null;
   loaded: boolean;
   capabilities: string[];
+  sourceRepo: string | null;
+  revision: string | null;
+  variantId: string | null;
+  files: string[];
 };
 
 export type LocalStatus = {
@@ -30,6 +35,12 @@ export type LocalStatus = {
     state: string;
     endpoint: string | null;
     modelsDir: string | null;
+    contextSize: number;
+  };
+  modelsStorage: {
+    dir: string;
+    availableBytes: number | null;
+    totalBytes: number | null;
   };
   /** Persisted runtime choice; may differ from the active `runtime.kind` until restart. */
   configuredRuntime: string | null;
@@ -40,6 +51,53 @@ export type LocalStatus = {
     memoryTotalBytes: number | null;
     gpus: GpuStat[];
   };
+};
+
+export type HubModelSummary = {
+  id: string;
+  author: string;
+  name: string;
+  revision: string;
+  downloads: number;
+  likes: number;
+  lastModified: string | null;
+  pipelineTag: string | null;
+  tags: string[];
+  avatarUrl: string;
+};
+
+export type GgufFile = { path: string; sizeBytes: number };
+export type MemoryEstimate = {
+  weightsBytes: number;
+  kvCacheBytes: number;
+  overheadBytes: number;
+  totalBytes: number;
+  confidence: "high" | "low";
+};
+export type GgufVariant = {
+  id: string;
+  quantization: string;
+  sizeBytes: number;
+  files: GgufFile[];
+  companions: GgufFile[];
+  memory: MemoryEstimate;
+};
+export type HubModelDetail = HubModelSummary & {
+  license: string | null;
+  baseModels: string[];
+  readmeMarkdown: string;
+  variants: GgufVariant[];
+};
+export type HubModelPage = { items: HubModelSummary[]; nextCursor: string | null };
+export type DownloadState = {
+  id: string;
+  repoId: string;
+  revision: string;
+  variantId: string;
+  status: "queued" | "downloading" | "complete" | "error";
+  downloadedBytes: number;
+  totalBytes: number;
+  error: string | null;
 };
 
 // --- Persistent chat sessions (mirror src-tauri/src/chat_store.rs) ---------

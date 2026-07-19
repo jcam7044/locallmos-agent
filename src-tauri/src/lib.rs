@@ -11,6 +11,7 @@
 mod chat;
 mod chat_store;
 mod config;
+mod hub;
 mod local_chat;
 mod monitor;
 mod realtime;
@@ -22,6 +23,7 @@ mod updater;
 mod worker;
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
@@ -54,6 +56,7 @@ pub struct AppState {
     pub chat_lock: Mutex<()>,
     /// Shared HTTP client, reused for the web_fetch tool (direct GET from the rig).
     pub http: reqwest::Client,
+    pub hub: Arc<hub::HubState>,
 }
 
 fn build_state() -> Arc<AppState> {
@@ -84,6 +87,10 @@ fn build_state() -> Arc<AppState> {
         .or_else(|| cfg.runtime.clone())
         .unwrap_or_else(|| "ollama".into());
     let runtime = Runtime::from_kind(http.clone(), &runtime_kind);
+    let hub = Arc::new(hub::HubState::new(
+        http.clone(),
+        runtime::llamacpp_models_dir(),
+    ));
 
     Arc::new(AppState {
         settings,
@@ -96,6 +103,7 @@ fn build_state() -> Arc<AppState> {
         cancels: Mutex::new(HashMap::new()),
         chat_lock: Mutex::new(()),
         http,
+        hub,
     })
 }
 
@@ -133,22 +141,35 @@ async fn local_status(state: State<'_, Arc<AppState>>) -> Result<Value, String> 
         mon.sample().await
     };
     let configured_runtime = state.config.lock().await.runtime.clone();
+    let llama_models_dir = runtime::llamacpp_models_dir();
+    let (models_disk_total, disk_available) = models_disk_space(&llama_models_dir);
     Ok(json!({
         "runtime": {
             "kind": snap.kind,
             "version": snap.version,
             "state": snap.state,
             "endpoint": snap.endpoint,
-            "modelsDir": state.runtime.models_dir(),
+            "modelsDir": state.runtime.models_dir().or_else(|| Some(llama_models_dir.clone())),
+            "contextSize": state.runtime.context_size(),
         },
         "configuredRuntime": configured_runtime,
         "models": snap.models.iter().map(|m| json!({
+            "id": m.id,
             "name": m.name,
             "sizeBytes": m.size_bytes,
             "quantization": m.quantization,
             "loaded": m.loaded,
             "capabilities": m.capabilities,
+            "sourceRepo": m.source_repo,
+            "revision": m.revision,
+            "variantId": m.variant_id,
+            "files": m.files,
         })).collect::<Vec<_>>(),
+        "modelsStorage": {
+            "dir": llama_models_dir,
+            "availableBytes": disk_available,
+            "totalBytes": models_disk_total,
+        },
         "telemetry": {
             "cpuPct": telemetry.cpu_utilization_pct,
             "memoryUsedBytes": telemetry.memory_used_bytes,
@@ -156,6 +177,74 @@ async fn local_status(state: State<'_, Arc<AppState>>) -> Result<Value, String> 
             "gpus": telemetry.gpus,
         },
     }))
+}
+
+fn models_disk_space(models_dir: &str) -> (Option<u64>, Option<u64>) {
+    let path = Path::new(models_dir);
+    let disks = sysinfo::Disks::new_with_refreshed_list();
+    disks
+        .iter()
+        .filter(|disk| path.starts_with(disk.mount_point()))
+        .max_by_key(|disk| disk.mount_point().components().count())
+        .map(|disk| (Some(disk.total_space()), Some(disk.available_space())))
+        .unwrap_or((None, None))
+}
+
+#[tauri::command]
+async fn hub_search_models(
+    state: State<'_, Arc<AppState>>,
+    query: String,
+    capability: String,
+    sort: String,
+    cursor: Option<String>,
+) -> Result<hub::HubModelPage, String> {
+    state.hub.search(&query, &capability, &sort, cursor.as_deref()).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn hub_get_model(
+    state: State<'_, Arc<AppState>>,
+    repo_id: String,
+) -> Result<hub::HubModelDetail, String> {
+    state.hub.detail(&repo_id).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn hub_get_author_avatars(
+    state: State<'_, Arc<AppState>>,
+    authors: Vec<String>,
+) -> Result<HashMap<String, String>, String> {
+    let authors: std::collections::HashSet<_> = authors.into_iter().take(50).collect();
+    let pairs = futures_util::future::join_all(authors.into_iter().map(|author| {
+        let hub = state.hub.clone();
+        async move {
+            let avatar = hub.author_avatar(&author).await.ok().flatten();
+            (author, avatar)
+        }
+    }))
+    .await;
+    Ok(pairs
+        .into_iter()
+        .filter_map(|(author, avatar)| avatar.map(|url| (author, url)))
+        .collect())
+}
+
+#[tauri::command]
+async fn hub_start_download(
+    app: tauri::AppHandle,
+    state: State<'_, Arc<AppState>>,
+    repo_id: String,
+    revision: String,
+    variant_id: String,
+) -> Result<hub::DownloadState, String> {
+    state.hub.start_download(app, repo_id, revision, variant_id).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn hub_list_downloads(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<hub::DownloadState>, String> {
+    Ok(state.hub.list_downloads().await)
 }
 
 /// Load/keep a model resident in the runtime.
@@ -483,6 +572,11 @@ fn run_gui() {
             restart_runtime,
             set_runtime,
             open_models_dir,
+            hub_search_models,
+            hub_get_model,
+            hub_get_author_avatars,
+            hub_start_download,
+            hub_list_downloads,
             local_chat_send,
             local_chat_cancel,
             local_update,

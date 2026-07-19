@@ -20,12 +20,17 @@ use ollama::OllamaAdapter;
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelInfo {
+    pub id: String,
     pub name: String,
     pub size_bytes: Option<u64>,
     pub quantization: Option<String>,
     pub loaded: bool,
     /// Runtime-reported capabilities (e.g. "vision", "thinking", "tools").
     pub capabilities: Vec<String>,
+    pub source_repo: Option<String>,
+    pub revision: Option<String>,
+    pub variant_id: Option<String>,
+    pub files: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -189,6 +194,13 @@ impl Runtime {
         }
     }
 
+    pub fn context_size(&self) -> u64 {
+        match self {
+            Runtime::Ollama(_) => 8192,
+            Runtime::LlamaCpp(a) => a.context_size(),
+        }
+    }
+
     /// Stream a chat completion, dispatching to the active engine. The delta
     /// callback and `ChatOutput` result are identical across engines.
     #[allow(clippy::too_many_arguments)]
@@ -213,4 +225,12 @@ impl Runtime {
             }
         }
     }
+}
+
+/// Resolve the llama.cpp model store independently of the active engine.
+pub fn llamacpp_models_dir() -> String {
+    std::env::var("LOCALLMOS_LLAMACPP_MODELS_DIR")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(llama_server::default_models_dir)
 }

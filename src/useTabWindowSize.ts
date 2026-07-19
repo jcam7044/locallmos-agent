@@ -1,17 +1,19 @@
 import { useEffect, useRef } from "react";
 import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
 
-export type Tab = "dashboard" | "chat";
+export type Tab = "dashboard" | "models" | "chat";
 
 type Size = { w: number; h: number };
 
 const DEFAULTS: Record<Tab, Size> = {
   dashboard: { w: 480, h: 560 },
+  models: { w: 1180, h: 760 },
   chat: { w: 1000, h: 700 },
 };
 
 const MINS: Record<Tab, Size> = {
   dashboard: { w: 420, h: 480 },
+  models: { w: 800, h: 600 },
   chat: { w: 800, h: 600 },
 };
 

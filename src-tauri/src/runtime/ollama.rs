@@ -376,11 +376,16 @@ impl RuntimeAdapter for OllamaAdapter {
                     let is_loaded = loaded.contains(&m.name);
                     let capabilities = self.capabilities(&m.name).await;
                     models.push(ModelInfo {
+                        id: m.name.clone(),
                         quantization: m.details.and_then(|d| d.quantization_level),
                         size_bytes: m.size,
                         loaded: is_loaded,
                         capabilities,
                         name: m.name,
+                        source_repo: None,
+                        revision: None,
+                        variant_id: None,
+                        files: Vec::new(),
                     });
                 }
             }

@@ -259,13 +259,23 @@ async fn hub_cancel_download(
 /// Load/keep a model resident in the runtime.
 #[tauri::command]
 async fn load_model(state: State<'_, Arc<AppState>>, model: String) -> Result<(), String> {
-    state.runtime.load_model(&model).await.map_err(|e| e.to_string())
+    state.runtime.load_model(&model).await.map_err(|e| e.to_string())?;
+    let mut config = state.config.lock().await;
+    if config.locally_ejected_model.is_some() {
+        config.locally_ejected_model = None;
+        config.save().map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 /// Eject a resident model from memory while retaining its local files.
 #[tauri::command]
 async fn unload_model(state: State<'_, Arc<AppState>>, model: String) -> Result<(), String> {
-    state.runtime.unload_model(&model).await.map_err(|e| e.to_string())
+    state.runtime.unload_model(&model).await.map_err(|e| e.to_string())?;
+    let mut config = state.config.lock().await;
+    config.locally_ejected_model = Some(model);
+    config.save().map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// Delete a completed Hub download. Loaded models must be ejected first.

@@ -20,6 +20,11 @@ pub struct AgentConfig {
     /// installer/service-managed rigs). `None` → default ("ollama").
     #[serde(default)]
     pub runtime: Option<String>,
+    /// A model explicitly ejected from the local UI. While the cloud still
+    /// requests this same model, reconciliation leaves it unloaded. A changed
+    /// desired model (or an explicit local load) clears this override.
+    #[serde(default)]
+    pub locally_ejected_model: Option<String>,
 }
 
 /// Resolved agent config dir (credentials, chat sessions, …), created on demand.

@@ -17,11 +17,13 @@ use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashSet};
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, Signal, System, UpdateKind};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 
@@ -513,16 +515,53 @@ impl RuntimeAdapter for LlamaServerAdapter {
 
     async fn unload_model(&self, model: &str) -> Result<()> {
         let mut guard = self.proc.lock().await;
-        let Some(mut proc) = guard.take() else {
-            return Ok(());
-        };
-        if proc.model != model {
-            *guard = Some(proc);
-            return Err(anyhow!("model {model:?} is not the loaded llama.cpp model"));
+        if let Some(mut proc) = guard.take() {
+            // Cloud reconciliation uses the model stem while the local Models
+            // UI uses its stable relative GGUF filename. Resolve both forms so
+            // `ornith-Q4_K_M` and `ornith-Q4_K_M.gguf` eject the same child.
+            let same_model = proc.model == model
+                || self
+                    .resolve_gguf(&proc.model)
+                    .zip(self.resolve_gguf(model))
+                    .is_some_and(|(running, requested)| running == requested);
+            if !same_model && proc.is_alive() {
+                *guard = Some(proc);
+                return Err(anyhow!("model {model:?} is not the loaded llama.cpp model"));
+            }
+            if proc.is_alive() {
+                let _ = proc.child.start_kill();
+                let _ = proc.child.wait().await;
+                return Ok(());
+            }
+            // A failed load can leave a dead child with the cloud's model
+            // alias (without `.gguf`) while the UI ejects the stable file ID.
+            // Discard that stale handle and continue to check a surviving
+            // external server below.
+            let _ = proc.child.wait().await;
         }
-        let _ = proc.child.start_kill();
-        let _ = proc.child.wait().await;
-        Ok(())
+        drop(guard);
+
+        // A llama-server can survive an agent restart.  In that case it is not
+        // represented by `self.proc`, yet `snapshot` correctly reports its
+        // model as loaded through `/v1/models`.  Match only a llama-server
+        // command line that was launched with this exact GGUF before stopping
+        // it, so eject works without risking an unrelated process.
+        let gguf = self.resolve_gguf(model).ok_or_else(|| {
+            anyhow!("no .gguf for model {model:?} in {:?}", self.models_dir)
+        })?;
+        if stop_external_llama_server(&self.bin, &gguf) {
+            return Ok(());
+        }
+        // A crashed/hung server may keep GPU allocations even though its HTTP
+        // endpoint is no longer reachable. If it was already gone, eject is
+        // still idempotent; otherwise return a useful error rather than claim
+        // that memory was released.
+        if !self.server_has_model(model, &gguf).await {
+            return Ok(());
+        }
+        Err(anyhow!(
+            "the loaded llama-server was not started by LocalLMOS and could not be stopped safely"
+        ))
     }
 
     async fn restart(&self) -> Result<()> {
@@ -534,6 +573,48 @@ impl RuntimeAdapter for LlamaServerAdapter {
         }
         Ok(())
     }
+}
+
+/// Stop a surviving llama-server only when its command line identifies the
+/// exact GGUF being ejected. This supports app restarts while preventing an
+/// eject request from terminating an unrelated local server. A model server
+/// has no state to preserve during ejection, so use a forceful stop: a hung
+/// Vulkan worker can otherwise ignore graceful termination and retain VRAM.
+fn stop_external_llama_server(configured_bin: &str, gguf: &Path) -> bool {
+    let expected = gguf.canonicalize().unwrap_or_else(|_| gguf.to_path_buf());
+    let expected_bin = Path::new(configured_bin)
+        .file_name()
+        .unwrap_or_else(|| OsStr::new("llama-server"));
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::new()
+            .with_cmd(UpdateKind::Always)
+            .with_exe(UpdateKind::Always),
+    );
+    let mut stopped = false;
+    for process in system.processes().values() {
+        let executable_matches = process
+            .exe()
+            .and_then(Path::file_name)
+            .map(|name| name == expected_bin || name == OsStr::new("llama-server"))
+            .unwrap_or(false);
+        let command = process.cmd();
+        let command_matches = command
+            .first()
+            .and_then(|arg| Path::new(arg).file_name())
+            .map(|name| name == expected_bin || name == OsStr::new("llama-server"))
+            .unwrap_or(false);
+        let model_matches = command.iter().any(|arg| {
+            let candidate = Path::new(arg);
+            candidate == expected || candidate.canonicalize().map(|path| path == expected).unwrap_or(false)
+        });
+        if (executable_matches || command_matches) && model_matches {
+            stopped |= process.kill_with(Signal::Kill).unwrap_or(false);
+        }
+    }
+    stopped
 }
 
 /// Parse `llama-server --list-devices` output into `(token, name)` pairs, e.g.

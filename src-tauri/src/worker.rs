@@ -9,6 +9,7 @@ use crate::AppState;
 use anyhow::{anyhow, Result};
 use chrono::Utc;
 use serde_json::{json, Value};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -319,8 +320,27 @@ async fn reconcile_tick(state: &Arc<AppState>) -> Result<()> {
         return Ok(()); // reassess next tick
     }
 
-    // Ensure the desired model is loaded.
+    // An explicit local Eject takes precedence over the unchanged cloud
+    // desired-model value. This is persisted so a restarted agent does not
+    // immediately consume VRAM again. Selecting a different desired model in
+    // the web app clears the override on the next reconcile.
     if let Some(model) = desired.desired_model.as_deref() {
+        let suppressed = {
+            let mut config = state.config.lock().await;
+            match config.locally_ejected_model.as_deref() {
+                Some(ejected) if same_model(ejected, model) => true,
+                Some(_) => {
+                    config.locally_ejected_model = None;
+                    config.save().ok();
+                    false
+                }
+                None => false,
+            }
+        };
+        if suppressed {
+            tracing::debug!("reconcile: leaving locally ejected model {model} unloaded");
+            return Ok(());
+        }
         let loaded = snap.models.iter().any(|m| m.name == model && m.loaded);
         if !loaded {
             tracing::info!("reconcile: loading desired model {model}");
@@ -328,6 +348,18 @@ async fn reconcile_tick(state: &Arc<AppState>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn same_model(left: &str, right: &str) -> bool {
+    fn normalized(value: &str) -> String {
+        Path::new(value)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(value)
+            .trim_end_matches(".gguf")
+            .to_ascii_lowercase()
+    }
+    normalized(left) == normalized(right)
 }
 
 // ---------------------------------------------------------------------------
@@ -412,5 +444,19 @@ fn run_os(program: &str, args: &[String]) -> Result<()> {
         Ok(())
     } else {
         Err(anyhow!("{program} exited with {status}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::same_model;
+
+    #[test]
+    fn locally_ejected_file_id_matches_cloud_model_alias() {
+        assert!(same_model(
+            "huggingface/owner/repo/model-Q4_K_M.gguf",
+            "model-Q4_K_M"
+        ));
+        assert!(!same_model("model-Q4_K_M.gguf", "model-Q5_K_M"));
     }
 }

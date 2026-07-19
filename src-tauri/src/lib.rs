@@ -253,6 +253,12 @@ async fn load_model(state: State<'_, Arc<AppState>>, model: String) -> Result<()
     state.runtime.load_model(&model).await.map_err(|e| e.to_string())
 }
 
+/// Eject a resident model from memory while retaining its local files.
+#[tauri::command]
+async fn unload_model(state: State<'_, Arc<AppState>>, model: String) -> Result<(), String> {
+    state.runtime.unload_model(&model).await.map_err(|e| e.to_string())
+}
+
 /// Restart the local runtime service.
 #[tauri::command]
 async fn restart_runtime(state: State<'_, Arc<AppState>>) -> Result<(), String> {
@@ -569,6 +575,7 @@ fn run_gui() {
             enroll,
             local_status,
             load_model,
+            unload_model,
             restart_runtime,
             set_runtime,
             open_models_dir,

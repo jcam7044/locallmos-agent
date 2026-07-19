@@ -4,7 +4,7 @@ import ReactMarkdown from "react-markdown";
 import rehypeRaw from "rehype-raw";
 import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
 import remarkGfm from "remark-gfm";
-import { hubGetAuthorAvatars, hubGetModel, hubListDownloads, hubSearchModels, hubStartDownload } from "../api";
+import { hubGetAuthorAvatars, hubGetModel, hubListDownloads, hubSearchModels, hubStartDownload, loadModel, unloadModel } from "../api";
 import type {
   DownloadState,
   GgufVariant,
@@ -48,6 +48,7 @@ export function ModelsView({ local, onChanged }: { local: LocalStatus | null; on
   const [error, setError] = useState<string | null>(null);
   const [downloads, setDownloads] = useState<Record<string, DownloadState>>({});
   const [authorAvatars, setAuthorAvatars] = useState<Record<string, string>>({});
+  const [modelAction, setModelAction] = useState<string | null>(null);
   const request = useRef(0);
 
   useEffect(() => {
@@ -133,6 +134,26 @@ export function ModelsView({ local, onChanged }: { local: LocalStatus | null; on
     } catch (e) { setError(readError(e)); }
   };
 
+  const load = async (model: LocalModel) => {
+    setError(null);
+    setModelAction(model.id);
+    try {
+      await loadModel(model.id);
+      await onChanged();
+    } catch (e) { setError(readError(e));
+    } finally { setModelAction(null); }
+  };
+
+  const eject = async (model: LocalModel) => {
+    setError(null);
+    setModelAction(model.id);
+    try {
+      await unloadModel(model.id);
+      await onChanged();
+    } catch (e) { setError(readError(e));
+    } finally { setModelAction(null); }
+  };
+
   const selectDevice = (model: LocalModel) => {
     if (model.sourceRepo) {
       setMode("discover");
@@ -193,11 +214,15 @@ export function ModelsView({ local, onChanged }: { local: LocalStatus | null; on
                 diskEnough={diskEnough}
                 avatarUrl={modelLogo(detail) ?? authorAvatars[detail.author]}
                 onDownload={() => void startDownload()}
+                localModel={selectedVariant ? local?.models.find((model) => model.sourceRepo === detail.id && model.variantId === selectedVariant.id) : undefined}
+                actionBusy={modelAction}
+                onLoad={load}
+                onEject={eject}
               />
             ) : <Empty title="Select a model" body="Choose a repository to compare its available GGUF downloads." />}
           </section>
         </div>
-      ) : <OnDevice models={local?.models ?? []} onSelect={selectDevice} />}
+      ) : <OnDevice models={local?.models ?? []} onSelect={selectDevice} busy={modelAction} onLoad={load} onEject={eject} />}
     </main>
   );
 }
@@ -229,9 +254,10 @@ function Avatar({ model, overrideUrl }: { model: HubModelSummary; overrideUrl?: 
     <img className="hub-avatar" src={url} alt="" onError={() => setFailed(true)} />;
 }
 
-function ModelDetail({ detail, variant, variantId, onVariant, local, download, installed, diskEnough, avatarUrl, onDownload }: {
+function ModelDetail({ detail, variant, variantId, onVariant, local, download, installed, diskEnough, avatarUrl, onDownload, localModel, actionBusy, onLoad, onEject }: {
   detail: HubModelDetail; variant: GgufVariant | null; variantId: string | null; onVariant: (id: string) => void;
   local: LocalStatus | null; download?: DownloadState; installed: boolean; diskEnough: boolean; avatarUrl?: string | null; onDownload: () => void;
+  localModel?: LocalModel; actionBusy: string | null; onLoad: (model: LocalModel) => Promise<void>; onEject: (model: LocalModel) => Promise<void>;
 }) {
   const fit = variant ? assessFit(variant, local) : null;
   const downloading = download?.status === "queued" || download?.status === "downloading";
@@ -264,6 +290,7 @@ function ModelDetail({ detail, variant, variantId, onVariant, local, download, i
     <div className="hub-meta">
       <span>Updated <b>{relativeDate(detail.lastModified)}</b></span><span>Downloads <b>{compact(detail.downloads)}</b></span><span>Likes <b>{compact(detail.likes)}</b></span><span>License <b>{detail.license ?? "Not specified"}</b></span>
     </div>
+    {localModel && <ModelAction model={localModel} busy={actionBusy === localModel.id} onLoad={onLoad} onEject={onEject} />}
     <ModelCardReadme detail={detail} />
   </div>;
 }
@@ -284,13 +311,23 @@ export function ModelCardReadme({ detail }: { detail: HubModelDetail }) {
   </article>;
 }
 
-function OnDevice({ models, onSelect }: { models: LocalModel[]; onSelect: (model: LocalModel) => void }) {
+function OnDevice({ models, onSelect, busy, onLoad, onEject }: { models: LocalModel[]; onSelect: (model: LocalModel) => void; busy: string | null; onLoad: (model: LocalModel) => Promise<void>; onEject: (model: LocalModel) => Promise<void> }) {
   return <section className="hub-device">
     <div className="hub-pane-title"><strong>Models on this device</strong><span>{models.length}</span></div>
-    {models.length ? <div className="hub-device-grid">{models.map((model) => <button key={model.id} onClick={() => onSelect(model)} disabled={!model.sourceRepo}>
-      <span className="hub-device-icon">◫</span><span><strong>{model.name}</strong><small>{model.sourceRepo ?? "Local GGUF"}</small><em>{model.quantization ?? "GGUF"} · {formatBytes(model.sizeBytes)}</em></span><b className={model.loaded ? "loaded" : ""}>{model.loaded ? "Loaded" : "On Device"}</b>
-    </button>)}</div> : <Empty title="No models on device" body="Download a GGUF model or place one in the llama.cpp models directory." />}
+    {models.length ? <div className="hub-device-grid">{models.map((model) => <article key={model.id} className="hub-device-card">
+      <button className="hub-device-select" onClick={() => onSelect(model)} disabled={!model.sourceRepo}>
+        <span className="hub-device-icon">◫</span><span><strong>{model.name}</strong><small>{model.sourceRepo ?? "Local GGUF"}</small><em>{model.quantization ?? "GGUF"} · {formatBytes(model.sizeBytes)}</em></span><b className={model.loaded ? "loaded" : ""}>{model.loaded ? "Loaded" : "On Device"}</b>
+      </button>
+      <ModelAction model={model} busy={busy === model.id} onLoad={onLoad} onEject={onEject} compact />
+    </article>)}</div> : <Empty title="No models on device" body="Download a GGUF model or place one in the llama.cpp models directory." />}
   </section>;
+}
+
+function ModelAction({ model, busy, onLoad, onEject, compact = false }: { model: LocalModel; busy: boolean; onLoad: (model: LocalModel) => Promise<void>; onEject: (model: LocalModel) => Promise<void>; compact?: boolean }) {
+  return <div className={`hub-model-actions ${compact ? "compact" : ""}`}>
+    {model.loaded ? <button className="hub-eject-button" disabled={busy} onClick={() => void onEject(model)}>{busy ? "Ejecting…" : "Eject"}</button> : <button className="hub-load-button" disabled={busy} onClick={() => void onLoad(model)}>{busy ? "Loading…" : "Load"}</button>}
+    <small>{model.loaded ? "Releases model memory; files stay on disk." : "Loads this model into memory."}</small>
+  </div>;
 }
 
 function Empty({ title, body }: { title: string; body: string }) { return <div className="hub-empty"><span>◌</span><strong>{title}</strong><p>{body}</p></div>; }

@@ -92,6 +92,12 @@ pub trait RuntimeAdapter {
         model: &str,
     ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
 
+    /// Remove a resident model from memory without deleting its local files.
+    fn unload_model(
+        &self,
+        model: &str,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
+
     /// Restart the runtime process/service (platform-specific, may no-op).
     fn restart(&self) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
 }
@@ -140,6 +146,13 @@ impl Runtime {
         match self {
             Runtime::Ollama(a) => a.load_model(model).await,
             Runtime::LlamaCpp(a) => a.load_model(model).await,
+        }
+    }
+
+    pub async fn unload_model(&self, model: &str) -> anyhow::Result<()> {
+        match self {
+            Runtime::Ollama(a) => a.unload_model(model).await,
+            Runtime::LlamaCpp(a) => a.unload_model(model).await,
         }
     }
 

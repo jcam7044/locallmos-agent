@@ -6,6 +6,7 @@ import {
   openModelsDir,
   restartRuntime,
   setRuntime,
+  unloadModel,
 } from "../api";
 import { buttonStyle, card, inputStyle, label, secondaryButton } from "../styles";
 import { formatGB, type AgentStatus, type LocalStatus } from "../types";
@@ -26,6 +27,18 @@ export function Dashboard({
     setBusy(model);
     try {
       await loadModel(model);
+      await onChanged();
+    } catch (e) {
+      setUpdateMsg(String(e));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const eject = async (model: string) => {
+    setBusy(model);
+    try {
+      await unloadModel(model);
       await onChanged();
     } catch (e) {
       setUpdateMsg(String(e));
@@ -205,7 +218,13 @@ export function Dashboard({
                   <div style={label}>{formatGB(m.sizeBytes)}</div>
                 </div>
                 {m.loaded ? (
-                  <span style={{ color: "#34d399", fontSize: 12 }}>loaded</span>
+                  <button
+                    onClick={() => eject(m.id)}
+                    disabled={busy === m.id}
+                    style={{ ...secondaryButton, color: "#fca5a5", borderColor: "#7f3b3b" }}
+                  >
+                    {busy === m.id ? "Ejecting…" : "Eject"}
+                  </button>
                 ) : (
                   <button
                     onClick={() => load(m.id)}

@@ -15,6 +15,7 @@ import type {
 export const getLocalStatus = () => invoke<LocalStatus>("local_status");
 export const getAgentStatus = () => invoke<AgentStatus>("get_status");
 export const loadModel = (model: string) => invoke("load_model", { model });
+export const unloadModel = (model: string) => invoke("unload_model", { model });
 export const restartRuntime = () => invoke("restart_runtime");
 export const setRuntime = (kind: string) => invoke("set_runtime", { kind });
 export const openModelsDir = () => invoke("open_models_dir");

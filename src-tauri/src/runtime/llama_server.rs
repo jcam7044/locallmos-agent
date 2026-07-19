@@ -14,8 +14,9 @@
 use super::{ChatDelta, ChatOutput, ModelInfo, RuntimeAdapter, RuntimeSnapshot, ToolCall};
 use anyhow::{anyhow, Result};
 use futures_util::StreamExt;
+use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -28,6 +29,29 @@ use tokio::sync::Mutex;
 struct ChildProc {
     child: Child,
     model: String,
+}
+
+/// llama-server's `/v1/models` response is intentionally OpenAI-compatible.
+/// Recent versions return both `data` and a llama.cpp-specific `models` list,
+/// while older versions may return only one of them.
+#[derive(Default, Deserialize)]
+struct ServerModelsResponse {
+    #[serde(default)]
+    data: Vec<ServerModel>,
+    #[serde(default)]
+    models: Vec<ServerModel>,
+}
+
+#[derive(Default, Deserialize)]
+struct ServerModel {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    model: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    aliases: Vec<String>,
 }
 
 impl ChildProc {
@@ -172,11 +196,20 @@ impl LlamaServerAdapter {
     }
 
     pub async fn is_model_loaded(&self, model: &str) -> bool {
-        let mut guard = self.proc.lock().await;
-        match guard.as_mut() {
-            Some(p) => p.model == model && p.is_alive(),
-            None => false,
+        let managed = {
+            let mut guard = self.proc.lock().await;
+            match guard.as_mut() {
+                Some(p) => p.model == model && p.is_alive(),
+                None => false,
+            }
+        };
+        if managed {
+            return true;
         }
+        let Some(gguf) = self.resolve_gguf(model) else {
+            return false;
+        };
+        self.server_has_model(model, &gguf).await
     }
 
     /// Resolve a model name to a GGUF path: an exact file-stem match under the
@@ -215,6 +248,12 @@ impl LlamaServerAdapter {
         let gguf = self.resolve_gguf(model).ok_or_else(|| {
             anyhow!("no .gguf for model {model:?} in {:?}", self.models_dir)
         })?;
+        // A compatible llama-server can outlive this agent (for example after
+        // an app restart). Reuse it when it is already serving this exact GGUF
+        // instead of trying to bind a second server to the same port.
+        if self.server_has_model(model, &gguf).await {
+            return Ok(());
+        }
         // Compute the device selection before taking the process lock.
         let device = self.device_arg().await;
         {
@@ -293,6 +332,7 @@ impl LlamaServerAdapter {
     }
 
     async fn list_models(&self, current: Option<&str>) -> Vec<ModelInfo> {
+        let reported = self.server_models().await;
         let mut caps = vec!["tools".to_string()];
         if self.thinking {
             caps.push("thinking".to_string());
@@ -305,7 +345,11 @@ impl LlamaServerAdapter {
                     id: m.id.clone(),
                     size_bytes: Some(m.size_bytes),
                     quantization: quantization_from_name(&name),
-                    loaded: current == Some(m.id.as_str()) || current == Some(name.as_str()),
+                    loaded: current == Some(m.id.as_str())
+                        || current == Some(name.as_str())
+                        || reported
+                            .iter()
+                            .any(|reported_id| model_ids_match(reported_id, &m.id, &name)),
                     capabilities: caps.clone(),
                     name,
                     source_repo: m.source_repo,
@@ -315,6 +359,40 @@ impl LlamaServerAdapter {
                 }
             })
             .collect()
+    }
+
+    /// Ask a running llama-server which model it is serving. This deliberately
+    /// does not depend on `self.proc`: the UI must still report a model that was
+    /// launched before the agent restarted or by a compatible local supervisor.
+    async fn server_models(&self) -> HashSet<String> {
+        let Ok(response) = self.http.get(format!("{}/v1/models", self.base)).send().await else {
+            return HashSet::new();
+        };
+        if !response.status().is_success() {
+            return HashSet::new();
+        }
+        let Ok(models) = response.json::<ServerModelsResponse>().await else {
+            return HashSet::new();
+        };
+        models
+            .data
+            .into_iter()
+            .chain(models.models)
+            .flat_map(|model| {
+                [model.id, model.model, model.name]
+                    .into_iter()
+                    .chain(model.aliases)
+            })
+            .filter(|id| !id.trim().is_empty())
+            .collect()
+    }
+
+    async fn server_has_model(&self, model: &str, gguf: &Path) -> bool {
+        let display_name = stem(gguf);
+        self.server_models()
+            .await
+            .iter()
+            .any(|reported| model_ids_match(reported, model, &display_name))
     }
 
     /// Stream a chat completion from llama-server's OpenAI-compatible endpoint.
@@ -433,6 +511,20 @@ impl RuntimeAdapter for LlamaServerAdapter {
         self.ensure_running(model).await
     }
 
+    async fn unload_model(&self, model: &str) -> Result<()> {
+        let mut guard = self.proc.lock().await;
+        let Some(mut proc) = guard.take() else {
+            return Ok(());
+        };
+        if proc.model != model {
+            *guard = Some(proc);
+            return Err(anyhow!("model {model:?} is not the loaded llama.cpp model"));
+        }
+        let _ = proc.child.start_kill();
+        let _ = proc.child.wait().await;
+        Ok(())
+    }
+
     async fn restart(&self) -> Result<()> {
         // Stop the current child; the next chat/load respawns it on demand.
         let mut guard = self.proc.lock().await;
@@ -465,6 +557,27 @@ fn parse_devices(text: &str) -> Vec<(String, String)> {
         }
     }
     devices
+}
+
+/// `llama-server` normally reports the exact alias/path passed to `-m`, but
+/// accept a normalized relative path as well. This covers servers started with
+/// an absolute model path while avoiding fuzzy stem matching across similarly
+/// named quantizations.
+fn model_ids_match(reported: &str, id: &str, name: &str) -> bool {
+    let normalize = |value: &str| {
+        value
+            .trim()
+            .replace('\\', "/")
+            .trim_start_matches("./")
+            .to_lowercase()
+    };
+    let reported = normalize(reported);
+    let id = normalize(id);
+    let name = normalize(name);
+    reported == id
+        || reported == name
+        || reported.ends_with(&format!("/{id}"))
+        || id.ends_with(&format!("/{reported}"))
 }
 
 /// Best-effort integrated-GPU classifier from a device name (any vendor). Used to
@@ -862,6 +975,37 @@ mod tests {
         }
         let out = finalize(state);
         (content, thinking, out)
+    }
+
+    #[test]
+    fn detects_an_externally_served_model_from_v1_models() {
+        let response: ServerModelsResponse = serde_json::from_value(json!({
+            "models": [{"name": "huggingface/unsloth/gemma-4-12b-it-GGUF/gemma-4-12b-it-Q4_K_M.gguf"}],
+            "data": [{"id": "huggingface/unsloth/gemma-4-12b-it-GGUF/gemma-4-12b-it-Q4_K_M.gguf"}]
+        })).unwrap();
+        assert_eq!(
+            response.data[0].id,
+            "huggingface/unsloth/gemma-4-12b-it-GGUF/gemma-4-12b-it-Q4_K_M.gguf"
+        );
+        assert!(model_ids_match(
+            &response.models[0].name,
+            "huggingface/unsloth/gemma-4-12b-it-GGUF/gemma-4-12b-it-Q4_K_M.gguf",
+            "gemma-4-12b-it-Q4_K_M.gguf",
+        ));
+    }
+
+    #[test]
+    fn model_id_matching_accepts_absolute_paths_but_not_other_quants() {
+        assert!(model_ids_match(
+            "/models/huggingface/unsloth/gemma-4-12b-it-GGUF/gemma-4-12b-it-Q4_K_M.gguf",
+            "huggingface/unsloth/gemma-4-12b-it-GGUF/gemma-4-12b-it-Q4_K_M.gguf",
+            "gemma-4-12b-it-Q4_K_M.gguf",
+        ));
+        assert!(!model_ids_match(
+            "huggingface/unsloth/gemma-4-12b-it-GGUF/gemma-4-12b-it-Q8_0.gguf",
+            "huggingface/unsloth/gemma-4-12b-it-GGUF/gemma-4-12b-it-Q4_K_M.gguf",
+            "gemma-4-12b-it-Q4_K_M.gguf",
+        ));
     }
 
     #[test]

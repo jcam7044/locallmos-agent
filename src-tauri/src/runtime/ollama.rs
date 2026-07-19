@@ -415,6 +415,22 @@ impl RuntimeAdapter for OllamaAdapter {
         }
     }
 
+    async fn unload_model(&self, model: &str) -> Result<()> {
+        // Ollama unloads a resident model when a request sets keep_alive to 0.
+        // No model files are touched.
+        let resp = self
+            .http
+            .post(format!("{}/api/generate", self.base))
+            .json(&serde_json::json!({ "model": model, "keep_alive": 0, "stream": false }))
+            .send()
+            .await?;
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            Err(anyhow!("ollama unload_model failed: HTTP {}", resp.status()))
+        }
+    }
+
     async fn restart(&self) -> Result<()> {
         crate::worker::restart_service("ollama").await
     }

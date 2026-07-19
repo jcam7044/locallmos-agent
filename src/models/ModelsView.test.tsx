@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { renderToStaticMarkup } from "react-dom/server";
 import type { HubModelDetail } from "../types";
-import { ModelCardReadme, modelLogo } from "./ModelsView";
+import { isVariantOnDevice, ModelCardReadme, modelLogo, variantsBySizeAscending } from "./ModelsView";
 
 function detail(readmeMarkdown: string): HubModelDetail {
   return {
@@ -46,5 +46,25 @@ describe("ModelCardReadme", () => {
     expect(html).toContain('width="400px"');
     expect(html).toContain('height="80"');
     expect(html).not.toContain('style=');
+  });
+});
+
+describe("isVariantOnDevice", () => {
+  it("only marks the matching Hub repository and quantization as downloaded", () => {
+    const model = { id: "local-id", name: "model-Q4_K_M.gguf", sizeBytes: 1, quantization: "Q4_K_M", loaded: false, capabilities: [], sourceRepo: "owner/model-GGUF", revision: "abc", variantId: "q4", files: ["model-Q4_K_M.gguf"] };
+    expect(isVariantOnDevice(model, "owner/model-GGUF", "q4")).toBe(true);
+    expect(isVariantOnDevice(model, "owner/model-GGUF", "q8")).toBe(false);
+    expect(isVariantOnDevice(model, "other/model-GGUF", "q4")).toBe(false);
+  });
+});
+
+describe("variantsBySizeAscending", () => {
+  it("orders displayed quantizations from the smallest download to the largest", () => {
+    const variants = [
+      { id: "q8", quantization: "Q8_0", sizeBytes: 9_700, files: [], companions: [], memory: {} },
+      { id: "q3", quantization: "Q3_K_M", sizeBytes: 4_200, files: [], companions: [], memory: {} },
+      { id: "q5", quantization: "Q5_K_M", sizeBytes: 6_200, files: [], companions: [], memory: {} },
+    ] as never[];
+    expect(variantsBySizeAscending(variants).map((variant) => variant.id)).toEqual(["q3", "q5", "q8"]);
   });
 });

@@ -214,7 +214,7 @@ export function ModelsView({ local, onChanged }: { local: LocalStatus | null; on
                 diskEnough={diskEnough}
                 avatarUrl={modelLogo(detail) ?? authorAvatars[detail.author]}
                 onDownload={() => void startDownload()}
-                localModel={selectedVariant ? local?.models.find((model) => model.sourceRepo === detail.id && model.variantId === selectedVariant.id) : undefined}
+                localModel={selectedVariant ? local?.models.find((model) => isVariantOnDevice(model, detail.id, selectedVariant.id)) : undefined}
                 actionBusy={modelAction}
                 onLoad={load}
                 onEject={eject}
@@ -262,6 +262,11 @@ function ModelDetail({ detail, variant, variantId, onVariant, local, download, i
   const fit = variant ? assessFit(variant, local) : null;
   const downloading = download?.status === "queued" || download?.status === "downloading";
   const progress = download?.totalBytes ? Math.round(download.downloadedBytes / download.totalBytes * 100) : 0;
+  const downloadedVariantIds = new Set(
+    (local?.models ?? [])
+      .filter((model) => model.sourceRepo === detail.id && model.variantId)
+      .map((model) => model.variantId!),
+  );
   const capabilityTags = [...new Set([detail.pipelineTag, ...detail.tags])]
     .filter((tag): tag is string => !!tag && ["conversational", "text-generation", "image-text-to-text", "tools"].includes(tag))
     .slice(0, 4);
@@ -273,11 +278,9 @@ function ModelDetail({ detail, variant, variantId, onVariant, local, download, i
     </div>
     <div className="hub-download-card">
       <div className="hub-variant-row">
-        <label><span className="hub-fit-dot" style={{ borderColor: fit?.color, color: fit?.color }}>✓</span>
-          <select aria-label="GGUF quantization" value={variantId ?? ""} onChange={(e) => onVariant(e.target.value)}>
-            {detail.variants.map((v) => <option key={v.id} value={v.id}>{v.quantization} · {formatBytes(v.sizeBytes)}{v.files.length > 1 ? ` · ${v.files.length} shards` : ""}</option>)}
-          </select>
-        </label>
+        <div className="hub-variant-select"><span className="hub-fit-dot" style={{ borderColor: fit?.color, color: fit?.color }}>✓</span>
+          <VariantPicker variants={detail.variants} value={variantId} onChange={onVariant} downloadedVariantIds={downloadedVariantIds} />
+        </div>
         <button className="hub-download-button" disabled={!variant || installed || downloading || !diskEnough} onClick={onDownload}>
           {installed ? "✓ On Device" : downloading ? `${progress}%` : !diskEnough ? "Not enough disk" : "⇩ Download"}
         </button>
@@ -292,6 +295,28 @@ function ModelDetail({ detail, variant, variantId, onVariant, local, download, i
     </div>
     {localModel && <ModelAction model={localModel} busy={actionBusy === localModel.id} onLoad={onLoad} onEject={onEject} />}
     <ModelCardReadme detail={detail} />
+  </div>;
+}
+
+function VariantPicker({ variants, value, onChange, downloadedVariantIds }: {
+  variants: GgufVariant[]; value: string | null; onChange: (id: string) => void; downloadedVariantIds: ReadonlySet<string>;
+}) {
+  const [open, setOpen] = useState(false);
+  const ordered = variantsBySizeAscending(variants);
+  const selected = variants.find((variant) => variant.id === value) ?? variants[0];
+  if (!selected) return null;
+  const select = (id: string) => { onChange(id); setOpen(false); };
+  return <div className="hub-variant-picker">
+    <button type="button" className="hub-variant-trigger" aria-label="GGUF quantization" aria-expanded={open} onClick={() => setOpen((shown) => !shown)}>
+      <span className="hub-variant-copy"><b>{selected.quantization}</b>{downloadedVariantIds.has(selected.id) && <small>Downloaded</small>}</span>
+      <span className="hub-variant-size">{formatBytes(selected.sizeBytes)}{selected.files.length > 1 ? ` · ${selected.files.length} shards` : ""}</span><span aria-hidden="true">⌄</span>
+    </button>
+    {open && <div className="hub-variant-menu" role="listbox" aria-label="GGUF quantizations">
+      {ordered.map((candidate) => <button type="button" role="option" aria-selected={candidate.id === selected.id} key={candidate.id} onClick={() => select(candidate.id)}>
+        <span className="hub-variant-copy"><b>{candidate.quantization}</b>{downloadedVariantIds.has(candidate.id) && <small>Downloaded</small>}</span>
+        <span className="hub-variant-size">{formatBytes(candidate.sizeBytes)}{candidate.files.length > 1 ? ` · ${candidate.files.length} shards` : ""}</span>
+      </button>)}
+    </div>}
   </div>;
 }
 
@@ -350,6 +375,12 @@ export function modelLogo(detail: HubModelDetail): string | null {
   if (!candidates.length) return null;
   candidates.sort((a, b) => logoScore(b.value, b.afterHeading) - logoScore(a.value, a.afterHeading));
   return resolveCardUrl(candidates[0]!.value, detail, "resolve") ?? null;
+}
+export function isVariantOnDevice(model: LocalModel, repoId: string, variantId: string) {
+  return model.sourceRepo === repoId && model.variantId === variantId;
+}
+export function variantsBySizeAscending(variants: GgufVariant[]) {
+  return [...variants].sort((a, b) => a.sizeBytes - b.sizeBytes || a.quantization.localeCompare(b.quantization));
 }
 function logoScore(value: string, afterHeading: boolean) {
   const lower = value.toLowerCase();

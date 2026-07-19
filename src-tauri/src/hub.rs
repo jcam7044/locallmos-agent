@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
@@ -143,6 +144,7 @@ pub struct HubState {
     models_dir: PathBuf,
     cache: Mutex<HashMap<String, (Instant, Cached)>>,
     downloads: Mutex<HashMap<String, DownloadState>>,
+    cancellations: Mutex<HashMap<String, Arc<AtomicBool>>>,
     avatars: Mutex<HashMap<String, Option<String>>>,
     context_size: u64,
 }
@@ -154,6 +156,7 @@ impl HubState {
             models_dir: PathBuf::from(models_dir),
             cache: Mutex::new(HashMap::new()),
             downloads: Mutex::new(HashMap::new()),
+            cancellations: Mutex::new(HashMap::new()),
             avatars: Mutex::new(HashMap::new()),
             context_size: std::env::var("LOCALLMOS_LLAMACPP_CTX").ok().and_then(|v| v.parse().ok()).unwrap_or(8192),
         }
@@ -333,26 +336,56 @@ impl HubState {
             error: None,
         };
         self.downloads.lock().await.insert(state.id.clone(), state.clone());
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.cancellations.lock().await.insert(state.id.clone(), cancel.clone());
         let hub = self.clone();
         let id = state.id.clone();
         tauri::async_runtime::spawn(async move {
-            if let Err(error) = hub.download(&app, &id, &repo_id, &revision, &variant).await {
-                hub.patch_download(&app, &id, |s| {
-                    s.status = "error".into();
-                    s.error = Some(error.to_string());
-                }).await;
+            match hub.download(&app, &id, &repo_id, &revision, &variant, &cancel).await {
+                Ok(DownloadOutcome::Complete) => {}
+                Ok(DownloadOutcome::Cancelled) => {
+                    hub.patch_download(&app, &id, |s| {
+                        s.status = "cancelled".into();
+                        s.error = None;
+                    }).await;
+                }
+                Err(error) => {
+                    hub.patch_download(&app, &id, |s| {
+                        s.status = "error".into();
+                        s.error = Some(error.to_string());
+                    }).await;
+                }
             }
+            hub.cancellations.lock().await.remove(&id);
         });
         Ok(state)
     }
 
-    async fn download(&self, app: &AppHandle, id: &str, repo: &str, revision: &str, variant: &GgufVariant) -> Result<()> {
+    pub async fn cancel_download(&self, app: &AppHandle, id: &str) -> Result<DownloadState> {
+        let cancel = self.cancellations.lock().await.get(id).cloned()
+            .ok_or_else(|| anyhow!("download is no longer active"))?;
+        let state = self.downloads.lock().await.get(id).cloned()
+            .ok_or_else(|| anyhow!("download was not found"))?;
+        if state.status != "queued" && state.status != "downloading" {
+            return Err(anyhow!("download is no longer active"));
+        }
+        cancel.store(true, Ordering::Relaxed);
+        Ok(self.patch_download(app, id, |s| s.status = "canceling".into()).await
+            .ok_or_else(|| anyhow!("download was not found"))?)
+    }
+
+    async fn download(&self, app: &AppHandle, id: &str, repo: &str, revision: &str, variant: &GgufVariant, cancel: &AtomicBool) -> Result<DownloadOutcome> {
         self.patch_download(app, id, |s| s.status = "downloading".into()).await;
         let (owner, model) = repo.split_once('/').ok_or_else(|| anyhow!("invalid repository"))?;
         let target_dir = self.models_dir.join("huggingface").join(owner).join(model);
         std::fs::create_dir_all(&target_dir)?;
         let mut completed = 0u64;
+        let mut created = Vec::new();
         for file in &variant.files {
+            if cancel.load(Ordering::Relaxed) {
+                cleanup_download_files(&created);
+                return Ok(DownloadOutcome::Cancelled);
+            }
             validate_file(&file.path)?;
             let file_name = Path::new(&file.path).file_name().ok_or_else(|| anyhow!("invalid filename"))?;
             let target = target_dir.join(file_name);
@@ -382,17 +415,34 @@ impl HubState {
             let mut stream = response.bytes_stream();
             let mut file_done = 0u64;
             while let Some(chunk) = stream.next().await {
+                if cancel.load(Ordering::Relaxed) {
+                    drop(output);
+                    let _ = tokio::fs::remove_file(&part).await;
+                    cleanup_download_files(&created);
+                    return Ok(DownloadOutcome::Cancelled);
+                }
                 let bytes = chunk?;
                 output.write_all(&bytes).await?;
                 file_done += bytes.len() as u64;
                 self.set_progress(app, id, completed + file_done).await;
+            }
+            if cancel.load(Ordering::Relaxed) {
+                drop(output);
+                let _ = tokio::fs::remove_file(&part).await;
+                cleanup_download_files(&created);
+                return Ok(DownloadOutcome::Cancelled);
             }
             output.flush().await?;
             if file.size_bytes > 0 && file_done != file.size_bytes {
                 return Err(anyhow!("downloaded size did not match Hub metadata"));
             }
             tokio::fs::rename(&part, &target).await?;
+            created.push(target);
             completed += file_done;
+        }
+        if cancel.load(Ordering::Relaxed) {
+            cleanup_download_files(&created);
+            return Ok(DownloadOutcome::Cancelled);
         }
         let manifest = target_dir.join(format!("{}.locallmos.json", safe_manifest_name(&variant.id)));
         std::fs::write(manifest, serde_json::to_vec_pretty(&json!({
@@ -405,21 +455,30 @@ impl HubState {
             s.status = "complete".into();
             s.downloaded_bytes = s.total_bytes;
         }).await;
-        Ok(())
+        Ok(DownloadOutcome::Complete)
     }
 
     async fn set_progress(&self, app: &AppHandle, id: &str, bytes: u64) {
         self.patch_download(app, id, |s| s.downloaded_bytes = bytes.min(s.total_bytes)).await;
     }
 
-    async fn patch_download<F: FnOnce(&mut DownloadState)>(&self, app: &AppHandle, id: &str, patch: F) {
+    async fn patch_download<F: FnOnce(&mut DownloadState)>(&self, app: &AppHandle, id: &str, patch: F) -> Option<DownloadState> {
         let next = {
             let mut all = self.downloads.lock().await;
-            let Some(state) = all.get_mut(id) else { return };
+            let Some(state) = all.get_mut(id) else { return None };
             patch(state);
             state.clone()
         };
-        let _ = app.emit("model-download", next);
+        let _ = app.emit("model-download", &next);
+        Some(next)
+    }
+}
+
+enum DownloadOutcome { Complete, Cancelled }
+
+fn cleanup_download_files(paths: &[PathBuf]) {
+    for path in paths {
+        let _ = std::fs::remove_file(path);
     }
 }
 

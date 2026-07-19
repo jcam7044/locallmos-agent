@@ -4,7 +4,7 @@ import ReactMarkdown from "react-markdown";
 import rehypeRaw from "rehype-raw";
 import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
 import remarkGfm from "remark-gfm";
-import { hubGetAuthorAvatars, hubGetModel, hubListDownloads, hubSearchModels, hubStartDownload, loadModel, unloadModel } from "../api";
+import { deleteLocalModel, hubCancelDownload, hubGetAuthorAvatars, hubGetModel, hubListDownloads, hubSearchModels, hubStartDownload, loadModel, unloadModel } from "../api";
 import type {
   DownloadState,
   GgufVariant,
@@ -134,6 +134,14 @@ export function ModelsView({ local, onChanged }: { local: LocalStatus | null; on
     } catch (e) { setError(readError(e)); }
   };
 
+  const cancelDownload = async (download: DownloadState) => {
+    setError(null);
+    try {
+      const state = await hubCancelDownload(download.id);
+      setDownloads((all) => ({ ...all, [state.repoId + ":" + state.variantId]: state }));
+    } catch (e) { setError(readError(e)); }
+  };
+
   const load = async (model: LocalModel) => {
     setError(null);
     setModelAction(model.id);
@@ -149,6 +157,17 @@ export function ModelsView({ local, onChanged }: { local: LocalStatus | null; on
     setModelAction(model.id);
     try {
       await unloadModel(model.id);
+      await onChanged();
+    } catch (e) { setError(readError(e));
+    } finally { setModelAction(null); }
+  };
+
+  const remove = async (model: LocalModel) => {
+    if (!window.confirm(`Remove ${model.name} from this device? This deletes its downloaded files.`)) return;
+    setError(null);
+    setModelAction(model.id);
+    try {
+      await deleteLocalModel(model.id);
       await onChanged();
     } catch (e) { setError(readError(e));
     } finally { setModelAction(null); }
@@ -214,15 +233,17 @@ export function ModelsView({ local, onChanged }: { local: LocalStatus | null; on
                 diskEnough={diskEnough}
                 avatarUrl={modelLogo(detail) ?? authorAvatars[detail.author]}
                 onDownload={() => void startDownload()}
+                onCancelDownload={cancelDownload}
                 localModel={selectedVariant ? local?.models.find((model) => isVariantOnDevice(model, detail.id, selectedVariant.id)) : undefined}
                 actionBusy={modelAction}
                 onLoad={load}
                 onEject={eject}
+                onRemove={remove}
               />
             ) : <Empty title="Select a model" body="Choose a repository to compare its available GGUF downloads." />}
           </section>
         </div>
-      ) : <OnDevice models={local?.models ?? []} onSelect={selectDevice} busy={modelAction} onLoad={load} onEject={eject} />}
+      ) : <OnDevice models={local?.models ?? []} onSelect={selectDevice} busy={modelAction} onLoad={load} onEject={eject} onRemove={remove} />}
     </main>
   );
 }
@@ -254,13 +275,14 @@ function Avatar({ model, overrideUrl }: { model: HubModelSummary; overrideUrl?: 
     <img className="hub-avatar" src={url} alt="" onError={() => setFailed(true)} />;
 }
 
-function ModelDetail({ detail, variant, variantId, onVariant, local, download, installed, diskEnough, avatarUrl, onDownload, localModel, actionBusy, onLoad, onEject }: {
+function ModelDetail({ detail, variant, variantId, onVariant, local, download, installed, diskEnough, avatarUrl, onDownload, onCancelDownload, localModel, actionBusy, onLoad, onEject, onRemove }: {
   detail: HubModelDetail; variant: GgufVariant | null; variantId: string | null; onVariant: (id: string) => void;
-  local: LocalStatus | null; download?: DownloadState; installed: boolean; diskEnough: boolean; avatarUrl?: string | null; onDownload: () => void;
-  localModel?: LocalModel; actionBusy: string | null; onLoad: (model: LocalModel) => Promise<void>; onEject: (model: LocalModel) => Promise<void>;
+  local: LocalStatus | null; download?: DownloadState; installed: boolean; diskEnough: boolean; avatarUrl?: string | null; onDownload: () => void; onCancelDownload: (download: DownloadState) => Promise<void>;
+  localModel?: LocalModel; actionBusy: string | null; onLoad: (model: LocalModel) => Promise<void>; onEject: (model: LocalModel) => Promise<void>; onRemove: (model: LocalModel) => Promise<void>;
 }) {
   const fit = variant ? assessFit(variant, local) : null;
-  const downloading = download?.status === "queued" || download?.status === "downloading";
+  const downloading = download?.status === "queued" || download?.status === "downloading" || download?.status === "canceling";
+  const canceling = download?.status === "canceling";
   const progress = download?.totalBytes ? Math.round(download.downloadedBytes / download.totalBytes * 100) : 0;
   const downloadedVariantIds = new Set(
     (local?.models ?? [])
@@ -281,9 +303,10 @@ function ModelDetail({ detail, variant, variantId, onVariant, local, download, i
         <div className="hub-variant-select"><span className="hub-fit-dot" style={{ borderColor: fit?.color, color: fit?.color }}>✓</span>
           <VariantPicker variants={detail.variants} value={variantId} onChange={onVariant} downloadedVariantIds={downloadedVariantIds} />
         </div>
-        <button className="hub-download-button" disabled={!variant || installed || downloading || !diskEnough} onClick={onDownload}>
-          {installed ? "✓ On Device" : downloading ? `${progress}%` : !diskEnough ? "Not enough disk" : "⇩ Download"}
-        </button>
+        {downloading && download ? <button className="hub-download-button hub-cancel-download" disabled={canceling} onClick={() => void onCancelDownload(download)}>{canceling ? "Cancelling…" : "Cancel download"}</button> :
+          <button className="hub-download-button" disabled={!variant || installed || !diskEnough} onClick={onDownload}>
+            {installed ? "✓ On Device" : !diskEnough ? "Not enough disk" : "⇩ Download"}
+          </button>}
       </div>
       {fit && <div className="hub-fit-line"><strong style={{ color: fit.color }}>{fit.label}</strong><span>{fit.detail}</span>{fit.freeMemoryWarning && <em>Free memory before loading.</em>}</div>}
       {downloading && <div className="hub-progress"><i style={{ width: `${progress}%` }} /></div>}
@@ -293,7 +316,7 @@ function ModelDetail({ detail, variant, variantId, onVariant, local, download, i
     <div className="hub-meta">
       <span>Updated <b>{relativeDate(detail.lastModified)}</b></span><span>Downloads <b>{compact(detail.downloads)}</b></span><span>Likes <b>{compact(detail.likes)}</b></span><span>License <b>{detail.license ?? "Not specified"}</b></span>
     </div>
-    {localModel && <ModelAction model={localModel} busy={actionBusy === localModel.id} onLoad={onLoad} onEject={onEject} />}
+    {localModel && <ModelAction model={localModel} busy={actionBusy === localModel.id} onLoad={onLoad} onEject={onEject} onRemove={onRemove} />}
     <ModelCardReadme detail={detail} />
   </div>;
 }
@@ -336,21 +359,23 @@ export function ModelCardReadme({ detail }: { detail: HubModelDetail }) {
   </article>;
 }
 
-function OnDevice({ models, onSelect, busy, onLoad, onEject }: { models: LocalModel[]; onSelect: (model: LocalModel) => void; busy: string | null; onLoad: (model: LocalModel) => Promise<void>; onEject: (model: LocalModel) => Promise<void> }) {
+function OnDevice({ models, onSelect, busy, onLoad, onEject, onRemove }: { models: LocalModel[]; onSelect: (model: LocalModel) => void; busy: string | null; onLoad: (model: LocalModel) => Promise<void>; onEject: (model: LocalModel) => Promise<void>; onRemove: (model: LocalModel) => Promise<void> }) {
   return <section className="hub-device">
     <div className="hub-pane-title"><strong>Models on this device</strong><span>{models.length}</span></div>
     {models.length ? <div className="hub-device-grid">{models.map((model) => <article key={model.id} className="hub-device-card">
       <button className="hub-device-select" onClick={() => onSelect(model)} disabled={!model.sourceRepo}>
         <span className="hub-device-icon">◫</span><span><strong>{model.name}</strong><small>{model.sourceRepo ?? "Local GGUF"}</small><em>{model.quantization ?? "GGUF"} · {formatBytes(model.sizeBytes)}</em></span><b className={model.loaded ? "loaded" : ""}>{model.loaded ? "Loaded" : "On Device"}</b>
       </button>
-      <ModelAction model={model} busy={busy === model.id} onLoad={onLoad} onEject={onEject} compact />
+      <ModelAction model={model} busy={busy === model.id} onLoad={onLoad} onEject={onEject} onRemove={onRemove} compact />
     </article>)}</div> : <Empty title="No models on device" body="Download a GGUF model or place one in the llama.cpp models directory." />}
   </section>;
 }
 
-function ModelAction({ model, busy, onLoad, onEject, compact = false }: { model: LocalModel; busy: boolean; onLoad: (model: LocalModel) => Promise<void>; onEject: (model: LocalModel) => Promise<void>; compact?: boolean }) {
+function ModelAction({ model, busy, onLoad, onEject, onRemove, compact = false }: { model: LocalModel; busy: boolean; onLoad: (model: LocalModel) => Promise<void>; onEject: (model: LocalModel) => Promise<void>; onRemove: (model: LocalModel) => Promise<void>; compact?: boolean }) {
+  const removable = !!model.sourceRepo && !!model.revision && !!model.variantId;
   return <div className={`hub-model-actions ${compact ? "compact" : ""}`}>
     {model.loaded ? <button className="hub-eject-button" disabled={busy} onClick={() => void onEject(model)}>{busy ? "Ejecting…" : "Eject"}</button> : <button className="hub-load-button" disabled={busy} onClick={() => void onLoad(model)}>{busy ? "Loading…" : "Load"}</button>}
+    {removable && <button className="hub-remove-button" disabled={busy || model.loaded} title={model.loaded ? "Eject this model before removing it" : "Remove downloaded model files"} onClick={() => void onRemove(model)}>{busy ? "Removing…" : "Remove"}</button>}
     <small>{model.loaded ? "Releases model memory; files stay on disk." : "Loads this model into memory."}</small>
   </div>;
 }

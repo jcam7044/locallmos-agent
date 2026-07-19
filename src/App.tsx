@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useState } from "react";
-import { getAgentStatus, getLocalStatus } from "./api";
+import { listen } from "@tauri-apps/api/event";
+import { getAgentStatus, getLocalStatus, hubCancelDownload, hubListDownloads } from "./api";
 import { ChatView } from "./chat/ChatView";
 import { ConnectCloud, Dashboard } from "./dashboard/Dashboard";
-import type { AgentStatus, LocalStatus } from "./types";
+import { DownloadBanner } from "./downloads/DownloadBanner";
+import type { AgentStatus, DownloadState, LocalStatus } from "./types";
 import { useTabWindowSize, type Tab } from "./useTabWindowSize";
 import { ModelsView } from "./models/ModelsView";
 
@@ -12,6 +14,8 @@ export function App() {
   const [local, setLocal] = useState<LocalStatus | null>(null);
   const [status, setStatus] = useState<AgentStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [downloads, setDownloads] = useState<Record<string, DownloadState>>({});
+  const [dismissedDownloads, setDismissedDownloads] = useState<Set<string>>(() => new Set());
 
   const refresh = useCallback(async () => {
     try {
@@ -28,6 +32,19 @@ export function App() {
     void refresh();
     const t = setInterval(refresh, 3000);
     return () => clearInterval(t);
+  }, [refresh]);
+
+  useEffect(() => {
+    let disposed = false;
+    void hubListDownloads().then((items) => {
+      if (!disposed) setDownloads(Object.fromEntries(items.map((download) => [download.id, download])));
+    }).catch(() => undefined);
+    let unlisten: (() => void) | undefined;
+    void listen<DownloadState>("model-download", ({ payload }) => {
+      setDownloads((current) => ({ ...current, [payload.id]: payload }));
+      if (payload.status === "complete") void refresh();
+    }).then((stop) => { unlisten = stop; });
+    return () => { disposed = true; unlisten?.(); };
   }, [refresh]);
 
   const running = local?.runtime.state === "running";
@@ -81,6 +98,11 @@ export function App() {
       )}
 
       {error && <p style={{ color: "#f87171", fontSize: 12, marginTop: 12 }}>{error}</p>}
+      <DownloadBanner
+        downloads={Object.values(downloads).filter((download) => !dismissedDownloads.has(download.id))}
+        onDismiss={(id) => setDismissedDownloads((dismissed) => new Set(dismissed).add(id))}
+        onCancel={(id) => { void hubCancelDownload(id).then((download) => setDownloads((current) => ({ ...current, [download.id]: download }))).catch((reason) => setError(String(reason))); }}
+      />
     </div>
   );
 }

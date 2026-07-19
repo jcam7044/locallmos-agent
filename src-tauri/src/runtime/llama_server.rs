@@ -846,6 +846,78 @@ fn grouped_ggufs(dir: &str) -> Vec<InstalledModel> {
     groups.into_values().collect()
 }
 
+/// Remove a completed LocalLMOS-managed Hub download. The model is located by
+/// its scanned stable id rather than accepting a filesystem path from the UI;
+/// a matching manifest is required before any files can be deleted.
+pub fn delete_hub_model(dir: &str, model_id: &str) -> Result<()> {
+    let root = Path::new(dir);
+    let model = grouped_ggufs(dir)
+        .into_iter()
+        .find(|model| model.id == model_id)
+        .ok_or_else(|| anyhow!("model is no longer on disk"))?;
+    let repo = model
+        .source_repo
+        .as_deref()
+        .ok_or_else(|| anyhow!("only LocalLMOS Hub downloads can be removed"))?;
+    if model.revision.is_none() {
+        return Err(anyhow!("only LocalLMOS Hub downloads with a manifest can be removed"));
+    }
+    let files = model.files;
+    let first = files.first().ok_or_else(|| anyhow!("model has no GGUF files"))?;
+    let parent_rel = Path::new(first).parent().unwrap_or(Path::new(""));
+    if parent_rel.components().any(|part| !matches!(part, std::path::Component::Normal(_))) {
+        return Err(anyhow!("invalid installed model path"));
+    }
+    let parent = root.join(parent_rel);
+    let mut expected_names: Vec<String> = files
+        .iter()
+        .filter_map(|file| Path::new(file).file_name()?.to_str().map(str::to_string))
+        .collect();
+    expected_names.sort();
+    if expected_names.len() != files.len() {
+        return Err(anyhow!("invalid installed model filename"));
+    }
+
+    let manifest = std::fs::read_dir(&parent)
+        .ok()
+        .into_iter()
+        .flatten()
+        .flatten()
+        .find_map(|entry| {
+            let path = entry.path();
+            let name = path.file_name()?.to_str()?;
+            if !name.ends_with(".locallmos.json") || entry.file_type().ok()?.is_symlink() {
+                return None;
+            }
+            let value: Value = serde_json::from_slice(&std::fs::read(&path).ok()?).ok()?;
+            let manifest_repo = value.get("repoId")?.as_str()?;
+            let mut manifest_names: Vec<String> = value
+                .get("files")?
+                .as_array()?
+                .iter()
+                .filter_map(|file| file.get("path")?.as_str())
+                .filter_map(|file| Path::new(file).file_name()?.to_str().map(str::to_string))
+                .collect();
+            manifest_names.sort();
+            (manifest_repo == repo && manifest_names == expected_names).then_some(path)
+        })
+        .ok_or_else(|| anyhow!("LocalLMOS download manifest was not found"))?;
+
+    for file in files {
+        let relative = Path::new(&file);
+        if relative.is_absolute() || relative.components().any(|part| !matches!(part, std::path::Component::Normal(_))) {
+            return Err(anyhow!("invalid installed model path"));
+        }
+        let target = root.join(relative);
+        if !target.starts_with(root) || std::fs::symlink_metadata(&target).map(|meta| meta.file_type().is_symlink()).unwrap_or(true) {
+            return Err(anyhow!("invalid installed model file"));
+        }
+        std::fs::remove_file(target)?;
+    }
+    std::fs::remove_file(manifest)?;
+    Ok(())
+}
+
 fn quantization_from_name(name: &str) -> Option<String> {
     let upper = name.to_uppercase();
     for marker in ["UD-Q", "IQ", "Q", "BF16", "F16", "F32"] {
@@ -1182,6 +1254,48 @@ mod tests {
         assert_eq!(models[0].source_repo.as_deref(), Some("owner/model"));
         assert_eq!(models[0].revision.as_deref(), Some("abc"));
         assert!(models[0].id.ends_with("00001-of-00002.gguf"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn deletes_only_manifest_backed_hub_models() {
+        let root = std::env::temp_dir().join(format!("locallmos-delete-model-{}", std::process::id()));
+        let repo = root.join("huggingface/owner/model");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&repo).unwrap();
+        let weight = repo.join("model-Q4_K_M.gguf");
+        fs::write(&weight, [0u8; 3]).unwrap();
+        let manifest = repo.join("model-Q4_K_M.locallmos.json");
+        fs::write(&manifest, r#"{
+            "repoId":"owner/model",
+            "revision":"abc",
+            "variantId":"model-Q4_K_M",
+            "files":[{"path":"model-Q4_K_M.gguf","sizeBytes":3}]
+        }"#).unwrap();
+
+        delete_hub_model(
+            root.to_str().unwrap(),
+            "huggingface/owner/model/model-Q4_K_M.gguf",
+        ).unwrap();
+        assert!(!weight.exists());
+        assert!(!manifest.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn refuses_to_delete_a_model_without_a_manifest() {
+        let root = std::env::temp_dir().join(format!("locallmos-refuse-delete-{}", std::process::id()));
+        let repo = root.join("huggingface/owner/model");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&repo).unwrap();
+        let weight = repo.join("model-Q4_K_M.gguf");
+        fs::write(&weight, [0u8; 3]).unwrap();
+
+        assert!(delete_hub_model(
+            root.to_str().unwrap(),
+            "huggingface/owner/model/model-Q4_K_M.gguf",
+        ).is_err());
+        assert!(weight.exists());
         let _ = fs::remove_dir_all(root);
     }
 }

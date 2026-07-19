@@ -16,6 +16,7 @@ export const getLocalStatus = () => invoke<LocalStatus>("local_status");
 export const getAgentStatus = () => invoke<AgentStatus>("get_status");
 export const loadModel = (model: string) => invoke("load_model", { model });
 export const unloadModel = (model: string) => invoke("unload_model", { model });
+export const deleteLocalModel = (modelId: string) => invoke("delete_local_model", { modelId });
 export const restartRuntime = () => invoke("restart_runtime");
 export const setRuntime = (kind: string) => invoke("set_runtime", { kind });
 export const openModelsDir = () => invoke("open_models_dir");
@@ -32,6 +33,7 @@ export const hubGetAuthorAvatars = (authors: string[]) =>
 export const hubStartDownload = (repoId: string, revision: string, variantId: string) =>
   invoke<DownloadState>("hub_start_download", { repoId, revision, variantId });
 export const hubListDownloads = () => invoke<DownloadState[]>("hub_list_downloads");
+export const hubCancelDownload = (id: string) => invoke<DownloadState>("hub_cancel_download", { id });
 export const localUpdate = () => invoke<string | null>("local_update");
 export const enroll = (code: string, name: string) => invoke("enroll", { code, name });
 export const localChatSend = (args: {

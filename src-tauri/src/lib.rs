@@ -247,6 +247,15 @@ async fn hub_list_downloads(
     Ok(state.hub.list_downloads().await)
 }
 
+#[tauri::command]
+async fn hub_cancel_download(
+    app: tauri::AppHandle,
+    state: State<'_, Arc<AppState>>,
+    id: String,
+) -> Result<hub::DownloadState, String> {
+    state.hub.cancel_download(&app, &id).await.map_err(|e| e.to_string())
+}
+
 /// Load/keep a model resident in the runtime.
 #[tauri::command]
 async fn load_model(state: State<'_, Arc<AppState>>, model: String) -> Result<(), String> {
@@ -257,6 +266,16 @@ async fn load_model(state: State<'_, Arc<AppState>>, model: String) -> Result<()
 #[tauri::command]
 async fn unload_model(state: State<'_, Arc<AppState>>, model: String) -> Result<(), String> {
     state.runtime.unload_model(&model).await.map_err(|e| e.to_string())
+}
+
+/// Delete a completed Hub download. Loaded models must be ejected first.
+#[tauri::command]
+async fn delete_local_model(state: State<'_, Arc<AppState>>, model_id: String) -> Result<(), String> {
+    if state.runtime.snapshot().await.models.iter().any(|model| model.id == model_id && model.loaded) {
+        return Err("eject this model before removing its files".into());
+    }
+    runtime::llama_server::delete_hub_model(&runtime::llamacpp_models_dir(), &model_id)
+        .map_err(|error| error.to_string())
 }
 
 /// Restart the local runtime service.
@@ -576,6 +595,7 @@ fn run_gui() {
             local_status,
             load_model,
             unload_model,
+            delete_local_model,
             restart_runtime,
             set_runtime,
             open_models_dir,
@@ -584,6 +604,7 @@ fn run_gui() {
             hub_get_author_avatars,
             hub_start_download,
             hub_list_downloads,
+            hub_cancel_download,
             local_chat_send,
             local_chat_cancel,
             local_update,

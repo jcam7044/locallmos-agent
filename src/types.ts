@@ -94,7 +94,7 @@ export type DownloadState = {
   repoId: string;
   revision: string;
   variantId: string;
-  status: "queued" | "downloading" | "complete" | "error";
+  status: "queued" | "downloading" | "canceling" | "cancelled" | "complete" | "error";
   downloadedBytes: number;
   totalBytes: number;
   error: string | null;

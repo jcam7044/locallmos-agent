@@ -51,6 +51,9 @@ pub struct LlamaServerAdapter {
     thinking: bool,
     startup_timeout: u64,
     proc: Mutex<Option<ChildProc>>,
+    /// Cached auto device selection: `None` = not yet probed; `Some(None)` = probed,
+    /// use all devices; `Some(Some(list))` = restrict to this `--device` list.
+    device_cache: Mutex<Option<Option<String>>>,
 }
 
 impl LlamaServerAdapter {
@@ -92,7 +95,54 @@ impl LlamaServerAdapter {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(180),
             proc: Mutex::new(None),
+            device_cache: Mutex::new(None),
         }
+    }
+
+    /// The `--device` value to pass, auto-selecting discrete GPUs over a weak
+    /// iGPU when both are present. Returns `None` to let llama.cpp use all
+    /// devices (single-GPU / unified-memory boxes: Apple Silicon, Strix Halo,
+    /// DGX Spark, or homogeneous multi-GPU). Cached after the first probe; skipped
+    /// entirely when the user already passes `--device`/`-dev` or opts out via
+    /// `LOCALLMOS_LLAMACPP_AUTODEVICE=0`.
+    async fn device_arg(&self) -> Option<String> {
+        let user_set = self
+            .extra_args
+            .iter()
+            .any(|a| a == "--device" || a == "-dev");
+        let opted_out = std::env::var("LOCALLMOS_LLAMACPP_AUTODEVICE")
+            .map(|v| v == "0" || v.eq_ignore_ascii_case("false"))
+            .unwrap_or(false);
+        if user_set || opted_out {
+            return None;
+        }
+        if let Some(cached) = self.device_cache.lock().await.as_ref() {
+            return cached.clone();
+        }
+        let devices = self.list_devices().await;
+        let picked = pick_devices(&devices);
+        if let Some(list) = &picked {
+            tracing::info!("llama.cpp: auto-selected devices {list} (excluding integrated GPU)");
+        }
+        *self.device_cache.lock().await = Some(picked.clone());
+        picked
+    }
+
+    /// Ask llama-server to enumerate its compute devices (`token`, `name`).
+    async fn list_devices(&self) -> Vec<(String, String)> {
+        let output = Command::new(&self.bin)
+            .arg("--list-devices")
+            .output()
+            .await
+            .ok();
+        let text = output
+            .map(|o| {
+                let mut s = String::from_utf8_lossy(&o.stdout).into_owned();
+                s.push_str(&String::from_utf8_lossy(&o.stderr));
+                s
+            })
+            .unwrap_or_default();
+        parse_devices(&text)
     }
 
     pub fn endpoint(&self) -> &str {
@@ -151,6 +201,8 @@ impl LlamaServerAdapter {
         let gguf = self.resolve_gguf(model).ok_or_else(|| {
             anyhow!("no .gguf for model {model:?} in {:?}", self.models_dir)
         })?;
+        // Compute the device selection before taking the process lock.
+        let device = self.device_arg().await;
         {
             let mut guard = self.proc.lock().await;
             if let Some(p) = guard.as_mut() {
@@ -180,6 +232,9 @@ impl LlamaServerAdapter {
                 .arg(&self.ngl);
             for a in &self.extra_args {
                 cmd.arg(a);
+            }
+            if let Some(dev) = &device {
+                cmd.arg("--device").arg(dev);
             }
             // Surface llama-server load progress/errors in the agent terminal.
             cmd.stdout(Stdio::null()).stderr(Stdio::inherit());
@@ -367,6 +422,82 @@ impl RuntimeAdapter for LlamaServerAdapter {
             let _ = p.child.wait().await;
         }
         Ok(())
+    }
+}
+
+/// Parse `llama-server --list-devices` output into `(token, name)` pairs, e.g.
+/// `("Vulkan1", "NVIDIA GeForce RTX 5060 Ti")`. Device lines look like
+/// `  Vulkan1: NVIDIA GeForce RTX 5060 Ti (16311 MiB, 4680 MiB free)`.
+fn parse_devices(text: &str) -> Vec<(String, String)> {
+    let mut devices = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        let Some((token, rest)) = line.split_once(": ") else {
+            continue;
+        };
+        // A device token is a single word (e.g. Vulkan0, CUDA0, Metal0); the
+        // "Available devices:" header and prose lines contain spaces → skipped.
+        if token.is_empty() || token.contains(char::is_whitespace) {
+            continue;
+        }
+        let name = rest.split(" (").next().unwrap_or(rest).trim();
+        if !name.is_empty() {
+            devices.push((token.to_string(), name.to_string()));
+        }
+    }
+    devices
+}
+
+/// Best-effort integrated-GPU classifier from a device name (any vendor). Used to
+/// drop a weak CPU iGPU when a real GPU is present. `--list-devices` exposes no
+/// device-type flag, so this is name-based and deliberately conservative — it only
+/// matches well-known iGPU naming and is overridable (see `device_arg`).
+fn is_integrated(name: &str) -> bool {
+    let n = name.to_lowercase();
+    // RADV names an AMD iGPU after the host CPU, e.g. "AMD Ryzen 5 7600X 6-Core
+    // Processor (RADV RAPHAEL_MENDOCINO)".
+    if n.contains("processor") {
+        return true;
+    }
+    // Intel iGPUs ("UHD/Iris/HD Graphics"); Arc is discrete.
+    if (n.contains("uhd graphics") || n.contains("iris") || n.contains("hd graphics"))
+        && !n.contains("arc")
+    {
+        return true;
+    }
+    // AMD APU iGPUs are generic "… Radeon Graphics"; discrete AMD is "Radeon RX",
+    // "Radeon Pro", or "Instinct".
+    if n.contains("radeon")
+        && n.contains("graphics")
+        && !n.contains("rx ")
+        && !n.contains("radeon pro")
+        && !n.contains("instinct")
+    {
+        return true;
+    }
+    false
+}
+
+/// Pick the `--device` list, vendor-agnostically: when the machine has both
+/// discrete and integrated GPUs, restrict to the **discrete** ones (of any/mixed
+/// vendor — so an NVIDIA + AMD build keeps both). Returns `None` (use all) for a
+/// single device, an all-discrete set (incl. mixed-vendor multi-GPU), or an
+/// all-integrated / unified-memory box (Apple Silicon, Strix Halo, DGX Spark).
+fn pick_devices(devices: &[(String, String)]) -> Option<String> {
+    if devices.len() < 2 {
+        return None;
+    }
+    let discrete: Vec<&str> = devices
+        .iter()
+        .filter(|(_, n)| !is_integrated(n))
+        .map(|(t, _)| t.as_str())
+        .collect();
+    // Only restrict if doing so actually drops an integrated GPU while keeping
+    // at least one discrete device.
+    if !discrete.is_empty() && discrete.len() < devices.len() {
+        Some(discrete.join(","))
+    } else {
+        None
     }
 }
 
@@ -676,6 +807,69 @@ mod tests {
         assert_eq!(content, "answer");
         assert_eq!(thinking, "thinking...");
         assert_eq!(out.thinking, "thinking...");
+    }
+
+    #[test]
+    fn parses_list_devices_output() {
+        let text = "Available devices:\n  \
+            Vulkan0: AMD Ryzen 5 7600X 6-Core Processor (RADV RAPHAEL_MENDOCINO) (15837 MiB, 13250 MiB free)\n  \
+            Vulkan1: NVIDIA GeForce RTX 5060 Ti (16311 MiB, 4680 MiB free)\n  \
+            Vulkan2: NVIDIA GeForce RTX 5060 Ti (16311 MiB, 5209 MiB free)\n";
+        let d = parse_devices(text);
+        assert_eq!(d.len(), 3);
+        assert_eq!(d[0].0, "Vulkan0");
+        assert!(d[0].1.contains("Ryzen"));
+        assert_eq!(d[1].0, "Vulkan1");
+        assert!(d[1].1.contains("NVIDIA"));
+    }
+
+    #[test]
+    fn device_selection_drops_igpu_across_vendors_and_keeps_mixed_discrete() {
+        let d = |t: &str, n: &str| (t.to_string(), n.to_string());
+
+        // NVIDIA discrete + AMD CPU iGPU → keep the NVIDIA cards.
+        assert_eq!(
+            pick_devices(&[
+                d("Vulkan0", "AMD Ryzen 5 7600X 6-Core Processor (RADV RAPHAEL)"),
+                d("Vulkan1", "NVIDIA GeForce RTX 5060 Ti"),
+                d("Vulkan2", "NVIDIA GeForce RTX 5060 Ti"),
+            ])
+            .as_deref(),
+            Some("Vulkan1,Vulkan2")
+        );
+        // AMD discrete + AMD iGPU → keep the discrete AMD card (vendor-agnostic).
+        assert_eq!(
+            pick_devices(&[
+                d("Vulkan0", "AMD Radeon Graphics (RADV PHOENIX)"),
+                d("Vulkan1", "AMD Radeon RX 7900 XTX"),
+            ])
+            .as_deref(),
+            Some("Vulkan1")
+        );
+        // Intel Arc discrete + Intel iGPU → keep the Arc.
+        assert_eq!(
+            pick_devices(&[
+                d("Vulkan0", "Intel(R) UHD Graphics 770"),
+                d("Vulkan1", "Intel(R) Arc(TM) A770 Graphics"),
+            ])
+            .as_deref(),
+            Some("Vulkan1")
+        );
+        // Mixed-vendor, BOTH discrete → use both (Vulkan cross-vendor).
+        assert_eq!(
+            pick_devices(&[
+                d("Vulkan0", "NVIDIA GeForce RTX 4090"),
+                d("Vulkan1", "AMD Radeon RX 7900 XTX"),
+            ]),
+            None
+        );
+        // Single device (Apple / Strix Halo / DGX Spark) → don't restrict.
+        assert_eq!(pick_devices(&[d("Metal0", "Apple M3 Max")]), None);
+        // Homogeneous discrete multi-GPU → use all.
+        assert_eq!(
+            pick_devices(&[d("CUDA0", "NVIDIA A100"), d("CUDA1", "NVIDIA A100")]),
+            None
+        );
     }
 
     #[test]

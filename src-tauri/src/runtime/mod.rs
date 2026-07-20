@@ -140,6 +140,21 @@ impl ToolCall {
     }
 }
 
+/// Performance information reported by a completed llama.cpp streamed response.
+/// Times are milliseconds and rates are tokens per second.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GenerationMetrics {
+    pub prompt_eval_tokens: Option<u32>,
+    pub cached_tokens: Option<u32>,
+    pub prompt_eval_ms: Option<f64>,
+    pub prompt_tokens_per_second: Option<f64>,
+    pub generation_ms: Option<f64>,
+    pub tokens_per_second: Option<f64>,
+    pub time_to_first_token_ms: Option<f64>,
+    pub stream_chunks: u32,
+}
+
 /// The assembled result of a chat turn.
 pub struct ChatOutput {
     pub content: String,
@@ -148,6 +163,8 @@ pub struct ChatOutput {
     /// the stream ended without reporting them.
     pub prompt_tokens: Option<u32>,
     pub completion_tokens: Option<u32>,
+    /// Timing and cache information from the runtime, when it reports it.
+    pub generation_metrics: Option<GenerationMetrics>,
     /// Tool calls the model requested this round (empty when it answered directly).
     pub tool_calls: Vec<ToolCall>,
 }

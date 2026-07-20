@@ -278,6 +278,7 @@ impl OllamaAdapter {
                     thinking,
                     prompt_tokens: None,
                     completion_tokens: None,
+                    generation_metrics: None,
                     tool_calls,
                 });
             }
@@ -335,6 +336,7 @@ impl OllamaAdapter {
                         thinking,
                         prompt_tokens,
                         completion_tokens,
+                        generation_metrics: None,
                         tool_calls,
                     });
                 }
@@ -345,6 +347,7 @@ impl OllamaAdapter {
             thinking,
             prompt_tokens: None,
             completion_tokens: None,
+            generation_metrics: None,
             tool_calls,
         })
     }

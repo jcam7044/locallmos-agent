@@ -128,6 +128,18 @@ export type Attachment = {
   text: string | null;
 };
 
+/** Performance details reported by llama.cpp for a completed response. */
+export type GenerationMetrics = {
+  promptEvalTokens: number | null;
+  cachedTokens: number | null;
+  promptEvalMs: number | null;
+  promptTokensPerSecond: number | null;
+  generationMs: number | null;
+  tokensPerSecond: number | null;
+  timeToFirstTokenMs: number | null;
+  streamChunks: number;
+};
+
 export type StoredMessage = {
   role: "user" | "assistant";
   content: string;
@@ -135,6 +147,7 @@ export type StoredMessage = {
   attachments: Attachment[];
   promptTokens: number | null;
   completionTokens: number | null;
+  generationMetrics: GenerationMetrics | null;
   toolActivity: unknown;
   cancelled: boolean;
   createdAt: string;
@@ -175,6 +188,7 @@ export function newUserMessage(content: string, attachments: Attachment[] = []):
     attachments,
     promptTokens: null,
     completionTokens: null,
+    generationMetrics: null,
     toolActivity: null,
     cancelled: false,
     createdAt: new Date().toISOString(),

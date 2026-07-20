@@ -6,6 +6,7 @@
 
 use crate::chat_store::{self, StoredMessage};
 use crate::runtime::ollama::{ChatDelta, ToolCall};
+use crate::runtime::GenerationMetrics;
 use crate::runtime::tools;
 use crate::AppState;
 use serde_json::{json, Value};
@@ -140,6 +141,7 @@ pub async fn send(
     assistant.thinking = (!turn.thinking.is_empty()).then_some(turn.thinking);
     assistant.prompt_tokens = (turn.prompt_tokens > 0).then_some(turn.prompt_tokens);
     assistant.completion_tokens = (turn.completion_tokens > 0).then_some(turn.completion_tokens);
+    assistant.generation_metrics = turn.generation_metrics;
     assistant.tool_activity =
         (!turn.tool_activity.is_empty()).then(|| Value::Array(turn.tool_activity));
     assistant.cancelled = cancel.load(Ordering::Relaxed);
@@ -163,6 +165,7 @@ struct TurnOutput {
     thinking: String,
     prompt_tokens: u32,
     completion_tokens: u32,
+    generation_metrics: Option<GenerationMetrics>,
     tool_activity: Vec<Value>,
 }
 
@@ -185,6 +188,7 @@ async fn run_turn(
         thinking: String::new(),
         prompt_tokens: 0,
         completion_tokens: 0,
+        generation_metrics: None,
         tool_activity: Vec::new(),
     };
 
@@ -228,6 +232,7 @@ async fn run_turn(
         if round_out.tool_calls.is_empty() || cancel.load(Ordering::Relaxed) {
             out.content = round_out.content;
             out.thinking = round_out.thinking;
+            out.generation_metrics = round_out.generation_metrics;
             return Ok(out);
         }
 
@@ -261,6 +266,7 @@ async fn run_turn(
         if round == MAX_TOOL_ROUNDS - 1 {
             out.content = round_out.content;
             out.thinking = round_out.thinking;
+            out.generation_metrics = round_out.generation_metrics;
         }
     }
     Ok(out)

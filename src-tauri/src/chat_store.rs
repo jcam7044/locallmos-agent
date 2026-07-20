@@ -4,6 +4,7 @@
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use crate::runtime::GenerationMetrics;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::PathBuf;
@@ -44,6 +45,8 @@ pub struct StoredMessage {
     pub attachments: Vec<Attachment>,
     pub prompt_tokens: Option<u32>,
     pub completion_tokens: Option<u32>,
+    #[serde(default)]
+    pub generation_metrics: Option<GenerationMetrics>,
     pub tool_activity: Option<Value>,
     #[serde(default)]
     pub cancelled: bool,
@@ -59,6 +62,7 @@ impl StoredMessage {
             attachments: Vec::new(),
             prompt_tokens: None,
             completion_tokens: None,
+            generation_metrics: None,
             tool_activity: None,
             cancelled: false,
             created_at: Utc::now(),

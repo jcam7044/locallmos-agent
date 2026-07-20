@@ -12,7 +12,7 @@
 //! `/health`, and reuses it while the same model is requested.
 
 use super::{
-    ChatDelta, ChatOutput, FlashAttention, GpuOffload, KvCacheType, ModelInfo,
+    ChatDelta, ChatOutput, FlashAttention, GenerationMetrics, GpuOffload, KvCacheType, ModelInfo,
     ModelLoadSettings, RuntimeAdapter, RuntimeSnapshot, SpeculativeDecoding, ToolCall,
 };
 use anyhow::{anyhow, Result};
@@ -475,6 +475,8 @@ impl LlamaServerAdapter {
         mut on_delta: F,
     ) -> Result<ChatOutput> {
         self.ensure_running(model, load_settings).await?;
+        // Measure from the chat request, not from an optional model start/reload.
+        let request_started = Instant::now();
 
         let mut body = json!({
             "model": model,
@@ -513,7 +515,7 @@ impl LlamaServerAdapter {
 
         let mut stream = resp.bytes_stream();
         let mut buf: Vec<u8> = Vec::new();
-        let mut state = StreamState::default();
+        let mut state = StreamState { request_started: Some(request_started), ..Default::default() };
         'outer: while let Some(chunk) = stream.next().await {
             // Stop-generation: drop the stream (closing the connection halts the
             // server) and return what we have.
@@ -1300,11 +1302,21 @@ struct StreamState {
     tools: Vec<ToolFrag>,
     prompt_tokens: Option<u32>,
     completion_tokens: Option<u32>,
+    cached_tokens: Option<u32>,
+    prompt_eval_tokens: Option<u32>,
+    prompt_eval_ms: Option<f64>,
+    prompt_tokens_per_second: Option<f64>,
+    generation_ms: Option<f64>,
+    tokens_per_second: Option<f64>,
+    request_started: Option<Instant>,
+    time_to_first_token_ms: Option<f64>,
+    stream_chunks: u32,
 }
 
 /// Fold one parsed SSE `chunk` into `state`, returning any (content, thinking)
 /// text to stream to the UI now.
 fn ingest(state: &mut StreamState, chunk: &Value) -> (Option<String>, Option<String>) {
+    state.stream_chunks += 1;
     if let Some(u) = chunk.get("usage").and_then(Value::as_object) {
         if let Some(p) = u.get("prompt_tokens").and_then(Value::as_u64) {
             state.prompt_tokens = Some(p as u32);
@@ -1312,6 +1324,14 @@ fn ingest(state: &mut StreamState, chunk: &Value) -> (Option<String>, Option<Str
         if let Some(c) = u.get("completion_tokens").and_then(Value::as_u64) {
             state.completion_tokens = Some(c as u32);
         }
+    }
+    if let Some(timings) = chunk.get("timings").and_then(Value::as_object) {
+        state.cached_tokens = timings.get("cache_n").and_then(json_u32);
+        state.prompt_eval_tokens = timings.get("prompt_n").and_then(json_u32);
+        state.prompt_eval_ms = timings.get("prompt_ms").and_then(Value::as_f64);
+        state.prompt_tokens_per_second = timings.get("prompt_per_second").and_then(Value::as_f64);
+        state.generation_ms = timings.get("predicted_ms").and_then(Value::as_f64);
+        state.tokens_per_second = timings.get("predicted_per_second").and_then(Value::as_f64);
     }
     let Some(choice) = chunk.get("choices").and_then(|c| c.get(0)) else {
         return (None, None);
@@ -1324,6 +1344,7 @@ fn ingest(state: &mut StreamState, chunk: &Value) -> (Option<String>, Option<Str
     let mut out_thinking = None;
     if let Some(s) = delta.get("content").and_then(Value::as_str) {
         if !s.is_empty() {
+            mark_first_token(state);
             state.content.push_str(s);
             out_content = Some(s.to_string());
         }
@@ -1331,6 +1352,7 @@ fn ingest(state: &mut StreamState, chunk: &Value) -> (Option<String>, Option<Str
     // Reasoning models (via llama.cpp --reasoning-format) stream reasoning_content.
     if let Some(s) = delta.get("reasoning_content").and_then(Value::as_str) {
         if !s.is_empty() {
+            mark_first_token(state);
             state.thinking.push_str(s);
             out_thinking = Some(s.to_string());
         }
@@ -1357,6 +1379,18 @@ fn ingest(state: &mut StreamState, chunk: &Value) -> (Option<String>, Option<Str
     (out_content, out_thinking)
 }
 
+fn json_u32(value: &Value) -> Option<u32> {
+    value.as_u64().and_then(|n| u32::try_from(n).ok())
+}
+
+fn mark_first_token(state: &mut StreamState) {
+    if state.time_to_first_token_ms.is_none() {
+        state.time_to_first_token_ms = state
+            .request_started
+            .map(|started| started.elapsed().as_secs_f64() * 1_000.0);
+    }
+}
+
 fn finalize(state: StreamState) -> ChatOutput {
     let tool_calls = state
         .tools
@@ -1367,11 +1401,28 @@ fn finalize(state: StreamState) -> ChatOutput {
             arguments: serde_json::from_str(f.args.trim()).unwrap_or_else(|_| json!({})),
         })
         .collect();
+    let generation_metrics = (state.prompt_eval_tokens.is_some()
+        || state.cached_tokens.is_some()
+        || state.prompt_eval_ms.is_some()
+        || state.generation_ms.is_some()
+        || state.tokens_per_second.is_some()
+        || state.time_to_first_token_ms.is_some())
+    .then_some(GenerationMetrics {
+        prompt_eval_tokens: state.prompt_eval_tokens,
+        cached_tokens: state.cached_tokens,
+        prompt_eval_ms: state.prompt_eval_ms,
+        prompt_tokens_per_second: state.prompt_tokens_per_second,
+        generation_ms: state.generation_ms,
+        tokens_per_second: state.tokens_per_second,
+        time_to_first_token_ms: state.time_to_first_token_ms,
+        stream_chunks: state.stream_chunks,
+    });
     ChatOutput {
         content: state.content,
         thinking: state.thinking,
         prompt_tokens: state.prompt_tokens,
         completion_tokens: state.completion_tokens,
+        generation_metrics,
         tool_calls,
     }
 }
@@ -1525,7 +1576,18 @@ mod tests {
             json!({"choices":[{"delta":{"content":"Hello"},"finish_reason":null}]}),
             json!({"choices":[{"delta":{"content":", world"},"finish_reason":null}]}),
             json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
-            json!({"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":4}}),
+            json!({
+                "choices":[],
+                "usage":{"prompt_tokens":11,"completion_tokens":4},
+                "timings": {
+                    "cache_n": 7,
+                    "prompt_n": 4,
+                    "prompt_ms": 25.0,
+                    "prompt_per_second": 160.0,
+                    "predicted_ms": 40.0,
+                    "predicted_per_second": 100.0
+                }
+            }),
         ];
         let (streamed, _thinking, out) = run(&chunks);
         assert_eq!(streamed, "Hello, world");
@@ -1533,6 +1595,12 @@ mod tests {
         assert!(out.tool_calls.is_empty());
         assert_eq!(out.prompt_tokens, Some(11));
         assert_eq!(out.completion_tokens, Some(4));
+        let metrics = out.generation_metrics.expect("llama.cpp timings are retained");
+        assert_eq!(metrics.cached_tokens, Some(7));
+        assert_eq!(metrics.prompt_eval_tokens, Some(4));
+        assert_eq!(metrics.tokens_per_second, Some(100.0));
+        assert_eq!(metrics.stream_chunks, 4);
+        assert!(metrics.time_to_first_token_ms.is_none());
     }
 
     #[test]

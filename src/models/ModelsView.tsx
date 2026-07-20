@@ -379,9 +379,11 @@ function OnDevice({ models, onSelect, busy, onLoad, onEject, onRemove, onSetting
 function ModelAction({ model, busy, onLoad, onEject, onRemove, onSettings, compact = false }: { model: LocalModel; busy: boolean; onLoad: (model: LocalModel) => Promise<void>; onEject: (model: LocalModel) => Promise<void>; onRemove: (model: LocalModel) => Promise<void>; onSettings?: (model: LocalModel) => void; compact?: boolean }) {
   const removable = !!model.sourceRepo && !!model.revision && !!model.variantId;
   return <div className={`hub-model-actions ${compact ? "compact" : ""}`}>
-    {model.loaded ? <button className="hub-eject-button" disabled={busy} onClick={() => void onEject(model)}>{busy ? "Ejecting…" : "Eject"}</button> : <button className="hub-load-button" disabled={busy} onClick={() => void onLoad(model)}>{busy ? "Loading…" : "Load"}</button>}
-    {onSettings && <button className="hub-settings-button" disabled={busy} title="Model load settings" aria-label={`Load settings for ${model.name}`} onClick={() => onSettings(model)}>⚙ Settings</button>}
-    {removable && <button className="hub-remove-button" disabled={busy || model.loaded} title={model.loaded ? "Eject this model before removing it" : "Remove downloaded model files"} onClick={() => void onRemove(model)}>{busy ? "Removing…" : "Remove"}</button>}
+    <div className="hub-model-action-buttons">
+      {model.loaded ? <button className="hub-eject-button" disabled={busy} onClick={() => void onEject(model)}>{busy ? "Ejecting…" : "Eject"}</button> : <button className="hub-load-button" disabled={busy} onClick={() => void onLoad(model)}>{busy ? "Loading…" : "Load"}</button>}
+      {onSettings && <button className="hub-settings-button" disabled={busy} title="Model load settings" aria-label={`Load settings for ${model.name}`} onClick={() => onSettings(model)}>⚙ Settings</button>}
+      {removable && <button className="hub-remove-button" disabled={busy || model.loaded} title={model.loaded ? "Eject this model before removing it" : "Remove downloaded model files"} onClick={() => void onRemove(model)}>{busy ? "Removing…" : "Remove"}</button>}
+    </div>
     <small>{model.loaded ? "Releases model memory; files stay on disk." : "Loads this model into memory."}</small>
   </div>;
 }

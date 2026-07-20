@@ -11,7 +11,10 @@
 //! child process: it (re)spawns llama-server for the requested model, waits for
 //! `/health`, and reuses it while the same model is requested.
 
-use super::{ChatDelta, ChatOutput, ModelInfo, RuntimeAdapter, RuntimeSnapshot, ToolCall};
+use super::{
+    ChatDelta, ChatOutput, FlashAttention, GpuOffload, KvCacheType, ModelInfo,
+    ModelLoadSettings, RuntimeAdapter, RuntimeSnapshot, ToolCall,
+};
 use anyhow::{anyhow, Result};
 use futures_util::StreamExt;
 use serde::Deserialize;
@@ -69,8 +72,6 @@ pub struct LlamaServerAdapter {
     port: u16,
     bin: String,
     models_dir: String,
-    ngl: String,
-    ctx: String,
     /// Extra `llama-server` args (whitespace-split from `LOCALLMOS_LLAMACPP_ARGS`).
     extra_args: Vec<String>,
     /// Whether this rig's model reasons; toggles Qwen-style `enable_thinking` and
@@ -85,6 +86,13 @@ pub struct LlamaServerAdapter {
 
 impl LlamaServerAdapter {
     pub fn new(http: reqwest::Client) -> Self {
+        for legacy in ["LOCALLMOS_LLAMACPP_CTX", "LOCALLMOS_LLAMACPP_NGL"] {
+            if std::env::var_os(legacy).is_some() {
+                tracing::warn!(
+                    "{legacy} is ignored; configure context and GPU offload per model in LocalLMOS"
+                );
+            }
+        }
         let host =
             std::env::var("LOCALLMOS_LLAMACPP_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
         let port = std::env::var("LOCALLMOS_LLAMACPP_PORT")
@@ -111,8 +119,6 @@ impl LlamaServerAdapter {
                 .ok()
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(default_models_dir),
-            ngl: std::env::var("LOCALLMOS_LLAMACPP_NGL").unwrap_or_else(|_| "999".into()),
-            ctx: std::env::var("LOCALLMOS_LLAMACPP_CTX").unwrap_or_else(|_| "8192".into()),
             extra_args,
             thinking: !std::env::var("LOCALLMOS_LLAMACPP_THINKING")
                 .unwrap_or_default()
@@ -181,8 +187,17 @@ impl LlamaServerAdapter {
         (!self.models_dir.is_empty()).then(|| self.models_dir.clone())
     }
 
-    pub fn context_size(&self) -> u64 {
-        self.ctx.parse().unwrap_or(8192)
+    pub async fn effective_context_size(&self) -> Option<u64> {
+        self.http
+            .get(format!("{}/props", self.base))
+            .send()
+            .await
+            .ok()?
+            .json::<Value>()
+            .await
+            .ok()?
+            .pointer("/default_generation_settings/n_ctx")
+            .and_then(Value::as_u64)
     }
 
     // llama-server serves whatever model process it was launched with, and its
@@ -241,9 +256,21 @@ impl LlamaServerAdapter {
             .cloned()
     }
 
+    pub fn canonical_model_id(&self, model: &str) -> Result<String> {
+        let gguf = self.resolve_gguf(model).ok_or_else(|| {
+            anyhow!("no .gguf for model {model:?} in {:?}", self.models_dir)
+        })?;
+        let root = Path::new(&self.models_dir);
+        Ok(gguf
+            .strip_prefix(root)
+            .unwrap_or(&gguf)
+            .to_string_lossy()
+            .replace('\\', "/"))
+    }
+
     /// Ensure a llama-server child is running and serving `model`, (re)spawning
     /// if none is running or a different model was requested.
-    async fn ensure_running(&self, model: &str) -> Result<()> {
+    async fn ensure_running(&self, model: &str, settings: &ModelLoadSettings) -> Result<()> {
         // Resolve the model file BEFORE touching the running process, so an
         // unknown/stale request (e.g. a reconcile `desired_model` that isn't a
         // local gguf) can never tear down a healthy server mid-load.
@@ -280,16 +307,17 @@ impl LlamaServerAdapter {
                 .arg(self.port.to_string())
                 // --jinja applies the GGUF's chat template and enables native,
                 // grammar-constrained tool calling.
-                .arg("--jinja")
-                .arg("--ctx-size")
-                .arg(&self.ctx)
-                .arg("--n-gpu-layers")
-                .arg(&self.ngl);
-            for a in &self.extra_args {
+                .arg("--jinja");
+            for a in filtered_extra_args(&self.extra_args, settings.gpu_offload) {
                 cmd.arg(a);
             }
-            if let Some(dev) = &device {
-                cmd.arg("--device").arg(dev);
+            for a in managed_args(settings) {
+                cmd.arg(a);
+            }
+            if settings.gpu_offload != GpuOffload::CpuOnly {
+                if let Some(dev) = &device {
+                    cmd.arg("--device").arg(dev);
+                }
             }
             // Surface llama-server load progress/errors in the agent terminal.
             cmd.stdout(Stdio::null()).stderr(Stdio::inherit());
@@ -406,10 +434,11 @@ impl LlamaServerAdapter {
         think: bool,
         tools: Option<&Value>,
         options: Option<&Value>,
+        load_settings: &ModelLoadSettings,
         cancel: Arc<AtomicBool>,
         mut on_delta: F,
     ) -> Result<ChatOutput> {
-        self.ensure_running(model).await?;
+        self.ensure_running(model, load_settings).await?;
 
         let mut body = json!({
             "model": model,
@@ -510,7 +539,7 @@ impl RuntimeAdapter for LlamaServerAdapter {
     }
 
     async fn load_model(&self, model: &str) -> Result<()> {
-        self.ensure_running(model).await
+        self.ensure_running(model, &ModelLoadSettings::default()).await
     }
 
     async fn unload_model(&self, model: &str) -> Result<()> {
@@ -573,6 +602,79 @@ impl RuntimeAdapter for LlamaServerAdapter {
         }
         Ok(())
     }
+}
+
+impl LlamaServerAdapter {
+    pub async fn load_model_configured(
+        &self,
+        model: &str,
+        settings: &ModelLoadSettings,
+    ) -> Result<()> {
+        settings.validate()?;
+        self.ensure_running(model, settings).await
+    }
+}
+
+fn managed_args(settings: &ModelLoadSettings) -> Vec<String> {
+    let mut args = Vec::new();
+    if let Some(context) = settings.context_size {
+        args.extend(["--ctx-size".into(), context.to_string()]);
+    }
+    if let Some(cache) = match settings.kv_cache_type {
+        KvCacheType::Auto => None,
+        KvCacheType::F16 => Some("f16"),
+        KvCacheType::Q8_0 => Some("q8_0"),
+        KvCacheType::Q4_0 => Some("q4_0"),
+    } {
+        args.extend(["--cache-type-k".into(), cache.into()]);
+        args.extend(["--cache-type-v".into(), cache.into()]);
+    }
+    match settings.gpu_offload {
+        GpuOffload::Auto => {}
+        GpuOffload::All => args.extend(["--n-gpu-layers".into(), "all".into()]),
+        GpuOffload::CpuOnly => args.extend(["--device".into(), "none".into()]),
+    }
+    if settings.flash_attention != FlashAttention::Auto {
+        args.extend([
+            "--flash-attn".into(),
+            match settings.flash_attention {
+                FlashAttention::On => "on",
+                FlashAttention::Off => "off",
+                FlashAttention::Auto => unreachable!(),
+            }
+            .into(),
+        ]);
+    }
+    if let Some(threads) = settings.cpu_threads {
+        args.extend(["--threads".into(), threads.to_string()]);
+    }
+    args
+}
+
+fn filtered_extra_args(extra: &[String], gpu_offload: GpuOffload) -> Vec<String> {
+    const MANAGED: &[&str] = &[
+        "-c", "--ctx-size", "-ngl", "--gpu-layers", "--n-gpu-layers", "-ctk",
+        "--cache-type-k", "-ctv", "--cache-type-v", "-fa", "--flash-attn", "-t",
+        "--threads",
+    ];
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < extra.len() {
+        let arg = &extra[i];
+        let managed = MANAGED.iter().any(|flag| arg == flag || arg.starts_with(&format!("{flag}=")));
+        let device = gpu_offload == GpuOffload::CpuOnly
+            && ["-dev", "--device"].iter().any(|flag| arg == flag || arg.starts_with(&format!("{flag}=")));
+        if managed || device {
+            tracing::warn!("ignoring LOCALLMOS_LLAMACPP_ARGS value controlled by model settings: {arg}");
+            if !arg.contains('=') && i + 1 < extra.len() {
+                i += 1;
+            }
+        } else {
+            out.push(arg.clone());
+        }
+        i += 1;
+    }
+    out
 }
 
 /// Stop a surviving llama-server only when its command line identifies the
@@ -1128,6 +1230,48 @@ mod tests {
         }
         let out = finalize(state);
         (content, thinking, out)
+    }
+
+    #[test]
+    fn recommended_settings_leave_hardware_choices_to_llama_cpp() {
+        assert!(managed_args(&ModelLoadSettings::default()).is_empty());
+    }
+
+    #[test]
+    fn custom_settings_generate_the_expected_server_arguments() {
+        let settings = ModelLoadSettings {
+            context_size: Some(32768),
+            kv_cache_type: KvCacheType::Q8_0,
+            gpu_offload: GpuOffload::All,
+            flash_attention: FlashAttention::On,
+            cpu_threads: Some(12),
+        };
+        assert_eq!(managed_args(&settings), vec![
+            "--ctx-size", "32768", "--cache-type-k", "q8_0", "--cache-type-v",
+            "q8_0", "--n-gpu-layers", "all", "--flash-attn", "on", "--threads", "12",
+        ]);
+    }
+
+    #[test]
+    fn managed_extra_arguments_are_removed_without_losing_unrelated_flags() {
+        let extra = ["--ctx-size", "8192", "--mlock", "--threads=8", "--no-mmap"]
+            .map(str::to_string);
+        assert_eq!(
+            filtered_extra_args(&extra, GpuOffload::Auto),
+            vec!["--mlock", "--no-mmap"]
+        );
+        let device = ["--device", "Vulkan0", "--mlock"].map(str::to_string);
+        assert_eq!(
+            filtered_extra_args(&device, GpuOffload::CpuOnly),
+            vec!["--mlock"]
+        );
+        assert_eq!(
+            managed_args(&ModelLoadSettings {
+                gpu_offload: GpuOffload::CpuOnly,
+                ..Default::default()
+            }),
+            vec!["--device", "none"]
+        );
     }
 
     #[test]

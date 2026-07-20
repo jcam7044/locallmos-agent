@@ -272,7 +272,7 @@ async fn execute(state: &Arc<AppState>, kind: &str, payload: &Value) -> (bool, V
             if model.is_empty() {
                 Err(anyhow!("set_model: missing model"))
             } else {
-                state.runtime.load_model(model).await.map(|_| json!({ "model": model }))
+                state.load_model_configured(model, false).await.map(|_| json!({ "model": model }))
             }
         }
         "restart_runtime" => state.runtime.restart().await.map(|_| json!({})),
@@ -344,7 +344,7 @@ async fn reconcile_tick(state: &Arc<AppState>) -> Result<()> {
         let loaded = snap.models.iter().any(|m| m.name == model && m.loaded);
         if !loaded {
             tracing::info!("reconcile: loading desired model {model}");
-            state.runtime.load_model(model).await.ok();
+            state.load_model_configured(model, false).await.ok();
         }
     }
     Ok(())

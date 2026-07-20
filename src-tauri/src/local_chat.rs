@@ -179,6 +179,7 @@ async fn run_turn(
     options: Option<Value>,
     cancel: Arc<AtomicBool>,
 ) -> anyhow::Result<TurnOutput> {
+    let (_, load_settings) = state.model_settings(model).await?;
     let mut out = TurnOutput {
         content: String::new(),
         thinking: String::new(),
@@ -200,6 +201,7 @@ async fn run_turn(
                     think,
                     tools_value.as_ref(),
                     options.as_ref(),
+                    &load_settings,
                     cancel.clone(),
                     move |delta| match delta {
                         ChatDelta::Content(s) => emit(

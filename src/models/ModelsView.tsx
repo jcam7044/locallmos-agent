@@ -4,7 +4,7 @@ import ReactMarkdown from "react-markdown";
 import rehypeRaw from "rehype-raw";
 import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
 import remarkGfm from "remark-gfm";
-import { deleteLocalModel, hubCancelDownload, hubGetAuthorAvatars, hubGetModel, hubListDownloads, hubSearchModels, hubStartDownload, loadModel, unloadModel } from "../api";
+import { deleteLocalModel, getModelLoadSettings, hubCancelDownload, hubGetAuthorAvatars, hubGetModel, hubListDownloads, hubSearchModels, hubStartDownload, loadModel, saveModelLoadSettings, unloadModel } from "../api";
 import type {
   DownloadState,
   GgufVariant,
@@ -12,6 +12,7 @@ import type {
   HubModelSummary,
   LocalModel,
   LocalStatus,
+  ModelLoadSettings,
 } from "../types";
 import { assessFit, chooseVariant, formatBytes } from "./fit";
 import "./models.css";
@@ -49,6 +50,7 @@ export function ModelsView({ local, onChanged }: { local: LocalStatus | null; on
   const [downloads, setDownloads] = useState<Record<string, DownloadState>>({});
   const [authorAvatars, setAuthorAvatars] = useState<Record<string, string>>({});
   const [modelAction, setModelAction] = useState<string | null>(null);
+  const [settingsModel, setSettingsModel] = useState<LocalModel | null>(null);
   const request = useRef(0);
 
   useEffect(() => {
@@ -239,11 +241,13 @@ export function ModelsView({ local, onChanged }: { local: LocalStatus | null; on
                 onLoad={load}
                 onEject={eject}
                 onRemove={remove}
+                onSettings={local?.runtime.kind === "llamacpp" ? setSettingsModel : undefined}
               />
             ) : <Empty title="Select a model" body="Choose a repository to compare its available GGUF downloads." />}
           </section>
         </div>
-      ) : <OnDevice models={local?.models ?? []} onSelect={selectDevice} busy={modelAction} onLoad={load} onEject={eject} onRemove={remove} />}
+      ) : <OnDevice models={local?.models ?? []} onSelect={selectDevice} busy={modelAction} onLoad={load} onEject={eject} onRemove={remove} onSettings={local?.runtime.kind === "llamacpp" ? setSettingsModel : undefined} />}
+      {settingsModel && <ModelLoadSettingsDialog model={settingsModel} onClose={() => setSettingsModel(null)} onChanged={onChanged} />}
     </main>
   );
 }
@@ -254,7 +258,7 @@ function HardwareChips({ local }: { local: LocalStatus | null }) {
   return <div className="hub-hardware">
     <span><i className="green" />{vram ? `${formatBytes(vram)} VRAM` : "CPU only"}</span>
     <span><i className="blue" />{formatBytes(t?.memoryTotalBytes)} RAM</span>
-    <span><i />{local?.runtime.contextSize?.toLocaleString() ?? "8,192"} ctx</span>
+    <span><i />{local?.runtime.contextSize ? `${local.runtime.contextSize.toLocaleString()} ctx` : "Auto context"}</span>
     <span><i />{formatBytes(local?.modelsStorage.availableBytes)} free</span>
   </div>;
 }
@@ -275,10 +279,11 @@ function Avatar({ model, overrideUrl }: { model: HubModelSummary; overrideUrl?: 
     <img className="hub-avatar" src={url} alt="" onError={() => setFailed(true)} />;
 }
 
-function ModelDetail({ detail, variant, variantId, onVariant, local, download, installed, diskEnough, avatarUrl, onDownload, onCancelDownload, localModel, actionBusy, onLoad, onEject, onRemove }: {
+function ModelDetail({ detail, variant, variantId, onVariant, local, download, installed, diskEnough, avatarUrl, onDownload, onCancelDownload, localModel, actionBusy, onLoad, onEject, onRemove, onSettings }: {
   detail: HubModelDetail; variant: GgufVariant | null; variantId: string | null; onVariant: (id: string) => void;
   local: LocalStatus | null; download?: DownloadState; installed: boolean; diskEnough: boolean; avatarUrl?: string | null; onDownload: () => void; onCancelDownload: (download: DownloadState) => Promise<void>;
   localModel?: LocalModel; actionBusy: string | null; onLoad: (model: LocalModel) => Promise<void>; onEject: (model: LocalModel) => Promise<void>; onRemove: (model: LocalModel) => Promise<void>;
+  onSettings?: (model: LocalModel) => void;
 }) {
   const fit = variant ? assessFit(variant, local) : null;
   const downloading = download?.status === "queued" || download?.status === "downloading" || download?.status === "canceling";
@@ -316,7 +321,7 @@ function ModelDetail({ detail, variant, variantId, onVariant, local, download, i
     <div className="hub-meta">
       <span>Updated <b>{relativeDate(detail.lastModified)}</b></span><span>Downloads <b>{compact(detail.downloads)}</b></span><span>Likes <b>{compact(detail.likes)}</b></span><span>License <b>{detail.license ?? "Not specified"}</b></span>
     </div>
-    {localModel && <ModelAction model={localModel} busy={actionBusy === localModel.id} onLoad={onLoad} onEject={onEject} onRemove={onRemove} />}
+    {localModel && <ModelAction model={localModel} busy={actionBusy === localModel.id} onLoad={onLoad} onEject={onEject} onRemove={onRemove} onSettings={onSettings} />}
     <ModelCardReadme detail={detail} />
   </div>;
 }
@@ -359,24 +364,100 @@ export function ModelCardReadme({ detail }: { detail: HubModelDetail }) {
   </article>;
 }
 
-function OnDevice({ models, onSelect, busy, onLoad, onEject, onRemove }: { models: LocalModel[]; onSelect: (model: LocalModel) => void; busy: string | null; onLoad: (model: LocalModel) => Promise<void>; onEject: (model: LocalModel) => Promise<void>; onRemove: (model: LocalModel) => Promise<void> }) {
+function OnDevice({ models, onSelect, busy, onLoad, onEject, onRemove, onSettings }: { models: LocalModel[]; onSelect: (model: LocalModel) => void; busy: string | null; onLoad: (model: LocalModel) => Promise<void>; onEject: (model: LocalModel) => Promise<void>; onRemove: (model: LocalModel) => Promise<void>; onSettings?: (model: LocalModel) => void }) {
   return <section className="hub-device">
     <div className="hub-pane-title"><strong>Models on this device</strong><span>{models.length}</span></div>
     {models.length ? <div className="hub-device-grid">{models.map((model) => <article key={model.id} className="hub-device-card">
       <button className="hub-device-select" onClick={() => onSelect(model)} disabled={!model.sourceRepo}>
         <span className="hub-device-icon">◫</span><span><strong>{model.name}</strong><small>{model.sourceRepo ?? "Local GGUF"}</small><em>{model.quantization ?? "GGUF"} · {formatBytes(model.sizeBytes)}</em></span><b className={model.loaded ? "loaded" : ""}>{model.loaded ? "Loaded" : "On Device"}</b>
       </button>
-      <ModelAction model={model} busy={busy === model.id} onLoad={onLoad} onEject={onEject} onRemove={onRemove} compact />
+      <ModelAction model={model} busy={busy === model.id} onLoad={onLoad} onEject={onEject} onRemove={onRemove} onSettings={onSettings} compact />
     </article>)}</div> : <Empty title="No models on device" body="Download a GGUF model or place one in the llama.cpp models directory." />}
   </section>;
 }
 
-function ModelAction({ model, busy, onLoad, onEject, onRemove, compact = false }: { model: LocalModel; busy: boolean; onLoad: (model: LocalModel) => Promise<void>; onEject: (model: LocalModel) => Promise<void>; onRemove: (model: LocalModel) => Promise<void>; compact?: boolean }) {
+function ModelAction({ model, busy, onLoad, onEject, onRemove, onSettings, compact = false }: { model: LocalModel; busy: boolean; onLoad: (model: LocalModel) => Promise<void>; onEject: (model: LocalModel) => Promise<void>; onRemove: (model: LocalModel) => Promise<void>; onSettings?: (model: LocalModel) => void; compact?: boolean }) {
   const removable = !!model.sourceRepo && !!model.revision && !!model.variantId;
   return <div className={`hub-model-actions ${compact ? "compact" : ""}`}>
     {model.loaded ? <button className="hub-eject-button" disabled={busy} onClick={() => void onEject(model)}>{busy ? "Ejecting…" : "Eject"}</button> : <button className="hub-load-button" disabled={busy} onClick={() => void onLoad(model)}>{busy ? "Loading…" : "Load"}</button>}
+    {onSettings && <button className="hub-settings-button" disabled={busy} title="Model load settings" aria-label={`Load settings for ${model.name}`} onClick={() => onSettings(model)}>⚙ Settings</button>}
     {removable && <button className="hub-remove-button" disabled={busy || model.loaded} title={model.loaded ? "Eject this model before removing it" : "Remove downloaded model files"} onClick={() => void onRemove(model)}>{busy ? "Removing…" : "Remove"}</button>}
     <small>{model.loaded ? "Releases model memory; files stay on disk." : "Loads this model into memory."}</small>
+  </div>;
+}
+
+export const recommendedModelLoadSettings = (): ModelLoadSettings => ({
+  contextSize: null,
+  kvCacheType: "auto",
+  gpuOffload: "auto",
+  flashAttention: "auto",
+  cpuThreads: null,
+});
+
+export function isRecommendedModelLoadSettings(settings: ModelLoadSettings) {
+  return settings.contextSize == null && settings.kvCacheType === "auto" &&
+    settings.gpuOffload === "auto" && settings.flashAttention === "auto" &&
+    settings.cpuThreads == null;
+}
+
+export function modelLoadSettingsError(settings: ModelLoadSettings): string | null {
+  if (settings.contextSize != null && (!Number.isInteger(settings.contextSize) || settings.contextSize < 512 || settings.contextSize > 1_048_576)) {
+    return "Context size must be a whole number between 512 and 1,048,576 tokens.";
+  }
+  if (settings.cpuThreads != null && (!Number.isInteger(settings.cpuThreads) || settings.cpuThreads < 1 || settings.cpuThreads > 512)) {
+    return "CPU threads must be a whole number between 1 and 512.";
+  }
+  return null;
+}
+
+function ModelLoadSettingsDialog({ model, onClose, onChanged }: { model: LocalModel; onClose: () => void; onChanged: () => void }) {
+  const [settings, setSettings] = useState<ModelLoadSettings>(recommendedModelLoadSettings);
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+
+  useEffect(() => {
+    let disposed = false;
+    setLoading(true);
+    void getModelLoadSettings(model.id)
+      .then((value) => { if (!disposed) setSettings(value); })
+      .catch((cause) => { if (!disposed) setError(readError(cause)); })
+      .finally(() => { if (!disposed) setLoading(false); });
+    return () => { disposed = true; };
+  }, [model.id]);
+
+  const patch = <K extends keyof ModelLoadSettings>(key: K, value: ModelLoadSettings[K]) => {
+    setSettings((current) => ({ ...current, [key]: value }));
+    setNotice(null);
+    setError(null);
+  };
+  const save = async (loadNow: boolean) => {
+    const validationError = modelLoadSettingsError(settings);
+    if (validationError) { setError(validationError); return; }
+    setSaving(true); setError(null); setNotice(null);
+    try {
+      await saveModelLoadSettings(model.id, settings, loadNow);
+      await onChanged();
+      if (loadNow) onClose();
+      else setNotice(model.loaded ? "Saved. Reload the model to apply these settings." : "Settings saved for the next load.");
+    } catch (cause) { setError(readError(cause));
+    } finally { setSaving(false); }
+  };
+
+  return <div className="hub-settings-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !saving) onClose(); }}>
+    <section className="hub-settings-dialog" role="dialog" aria-modal="true" aria-labelledby="model-load-settings-title">
+      <header><div><span className={`hub-settings-state ${isRecommendedModelLoadSettings(settings) ? "recommended" : "custom"}`}>{isRecommendedModelLoadSettings(settings) ? "Recommended" : "Custom"}</span><h3 id="model-load-settings-title">Model load settings</h3><p>{model.name}</p></div><button aria-label="Close" disabled={saving} onClick={onClose}>×</button></header>
+      {loading ? <div className="hub-settings-loading">Loading settings…</div> : <div className="hub-settings-fields">
+        <label><span>Context window <small>Memory grows with context length.</small></span><input type="number" min={512} max={1048576} step={512} placeholder="Recommended (auto-fit)" value={settings.contextSize ?? ""} onChange={(e) => patch("contextSize", e.target.value ? Number(e.target.value) : null)} /></label>
+        <label><span>KV cache type <small>Lower precision saves memory but may reduce compatibility.</small></span><select value={settings.kvCacheType} onChange={(e) => patch("kvCacheType", e.target.value as ModelLoadSettings["kvCacheType"])}><option value="auto">Recommended (llama.cpp default)</option><option value="f16">f16 · highest compatibility</option><option value="q8_0">q8_0 · lower memory</option><option value="q4_0">q4_0 · lowest memory</option></select></label>
+        <label><span>GPU offload <small>Auto-fit leaves memory headroom for the KV cache.</small></span><select value={settings.gpuOffload} onChange={(e) => patch("gpuOffload", e.target.value as ModelLoadSettings["gpuOffload"])}><option value="auto">Recommended (auto-fit)</option><option value="all">All model layers</option><option value="cpu_only">CPU only</option></select></label>
+        <label><span>Flash Attention <small>Automatic mode uses it only when supported.</small></span><select value={settings.flashAttention} onChange={(e) => patch("flashAttention", e.target.value as ModelLoadSettings["flashAttention"])}><option value="auto">Recommended (automatic)</option><option value="on">On</option><option value="off">Off</option></select></label>
+        <label><span>CPU threads <small>Automatic mode lets llama.cpp choose.</small></span><input type="number" min={1} max={512} step={1} placeholder="Recommended (automatic)" value={settings.cpuThreads ?? ""} onChange={(e) => patch("cpuThreads", e.target.value ? Number(e.target.value) : null)} /></label>
+      </div>}
+      {error && <p className="hub-settings-error">{error}</p>}{notice && <p className="hub-settings-notice">{notice}</p>}
+      <footer><button className="hub-settings-reset" disabled={loading || saving || isRecommendedModelLoadSettings(settings)} onClick={() => { setSettings(recommendedModelLoadSettings()); setNotice(null); setError(null); }}>Reset to recommended</button><span /><button disabled={saving} onClick={onClose}>Cancel</button><button disabled={loading || saving} onClick={() => void save(false)}>{saving ? "Saving…" : "Save"}</button><button className="primary" disabled={loading || saving} onClick={() => void save(true)}>{saving ? "Applying…" : "Save & Load"}</button></footer>
+    </section>
   </div>;
 }
 

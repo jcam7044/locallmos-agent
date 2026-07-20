@@ -30,7 +30,7 @@ use std::time::Duration;
 
 use config::AgentConfig;
 use monitor::Monitor;
-use runtime::Runtime;
+use runtime::{ModelLoadSettings, Runtime};
 use serde_json::{json, Value};
 use settings::Settings;
 use status::AgentStatus;
@@ -57,6 +57,36 @@ pub struct AppState {
     /// Shared HTTP client, reused for the web_fetch tool (direct GET from the rig).
     pub http: reqwest::Client,
     pub hub: Arc<hub::HubState>,
+}
+
+impl AppState {
+    pub(crate) async fn model_settings(
+        &self,
+        model: &str,
+    ) -> anyhow::Result<(String, ModelLoadSettings)> {
+        let key = self.runtime.canonical_model_id(model)?;
+        let settings = self
+            .config
+            .lock()
+            .await
+            .model_load_settings
+            .get(&key)
+            .cloned()
+            .unwrap_or_default();
+        Ok((key, settings))
+    }
+
+    pub(crate) async fn load_model_configured(
+        &self,
+        model: &str,
+        force_reload: bool,
+    ) -> anyhow::Result<()> {
+        let (_, settings) = self.model_settings(model).await?;
+        if force_reload && self.runtime.is_model_loaded(model).await {
+            self.runtime.unload_model(model).await?;
+        }
+        self.runtime.load_model_configured(model, &settings).await
+    }
 }
 
 fn build_state() -> Arc<AppState> {
@@ -136,6 +166,7 @@ async fn enroll(
 #[tauri::command]
 async fn local_status(state: State<'_, Arc<AppState>>) -> Result<Value, String> {
     let snap = state.runtime.snapshot().await;
+    let context_size = state.runtime.context_size().await;
     let telemetry = {
         let mut mon = state.monitor.lock().await;
         mon.sample().await
@@ -150,7 +181,7 @@ async fn local_status(state: State<'_, Arc<AppState>>) -> Result<Value, String> 
             "state": snap.state,
             "endpoint": snap.endpoint,
             "modelsDir": state.runtime.models_dir().or_else(|| Some(llama_models_dir.clone())),
-            "contextSize": state.runtime.context_size(),
+            "contextSize": context_size,
         },
         "configuredRuntime": configured_runtime,
         "models": snap.models.iter().map(|m| json!({
@@ -259,7 +290,7 @@ async fn hub_cancel_download(
 /// Load/keep a model resident in the runtime.
 #[tauri::command]
 async fn load_model(state: State<'_, Arc<AppState>>, model: String) -> Result<(), String> {
-    state.runtime.load_model(&model).await.map_err(|e| e.to_string())?;
+    state.load_model_configured(&model, false).await.map_err(|e| e.to_string())?;
     let mut config = state.config.lock().await;
     if config.locally_ejected_model.is_some() {
         config.locally_ejected_model = None;
@@ -284,8 +315,63 @@ async fn delete_local_model(state: State<'_, Arc<AppState>>, model_id: String) -
     if state.runtime.snapshot().await.models.iter().any(|model| model.id == model_id && model.loaded) {
         return Err("eject this model before removing its files".into());
     }
+    let key = state.runtime.canonical_model_id(&model_id).map_err(|error| error.to_string())?;
     runtime::llama_server::delete_hub_model(&runtime::llamacpp_models_dir(), &model_id)
+        .map_err(|error| error.to_string())?;
+    let mut config = state.config.lock().await;
+    if config.model_load_settings.remove(&key).is_some() {
+        config.save().map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn get_model_load_settings(
+    state: State<'_, Arc<AppState>>,
+    model_id: String,
+) -> Result<ModelLoadSettings, String> {
+    if state.runtime.kind() != "llamacpp" {
+        return Err("model load settings are only available for llama.cpp".into());
+    }
+    state
+        .model_settings(&model_id)
+        .await
+        .map(|(_, settings)| settings)
         .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn save_model_load_settings(
+    state: State<'_, Arc<AppState>>,
+    model_id: String,
+    settings: ModelLoadSettings,
+    load_now: bool,
+) -> Result<(), String> {
+    if state.runtime.kind() != "llamacpp" {
+        return Err("model load settings are only available for llama.cpp".into());
+    }
+    settings.validate().map_err(|error| error.to_string())?;
+    let key = state.runtime.canonical_model_id(&model_id).map_err(|error| error.to_string())?;
+    {
+        let mut config = state.config.lock().await;
+        if settings.is_recommended() {
+            config.model_load_settings.remove(&key);
+        } else {
+            config.model_load_settings.insert(key, settings);
+        }
+        config.save().map_err(|error| error.to_string())?;
+    }
+    if load_now {
+        state
+            .load_model_configured(&model_id, true)
+            .await
+            .map_err(|error| format!("settings were saved, but the model failed to load: {error}"))?;
+        let mut config = state.config.lock().await;
+        if config.locally_ejected_model.take().is_some() {
+            config.save().map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(())
 }
 
 /// Restart the local runtime service.
@@ -604,6 +690,8 @@ fn run_gui() {
             enroll,
             local_status,
             load_model,
+            get_model_load_settings,
+            save_model_load_settings,
             unload_model,
             delete_local_model,
             restart_runtime,

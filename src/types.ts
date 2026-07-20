@@ -35,7 +35,7 @@ export type LocalStatus = {
     state: string;
     endpoint: string | null;
     modelsDir: string | null;
-    contextSize: number;
+    contextSize: number | null;
   };
   modelsStorage: {
     dir: string;
@@ -98,6 +98,14 @@ export type DownloadState = {
   downloadedBytes: number;
   totalBytes: number;
   error: string | null;
+};
+
+export type ModelLoadSettings = {
+  contextSize: number | null;
+  kvCacheType: "auto" | "f16" | "q8_0" | "q4_0";
+  gpuOffload: "auto" | "all" | "cpu_only";
+  flashAttention: "auto" | "on" | "off";
+  cpuThreads: number | null;
 };
 
 // --- Persistent chat sessions (mirror src-tauri/src/chat_store.rs) ---------

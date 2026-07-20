@@ -103,6 +103,7 @@ pub async fn process(state: &Arc<AppState>, pending: ChatPending) -> Result<()> 
             return Err(anyhow!(msg));
         }
     };
+    let (_, load_settings) = state.model_settings(&model).await?;
 
     // Build the Ollama chat history from prior completed messages, folding in
     // attachments: images become per-message base64 `images`; documents have
@@ -351,6 +352,7 @@ pub async fn process(state: &Arc<AppState>, pending: ChatPending) -> Result<()> 
                     pending.think,
                     tools_value.as_ref(),
                     None,
+                    &load_settings,
                     cancel.clone(),
                     move |delta| {
                         if !first_token.swap(true, Ordering::Relaxed) {

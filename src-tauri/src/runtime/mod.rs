@@ -9,13 +9,76 @@ pub mod ollama;
 pub mod tool_protocol;
 pub mod tools;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use llama_server::LlamaServerAdapter;
 use ollama::OllamaAdapter;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelLoadSettings {
+    #[serde(default)]
+    pub context_size: Option<u32>,
+    #[serde(default)]
+    pub kv_cache_type: KvCacheType,
+    #[serde(default)]
+    pub gpu_offload: GpuOffload,
+    #[serde(default)]
+    pub flash_attention: FlashAttention,
+    #[serde(default)]
+    pub cpu_threads: Option<u16>,
+}
+
+impl ModelLoadSettings {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if let Some(size) = self.context_size {
+            if !(512..=1_048_576).contains(&size) {
+                anyhow::bail!("context size must be between 512 and 1,048,576 tokens");
+            }
+        }
+        if let Some(threads) = self.cpu_threads {
+            if !(1..=512).contains(&threads) {
+                anyhow::bail!("CPU threads must be between 1 and 512");
+            }
+        }
+        Ok(())
+    }
+
+    pub fn is_recommended(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KvCacheType {
+    #[default]
+    Auto,
+    F16,
+    Q8_0,
+    Q4_0,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GpuOffload {
+    #[default]
+    Auto,
+    All,
+    CpuOnly,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FlashAttention {
+    #[default]
+    Auto,
+    On,
+    Off,
+}
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -149,6 +212,24 @@ impl Runtime {
         }
     }
 
+    pub async fn load_model_configured(
+        &self,
+        model: &str,
+        settings: &ModelLoadSettings,
+    ) -> anyhow::Result<()> {
+        match self {
+            Runtime::Ollama(a) => a.load_model(model).await,
+            Runtime::LlamaCpp(a) => a.load_model_configured(model, settings).await,
+        }
+    }
+
+    pub fn canonical_model_id(&self, model: &str) -> anyhow::Result<String> {
+        match self {
+            Runtime::Ollama(_) => Ok(model.to_string()),
+            Runtime::LlamaCpp(a) => a.canonical_model_id(model),
+        }
+    }
+
     pub async fn unload_model(&self, model: &str) -> anyhow::Result<()> {
         match self {
             Runtime::Ollama(a) => a.unload_model(model).await,
@@ -207,10 +288,10 @@ impl Runtime {
         }
     }
 
-    pub fn context_size(&self) -> u64 {
+    pub async fn context_size(&self) -> Option<u64> {
         match self {
-            Runtime::Ollama(_) => 8192,
-            Runtime::LlamaCpp(a) => a.context_size(),
+            Runtime::Ollama(_) => Some(8192),
+            Runtime::LlamaCpp(a) => a.effective_context_size().await,
         }
     }
 
@@ -224,6 +305,7 @@ impl Runtime {
         think: bool,
         tools: Option<&Value>,
         options: Option<&Value>,
+        load_settings: &ModelLoadSettings,
         cancel: Arc<AtomicBool>,
         on_delta: F,
     ) -> anyhow::Result<ChatOutput> {
@@ -233,7 +315,7 @@ impl Runtime {
                     .await
             }
             Runtime::LlamaCpp(a) => {
-                a.chat_stream(model, messages, think, tools, options, cancel, on_delta)
+                a.chat_stream(model, messages, think, tools, options, load_settings, cancel, on_delta)
                     .await
             }
         }
@@ -246,4 +328,26 @@ pub fn llamacpp_models_dir() -> String {
         .ok()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(llama_server::default_models_dir)
+}
+
+#[cfg(test)]
+mod model_settings_tests {
+    use super::*;
+
+    #[test]
+    fn validates_model_load_setting_bounds() {
+        assert!(ModelLoadSettings::default().validate().is_ok());
+        assert!(ModelLoadSettings {
+            context_size: Some(511),
+            ..Default::default()
+        }
+        .validate()
+        .is_err());
+        assert!(ModelLoadSettings {
+            cpu_threads: Some(513),
+            ..Default::default()
+        }
+        .validate()
+        .is_err());
+    }
 }

@@ -92,6 +92,7 @@ export function App() {
           models={local?.models ?? []}
           running={running}
           enrolled={status?.enrolled ?? false}
+          runtimeKind={local?.runtime.kind ?? "ollama"}
         />
       ) : (
         <ModelsView local={local} onChanged={refresh} />

@@ -33,10 +33,12 @@ export function ChatView({
   models,
   running,
   enrolled,
+  runtimeKind,
 }: {
   models: LocalModel[];
   running: boolean;
   enrolled: boolean;
+  runtimeKind: string;
 }) {
   const [sessions, setSessions] = useState<SessionMeta[]>([]);
   const [active, setActive] = useState<ChatSession | null>(null);
@@ -298,7 +300,7 @@ export function ChatView({
         </div>
 
         {settingsOpen && active && (
-          <SessionSettingsPanel settings={active.settings} onChange={patchSettings} />
+          <SessionSettingsPanel settings={active.settings} onChange={patchSettings} showContext={runtimeKind !== "llamacpp"} />
         )}
 
         <Conversation

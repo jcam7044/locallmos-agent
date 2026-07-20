@@ -10,12 +10,20 @@ import type {
   DownloadState,
   HubModelDetail,
   HubModelPage,
+  ModelLoadSettings,
 } from "./types";
 
 export const getLocalStatus = () => invoke<LocalStatus>("local_status");
 export const getAgentStatus = () => invoke<AgentStatus>("get_status");
 export const loadModel = (model: string) => invoke("load_model", { model });
 export const unloadModel = (model: string) => invoke("unload_model", { model });
+export const getModelLoadSettings = (modelId: string) =>
+  invoke<ModelLoadSettings>("get_model_load_settings", { modelId });
+export const saveModelLoadSettings = (
+  modelId: string,
+  settings: ModelLoadSettings,
+  loadNow: boolean,
+) => invoke("save_model_load_settings", { modelId, settings, loadNow });
 export const deleteLocalModel = (modelId: string) => invoke("delete_local_model", { modelId });
 export const restartRuntime = () => invoke("restart_runtime");
 export const setRuntime = (kind: string) => invoke("set_runtime", { kind });

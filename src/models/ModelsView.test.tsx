@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { renderToStaticMarkup } from "react-dom/server";
 import type { HubModelDetail } from "../types";
-import { isVariantOnDevice, ModelCardReadme, modelLogo, variantsBySizeAscending } from "./ModelsView";
+import { isRecommendedModelLoadSettings, isVariantOnDevice, ModelCardReadme, modelLoadSettingsError, modelLogo, recommendedModelLoadSettings, variantsBySizeAscending } from "./ModelsView";
 
 function detail(readmeMarkdown: string): HubModelDetail {
   return {
@@ -66,5 +66,21 @@ describe("variantsBySizeAscending", () => {
       { id: "q5", quantization: "Q5_K_M", sizeBytes: 6_200, files: [], companions: [], memory: {} },
     ] as never[];
     expect(variantsBySizeAscending(variants).map((variant) => variant.id)).toEqual(["q3", "q5", "q8"]);
+  });
+});
+
+describe("model load settings", () => {
+  it("recognizes the reset state and custom overrides", () => {
+    const recommended = recommendedModelLoadSettings();
+    expect(isRecommendedModelLoadSettings(recommended)).toBe(true);
+    expect(isRecommendedModelLoadSettings({ ...recommended, kvCacheType: "q8_0" })).toBe(false);
+    expect(isRecommendedModelLoadSettings({ ...recommended, contextSize: 32768 })).toBe(false);
+  });
+
+  it("validates custom numeric bounds", () => {
+    const recommended = recommendedModelLoadSettings();
+    expect(modelLoadSettingsError({ ...recommended, contextSize: 511 })).toContain("Context size");
+    expect(modelLoadSettingsError({ ...recommended, cpuThreads: 513 })).toContain("CPU threads");
+    expect(modelLoadSettingsError({ ...recommended, contextSize: 32768, cpuThreads: 12 })).toBeNull();
   });
 });

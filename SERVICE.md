@@ -77,6 +77,12 @@ and writes the `LOCALLMOS_RUNTIME=llamacpp` + `LOCALLMOS_LLAMACPP_*` vars into
 dashboard. Pin a specific engine build with `--llamacpp-version bNNNNN` (default:
 a known-good pinned release; `latest` resolves the newest).
 
+Model launch settings are configured per GGUF in the tray app's **Models** tab.
+Leaving them on **Recommended** lets llama.cpp auto-fit context and GPU offload
+to the available hardware. The installer no longer forces a global GPU-layer
+count; advanced unrelated flags can still be supplied with
+`LOCALLMOS_LLAMACPP_ARGS`.
+
 Manual equivalent:
 
 ```bash

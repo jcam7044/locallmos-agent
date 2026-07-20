@@ -48,6 +48,25 @@ export function MessageView({
         </div>
       )}
       {!user && <ToolActivity activity={message.toolActivity} />}
+      {!user && message.toolLimitReached != null && (
+        <div
+          role="status"
+          style={{
+            maxWidth: "85%",
+            margin: "0 0 6px",
+            padding: "7px 9px",
+            border: "1px solid #854d0e",
+            borderRadius: 8,
+            background: "#22180a",
+            color: "#fcd34d",
+            fontSize: 11,
+            lineHeight: 1.4,
+            textAlign: "left",
+          }}
+        >
+          ⚠ Maximum tool count reached ({message.toolLimitReached}). The response uses the completed tool results.
+        </div>
+      )}
       {!user && message.thinking && (
         <ThinkingBlock
           thinking={message.thinking}

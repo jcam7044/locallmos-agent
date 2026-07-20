@@ -17,6 +17,11 @@ use std::sync::Arc;
 use llama_server::LlamaServerAdapter;
 use ollama::OllamaAdapter;
 
+/// Recommended per-message ceiling for executed tool calls. The chat engine
+/// reserves one additional, tool-disabled request to synthesize the answer.
+pub const DEFAULT_MAX_TOOL_CALLS: u16 = 25;
+pub const MAX_TOOL_CALLS: u16 = 100;
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelLoadSettings {
@@ -32,6 +37,9 @@ pub struct ModelLoadSettings {
     pub cpu_threads: Option<u16>,
     #[serde(default)]
     pub speculative_decoding: SpeculativeDecoding,
+    /// `None` uses the recommended 25-call tool budget.
+    #[serde(default)]
+    pub max_tool_calls: Option<u16>,
 }
 
 impl ModelLoadSettings {
@@ -46,11 +54,20 @@ impl ModelLoadSettings {
                 anyhow::bail!("CPU threads must be between 1 and 512");
             }
         }
+        if let Some(limit) = self.max_tool_calls {
+            if !(1..=MAX_TOOL_CALLS).contains(&limit) {
+                anyhow::bail!("max tool calls must be between 1 and {MAX_TOOL_CALLS}");
+            }
+        }
         Ok(())
     }
 
     pub fn is_recommended(&self) -> bool {
         self == &Self::default()
+    }
+
+    pub fn tool_call_limit(&self) -> usize {
+        self.max_tool_calls.unwrap_or(DEFAULT_MAX_TOOL_CALLS) as usize
     }
 }
 
@@ -365,8 +382,15 @@ mod model_settings_tests {
     #[test]
     fn validates_model_load_setting_bounds() {
         assert!(ModelLoadSettings::default().validate().is_ok());
+        assert_eq!(ModelLoadSettings::default().tool_call_limit(), 25);
         assert!(ModelLoadSettings {
             context_size: Some(511),
+            ..Default::default()
+        }
+        .validate()
+        .is_err());
+        assert!(ModelLoadSettings {
+            max_tool_calls: Some(101),
             ..Default::default()
         }
         .validate()

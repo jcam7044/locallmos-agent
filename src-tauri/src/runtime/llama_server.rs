@@ -1475,6 +1475,7 @@ mod tests {
             flash_attention: FlashAttention::On,
             cpu_threads: Some(12),
             speculative_decoding: SpeculativeDecoding::Off,
+            max_tool_calls: None,
         };
         assert_eq!(managed_args(&settings, true), vec![
             "--ctx-size", "32768", "--cache-type-k", "q8_0", "--cache-type-v",

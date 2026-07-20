@@ -395,12 +395,13 @@ export const recommendedModelLoadSettings = (): ModelLoadSettings => ({
   flashAttention: "auto",
   cpuThreads: null,
   speculativeDecoding: "auto",
+  maxToolCalls: null,
 });
 
 export function isRecommendedModelLoadSettings(settings: ModelLoadSettings) {
   return settings.contextSize == null && settings.kvCacheType === "auto" &&
     settings.gpuOffload === "auto" && settings.flashAttention === "auto" &&
-    settings.cpuThreads == null && settings.speculativeDecoding === "auto";
+    settings.cpuThreads == null && settings.speculativeDecoding === "auto" && settings.maxToolCalls == null;
 }
 
 export function modelLoadSettingsError(settings: ModelLoadSettings): string | null {
@@ -409,6 +410,9 @@ export function modelLoadSettingsError(settings: ModelLoadSettings): string | nu
   }
   if (settings.cpuThreads != null && (!Number.isInteger(settings.cpuThreads) || settings.cpuThreads < 1 || settings.cpuThreads > 512)) {
     return "CPU threads must be a whole number between 1 and 512.";
+  }
+  if (settings.maxToolCalls != null && (!Number.isInteger(settings.maxToolCalls) || settings.maxToolCalls < 1 || settings.maxToolCalls > 100)) {
+    return "Max tool calls must be a whole number between 1 and 100.";
   }
   return null;
 }
@@ -447,7 +451,7 @@ function ModelLoadSettingsDialog({ model, onClose, onChanged }: { model: LocalMo
       await saveModelLoadSettings(model.id, settings, loadNow);
       await onChanged();
       if (loadNow) onClose();
-      else setNotice(model.loaded ? "Saved. Reload the model to apply these settings." : "Settings saved for the next load.");
+      else setNotice(model.loaded ? "Saved. Tool-call limits apply to the next message; reload to apply load settings." : "Settings saved for the next load.");
     } catch (cause) { setError(readError(cause));
     } finally { setSaving(false); }
   };
@@ -461,6 +465,7 @@ function ModelLoadSettingsDialog({ model, onClose, onChanged }: { model: LocalMo
         <label><span>GPU offload <small>Auto-fit leaves memory headroom for the KV cache.</small></span><select value={settings.gpuOffload} onChange={(e) => patch("gpuOffload", e.target.value as ModelLoadSettings["gpuOffload"])}><option value="auto">Recommended (auto-fit)</option><option value="all">All model layers</option><option value="cpu_only">CPU only</option></select></label>
         <label><span>Flash Attention <small>Automatic mode uses it only when supported.</small></span><select value={settings.flashAttention} onChange={(e) => patch("flashAttention", e.target.value as ModelLoadSettings["flashAttention"])}><option value="auto">Recommended (automatic)</option><option value="on">On</option><option value="off">Off</option></select></label>
         <label><span>Speculative decoding <small>{supportsMtp ? "Embedded MTP heads detected; Recommended enables them with a safe two-token draft." : "No embedded MTP prediction layers were detected in this GGUF."}</small></span><select value={settings.speculativeDecoding} onChange={(e) => patch("speculativeDecoding", e.target.value as ModelLoadSettings["speculativeDecoding"])}><option value="auto">Recommended ({supportsMtp ? "embedded MTP" : "off"})</option><option value="off">Off</option><option value="mtp" disabled={!supportsMtp}>Embedded MTP</option></select></label>
+        <label><span>Max tool calls per message <small>Stops runaway tool loops. Recommended allows 25 calls, then reserves a final answer pass.</small></span><input type="number" min={1} max={100} step={1} placeholder="Recommended (25)" value={settings.maxToolCalls ?? ""} onChange={(e) => patch("maxToolCalls", e.target.value ? Number(e.target.value) : null)} /></label>
         <label><span>CPU threads <small>Automatic mode lets llama.cpp choose.</small></span><input type="number" min={1} max={512} step={1} placeholder="Recommended (automatic)" value={settings.cpuThreads ?? ""} onChange={(e) => patch("cpuThreads", e.target.value ? Number(e.target.value) : null)} /></label>
       </div>}
       {error && <p className="hub-settings-error">{error}</p>}{notice && <p className="hub-settings-notice">{notice}</p>}

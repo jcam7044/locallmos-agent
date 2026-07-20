@@ -47,6 +47,9 @@ pub struct StoredMessage {
     pub completion_tokens: Option<u32>,
     #[serde(default)]
     pub generation_metrics: Option<GenerationMetrics>,
+    /// The per-message tool budget was exhausted before the final answer pass.
+    #[serde(default)]
+    pub tool_limit_reached: Option<u16>,
     pub tool_activity: Option<Value>,
     #[serde(default)]
     pub cancelled: bool,
@@ -63,6 +66,7 @@ impl StoredMessage {
             prompt_tokens: None,
             completion_tokens: None,
             generation_metrics: None,
+            tool_limit_reached: None,
             tool_activity: None,
             cancelled: false,
             created_at: Utc::now(),

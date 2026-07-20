@@ -76,12 +76,14 @@ describe("model load settings", () => {
     expect(isRecommendedModelLoadSettings({ ...recommended, kvCacheType: "q8_0" })).toBe(false);
     expect(isRecommendedModelLoadSettings({ ...recommended, contextSize: 32768 })).toBe(false);
     expect(isRecommendedModelLoadSettings({ ...recommended, speculativeDecoding: "off" })).toBe(false);
+    expect(isRecommendedModelLoadSettings({ ...recommended, maxToolCalls: 25 })).toBe(false);
   });
 
   it("validates custom numeric bounds", () => {
     const recommended = recommendedModelLoadSettings();
     expect(modelLoadSettingsError({ ...recommended, contextSize: 511 })).toContain("Context size");
     expect(modelLoadSettingsError({ ...recommended, cpuThreads: 513 })).toContain("CPU threads");
+    expect(modelLoadSettingsError({ ...recommended, maxToolCalls: 101 })).toContain("Max tool calls");
     expect(modelLoadSettingsError({ ...recommended, contextSize: 32768, cpuThreads: 12 })).toBeNull();
   });
 });

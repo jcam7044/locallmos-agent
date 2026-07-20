@@ -107,6 +107,8 @@ export type ModelLoadSettings = {
   flashAttention: "auto" | "on" | "off";
   cpuThreads: number | null;
   speculativeDecoding: "auto" | "off" | "mtp";
+  /** Empty uses the recommended 25-call limit. */
+  maxToolCalls: number | null;
 };
 
 // --- Persistent chat sessions (mirror src-tauri/src/chat_store.rs) ---------
@@ -148,6 +150,7 @@ export type StoredMessage = {
   promptTokens: number | null;
   completionTokens: number | null;
   generationMetrics: GenerationMetrics | null;
+  toolLimitReached: number | null;
   toolActivity: unknown;
   cancelled: boolean;
   createdAt: string;
@@ -189,6 +192,7 @@ export function newUserMessage(content: string, attachments: Attachment[] = []):
     promptTokens: null,
     completionTokens: null,
     generationMetrics: null,
+    toolLimitReached: null,
     toolActivity: null,
     cancelled: false,
     createdAt: new Date().toISOString(),

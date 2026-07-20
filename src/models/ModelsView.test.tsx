@@ -75,6 +75,7 @@ describe("model load settings", () => {
     expect(isRecommendedModelLoadSettings(recommended)).toBe(true);
     expect(isRecommendedModelLoadSettings({ ...recommended, kvCacheType: "q8_0" })).toBe(false);
     expect(isRecommendedModelLoadSettings({ ...recommended, contextSize: 32768 })).toBe(false);
+    expect(isRecommendedModelLoadSettings({ ...recommended, speculativeDecoding: "off" })).toBe(false);
   });
 
   it("validates custom numeric bounds", () => {

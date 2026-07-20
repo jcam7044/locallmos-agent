@@ -13,19 +13,20 @@
 
 use super::{
     ChatDelta, ChatOutput, FlashAttention, GpuOffload, KvCacheType, ModelInfo,
-    ModelLoadSettings, RuntimeAdapter, RuntimeSnapshot, ToolCall,
+    ModelLoadSettings, RuntimeAdapter, RuntimeSnapshot, SpeculativeDecoding, ToolCall,
 };
 use anyhow::{anyhow, Result};
 use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsStr;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, Signal, System, UpdateKind};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
@@ -82,6 +83,8 @@ pub struct LlamaServerAdapter {
     /// Cached auto device selection: `None` = not yet probed; `Some(None)` = probed,
     /// use all devices; `Some(Some(list))` = restrict to this `--device` list.
     device_cache: Mutex<Option<Option<String>>>,
+    /// GGUF capability cache keyed by path and invalidated when the file changes.
+    metadata_cache: Mutex<HashMap<PathBuf, (u64, Option<SystemTime>, bool)>>,
 }
 
 impl LlamaServerAdapter {
@@ -129,6 +132,7 @@ impl LlamaServerAdapter {
                 .unwrap_or(180),
             proc: Mutex::new(None),
             device_cache: Mutex::new(None),
+            metadata_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -268,6 +272,27 @@ impl LlamaServerAdapter {
             .replace('\\', "/"))
     }
 
+    async fn has_embedded_mtp(&self, path: &Path) -> bool {
+        let Ok(metadata) = std::fs::metadata(path) else { return false };
+        let fingerprint = (metadata.len(), metadata.modified().ok());
+        if let Some((size, modified, mtp)) = self.metadata_cache.lock().await.get(path) {
+            if (*size, *modified) == fingerprint {
+                return *mtp;
+            }
+        }
+        let owned = path.to_path_buf();
+        let mtp = tokio::task::spawn_blocking(move || gguf_has_embedded_mtp(&owned))
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or(false);
+        self.metadata_cache
+            .lock()
+            .await
+            .insert(path.to_path_buf(), (fingerprint.0, fingerprint.1, mtp));
+        mtp
+    }
+
     /// Ensure a llama-server child is running and serving `model`, (re)spawning
     /// if none is running or a different model was requested.
     async fn ensure_running(&self, model: &str, settings: &ModelLoadSettings) -> Result<()> {
@@ -277,6 +302,12 @@ impl LlamaServerAdapter {
         let gguf = self.resolve_gguf(model).ok_or_else(|| {
             anyhow!("no .gguf for model {model:?} in {:?}", self.models_dir)
         })?;
+        let embedded_mtp = self.has_embedded_mtp(&gguf).await;
+        if settings.speculative_decoding == SpeculativeDecoding::Mtp && !embedded_mtp {
+            return Err(anyhow!(
+                "this GGUF does not contain embedded MTP prediction layers"
+            ));
+        }
         // A compatible llama-server can outlive this agent (for example after
         // an app restart). Reuse it when it is already serving this exact GGUF
         // instead of trying to bind a second server to the same port.
@@ -311,7 +342,7 @@ impl LlamaServerAdapter {
             for a in filtered_extra_args(&self.extra_args, settings.gpu_offload) {
                 cmd.arg(a);
             }
-            for a in managed_args(settings) {
+            for a in managed_args(settings, embedded_mtp) {
                 cmd.arg(a);
             }
             if settings.gpu_offload != GpuOffload::CpuOnly {
@@ -367,11 +398,16 @@ impl LlamaServerAdapter {
         if self.thinking {
             caps.push("thinking".to_string());
         }
-        grouped_ggufs(&self.models_dir)
-            .into_iter()
-            .map(|m| {
-                let name = m.display_name;
-                ModelInfo {
+        let mut models = Vec::new();
+        let root = Path::new(&self.models_dir);
+        for m in grouped_ggufs(&self.models_dir) {
+            let mtp = self.has_embedded_mtp(&root.join(&m.id)).await;
+            let mut model_caps = caps.clone();
+            if mtp {
+                model_caps.push("mtp".into());
+            }
+            let name = m.display_name;
+            models.push(ModelInfo {
                     id: m.id.clone(),
                     size_bytes: Some(m.size_bytes),
                     quantization: quantization_from_name(&name),
@@ -380,15 +416,15 @@ impl LlamaServerAdapter {
                         || reported
                             .iter()
                             .any(|reported_id| model_ids_match(reported_id, &m.id, &name)),
-                    capabilities: caps.clone(),
+                    capabilities: model_caps,
                     name,
                     source_repo: m.source_repo,
                     revision: m.revision,
                     variant_id: m.variant_id,
                     files: m.files,
-                }
-            })
-            .collect()
+                });
+        }
+        models
     }
 
     /// Ask a running llama-server which model it is serving. This deliberately
@@ -615,7 +651,7 @@ impl LlamaServerAdapter {
     }
 }
 
-fn managed_args(settings: &ModelLoadSettings) -> Vec<String> {
+fn managed_args(settings: &ModelLoadSettings, embedded_mtp: bool) -> Vec<String> {
     let mut args = Vec::new();
     if let Some(context) = settings.context_size {
         args.extend(["--ctx-size".into(), context.to_string()]);
@@ -648,6 +684,18 @@ fn managed_args(settings: &ModelLoadSettings) -> Vec<String> {
     if let Some(threads) = settings.cpu_threads {
         args.extend(["--threads".into(), threads.to_string()]);
     }
+    let enable_mtp = settings.speculative_decoding == SpeculativeDecoding::Mtp
+        || (settings.speculative_decoding == SpeculativeDecoding::Auto && embedded_mtp);
+    if enable_mtp {
+        args.extend([
+            "--spec-type".into(),
+            "draft-mtp".into(),
+            "--spec-draft-n-max".into(),
+            "2".into(),
+            "--spec-draft-n-min".into(),
+            "0".into(),
+        ]);
+    }
     args
 }
 
@@ -655,7 +703,7 @@ fn filtered_extra_args(extra: &[String], gpu_offload: GpuOffload) -> Vec<String>
     const MANAGED: &[&str] = &[
         "-c", "--ctx-size", "-ngl", "--gpu-layers", "--n-gpu-layers", "-ctk",
         "--cache-type-k", "-ctv", "--cache-type-v", "-fa", "--flash-attn", "-t",
-        "--threads",
+        "--threads", "--spec-type", "--spec-draft-n-max", "--spec-draft-n-min",
     ];
     let mut out = Vec::new();
     let mut i = 0;
@@ -675,6 +723,125 @@ fn filtered_extra_args(extra: &[String], gpu_offload: GpuOffload) -> Vec<String>
         i += 1;
     }
     out
+}
+
+fn gguf_has_embedded_mtp(path: &Path) -> Result<bool> {
+    let mut file = std::io::BufReader::new(std::fs::File::open(path)?);
+    let mut magic = [0u8; 4];
+    file.read_exact(&mut magic)?;
+    if &magic != b"GGUF" {
+        return Err(anyhow!("not a GGUF file"));
+    }
+    let version = read_u32(&mut file)?;
+    if !(2..=3).contains(&version) {
+        return Err(anyhow!("unsupported GGUF version {version}"));
+    }
+    let _tensor_count = read_u64(&mut file)?;
+    let metadata_count = read_u64(&mut file)?;
+    if metadata_count > 1_000_000 {
+        return Err(anyhow!("invalid GGUF metadata count"));
+    }
+    for _ in 0..metadata_count {
+        let key = read_gguf_string(&mut file, 1_048_576)?;
+        let value_type = read_u32(&mut file)?;
+        let wanted = key.ends_with(".nextn_predict_layers");
+        let value = consume_gguf_value(&mut file, value_type, wanted)?;
+        if wanted && value.unwrap_or(0) > 0 {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn read_u32<R: Read>(reader: &mut R) -> Result<u32> {
+    let mut bytes = [0u8; 4];
+    reader.read_exact(&mut bytes)?;
+    Ok(u32::from_le_bytes(bytes))
+}
+
+fn read_u64<R: Read>(reader: &mut R) -> Result<u64> {
+    let mut bytes = [0u8; 8];
+    reader.read_exact(&mut bytes)?;
+    Ok(u64::from_le_bytes(bytes))
+}
+
+fn read_gguf_string<R: Read + Seek>(reader: &mut R, max_len: u64) -> Result<String> {
+    let len = read_u64(reader)?;
+    if len > max_len {
+        return Err(anyhow!("invalid GGUF string length"));
+    }
+    let mut bytes = vec![0u8; len as usize];
+    reader.read_exact(&mut bytes)?;
+    String::from_utf8(bytes).map_err(Into::into)
+}
+
+fn skip_bytes<R: Seek>(reader: &mut R, len: u64) -> Result<()> {
+    let offset = i64::try_from(len).map_err(|_| anyhow!("GGUF value is too large"))?;
+    reader.seek(SeekFrom::Current(offset))?;
+    Ok(())
+}
+
+/// Consume one GGUF metadata value. Numeric scalar values are returned only
+/// when `capture` is true; all other data is skipped without loading tensors.
+fn consume_gguf_value<R: Read + Seek>(
+    reader: &mut R,
+    value_type: u32,
+    capture: bool,
+) -> Result<Option<u64>> {
+    let fixed = match value_type {
+        0 | 1 | 7 => Some(1),
+        2 | 3 => Some(2),
+        4 | 5 | 6 => Some(4),
+        10 | 11 | 12 => Some(8),
+        _ => None,
+    };
+    if let Some(size) = fixed {
+        let mut bytes = [0u8; 8];
+        reader.read_exact(&mut bytes[..size])?;
+        if !capture {
+            return Ok(None);
+        }
+        return Ok(match value_type {
+            0 | 7 => Some(bytes[0] as u64),
+            1 => Some((bytes[0] as i8).max(0) as u64),
+            2 => Some(u16::from_le_bytes(bytes[..2].try_into().unwrap()) as u64),
+            3 => Some(i16::from_le_bytes(bytes[..2].try_into().unwrap()).max(0) as u64),
+            4 => Some(u32::from_le_bytes(bytes[..4].try_into().unwrap()) as u64),
+            5 => Some(i32::from_le_bytes(bytes[..4].try_into().unwrap()).max(0) as u64),
+            10 => Some(u64::from_le_bytes(bytes)),
+            11 => Some(i64::from_le_bytes(bytes).max(0) as u64),
+            _ => None,
+        });
+    }
+    match value_type {
+        8 => {
+            let len = read_u64(reader)?;
+            skip_bytes(reader, len)?;
+            Ok(None)
+        }
+        9 => {
+            let element_type = read_u32(reader)?;
+            let len = read_u64(reader)?;
+            if len > 100_000_000 {
+                return Err(anyhow!("invalid GGUF array length"));
+            }
+            if let Some(size) = match element_type {
+                0 | 1 | 7 => Some(1u64),
+                2 | 3 => Some(2),
+                4 | 5 | 6 => Some(4),
+                10 | 11 | 12 => Some(8),
+                _ => None,
+            } {
+                skip_bytes(reader, len.checked_mul(size).ok_or_else(|| anyhow!("GGUF array is too large"))?)?;
+            } else {
+                for _ in 0..len {
+                    consume_gguf_value(reader, element_type, false)?;
+                }
+            }
+            Ok(None)
+        }
+        other => Err(anyhow!("unsupported GGUF metadata type {other}")),
+    }
 }
 
 /// Stop a surviving llama-server only when its command line identifies the
@@ -1234,7 +1401,18 @@ mod tests {
 
     #[test]
     fn recommended_settings_leave_hardware_choices_to_llama_cpp() {
-        assert!(managed_args(&ModelLoadSettings::default()).is_empty());
+        assert!(managed_args(&ModelLoadSettings::default(), false).is_empty());
+        assert_eq!(
+            managed_args(&ModelLoadSettings::default(), true),
+            vec![
+                "--spec-type",
+                "draft-mtp",
+                "--spec-draft-n-max",
+                "2",
+                "--spec-draft-n-min",
+                "0"
+            ]
+        );
     }
 
     #[test]
@@ -1245,8 +1423,9 @@ mod tests {
             gpu_offload: GpuOffload::All,
             flash_attention: FlashAttention::On,
             cpu_threads: Some(12),
+            speculative_decoding: SpeculativeDecoding::Off,
         };
-        assert_eq!(managed_args(&settings), vec![
+        assert_eq!(managed_args(&settings, true), vec![
             "--ctx-size", "32768", "--cache-type-k", "q8_0", "--cache-type-v",
             "q8_0", "--n-gpu-layers", "all", "--flash-attn", "on", "--threads", "12",
         ]);
@@ -1254,8 +1433,16 @@ mod tests {
 
     #[test]
     fn managed_extra_arguments_are_removed_without_losing_unrelated_flags() {
-        let extra = ["--ctx-size", "8192", "--mlock", "--threads=8", "--no-mmap"]
-            .map(str::to_string);
+        let extra = [
+            "--ctx-size",
+            "8192",
+            "--mlock",
+            "--threads=8",
+            "--spec-type",
+            "ngram-mod",
+            "--no-mmap",
+        ]
+        .map(str::to_string);
         assert_eq!(
             filtered_extra_args(&extra, GpuOffload::Auto),
             vec!["--mlock", "--no-mmap"]
@@ -1269,9 +1456,36 @@ mod tests {
             managed_args(&ModelLoadSettings {
                 gpu_offload: GpuOffload::CpuOnly,
                 ..Default::default()
-            }),
+            }, false),
             vec!["--device", "none"]
         );
+    }
+
+    #[test]
+    fn detects_embedded_mtp_from_gguf_metadata() {
+        fn push_string(bytes: &mut Vec<u8>, value: &str) {
+            bytes.extend((value.len() as u64).to_le_bytes());
+            bytes.extend(value.as_bytes());
+        }
+        let mut bytes = Vec::new();
+        bytes.extend(b"GGUF");
+        bytes.extend(3u32.to_le_bytes());
+        bytes.extend(0u64.to_le_bytes());
+        bytes.extend(2u64.to_le_bytes());
+        push_string(&mut bytes, "general.architecture");
+        bytes.extend(8u32.to_le_bytes());
+        push_string(&mut bytes, "qwen35");
+        push_string(&mut bytes, "qwen35.nextn_predict_layers");
+        bytes.extend(4u32.to_le_bytes());
+        bytes.extend(1u32.to_le_bytes());
+
+        let path = std::env::temp_dir().join(format!(
+            "locallmos-mtp-metadata-{}.gguf",
+            std::process::id()
+        ));
+        fs::write(&path, bytes).unwrap();
+        assert!(gguf_has_embedded_mtp(&path).unwrap());
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

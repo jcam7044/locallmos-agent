@@ -106,6 +106,7 @@ export type ModelLoadSettings = {
   gpuOffload: "auto" | "all" | "cpu_only";
   flashAttention: "auto" | "on" | "off";
   cpuThreads: number | null;
+  speculativeDecoding: "auto" | "off" | "mtp";
 };
 
 // --- Persistent chat sessions (mirror src-tauri/src/chat_store.rs) ---------

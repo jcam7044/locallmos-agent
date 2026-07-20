@@ -392,12 +392,13 @@ export const recommendedModelLoadSettings = (): ModelLoadSettings => ({
   gpuOffload: "auto",
   flashAttention: "auto",
   cpuThreads: null,
+  speculativeDecoding: "auto",
 });
 
 export function isRecommendedModelLoadSettings(settings: ModelLoadSettings) {
   return settings.contextSize == null && settings.kvCacheType === "auto" &&
     settings.gpuOffload === "auto" && settings.flashAttention === "auto" &&
-    settings.cpuThreads == null;
+    settings.cpuThreads == null && settings.speculativeDecoding === "auto";
 }
 
 export function modelLoadSettingsError(settings: ModelLoadSettings): string | null {
@@ -416,6 +417,7 @@ function ModelLoadSettingsDialog({ model, onClose, onChanged }: { model: LocalMo
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const supportsMtp = model.capabilities.includes("mtp");
 
   useEffect(() => {
     let disposed = false;
@@ -435,6 +437,9 @@ function ModelLoadSettingsDialog({ model, onClose, onChanged }: { model: LocalMo
   const save = async (loadNow: boolean) => {
     const validationError = modelLoadSettingsError(settings);
     if (validationError) { setError(validationError); return; }
+    if (settings.speculativeDecoding === "mtp" && !supportsMtp) {
+      setError("This GGUF does not contain embedded MTP prediction layers."); return;
+    }
     setSaving(true); setError(null); setNotice(null);
     try {
       await saveModelLoadSettings(model.id, settings, loadNow);
@@ -453,6 +458,7 @@ function ModelLoadSettingsDialog({ model, onClose, onChanged }: { model: LocalMo
         <label><span>KV cache type <small>Lower precision saves memory but may reduce compatibility.</small></span><select value={settings.kvCacheType} onChange={(e) => patch("kvCacheType", e.target.value as ModelLoadSettings["kvCacheType"])}><option value="auto">Recommended (llama.cpp default)</option><option value="f16">f16 · highest compatibility</option><option value="q8_0">q8_0 · lower memory</option><option value="q4_0">q4_0 · lowest memory</option></select></label>
         <label><span>GPU offload <small>Auto-fit leaves memory headroom for the KV cache.</small></span><select value={settings.gpuOffload} onChange={(e) => patch("gpuOffload", e.target.value as ModelLoadSettings["gpuOffload"])}><option value="auto">Recommended (auto-fit)</option><option value="all">All model layers</option><option value="cpu_only">CPU only</option></select></label>
         <label><span>Flash Attention <small>Automatic mode uses it only when supported.</small></span><select value={settings.flashAttention} onChange={(e) => patch("flashAttention", e.target.value as ModelLoadSettings["flashAttention"])}><option value="auto">Recommended (automatic)</option><option value="on">On</option><option value="off">Off</option></select></label>
+        <label><span>Speculative decoding <small>{supportsMtp ? "Embedded MTP heads detected; Recommended enables them with a safe two-token draft." : "No embedded MTP prediction layers were detected in this GGUF."}</small></span><select value={settings.speculativeDecoding} onChange={(e) => patch("speculativeDecoding", e.target.value as ModelLoadSettings["speculativeDecoding"])}><option value="auto">Recommended ({supportsMtp ? "embedded MTP" : "off"})</option><option value="off">Off</option><option value="mtp" disabled={!supportsMtp}>Embedded MTP</option></select></label>
         <label><span>CPU threads <small>Automatic mode lets llama.cpp choose.</small></span><input type="number" min={1} max={512} step={1} placeholder="Recommended (automatic)" value={settings.cpuThreads ?? ""} onChange={(e) => patch("cpuThreads", e.target.value ? Number(e.target.value) : null)} /></label>
       </div>}
       {error && <p className="hub-settings-error">{error}</p>}{notice && <p className="hub-settings-notice">{notice}</p>}

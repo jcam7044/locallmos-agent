@@ -30,6 +30,8 @@ pub struct ModelLoadSettings {
     pub flash_attention: FlashAttention,
     #[serde(default)]
     pub cpu_threads: Option<u16>,
+    #[serde(default)]
+    pub speculative_decoding: SpeculativeDecoding,
 }
 
 impl ModelLoadSettings {
@@ -78,6 +80,15 @@ pub enum FlashAttention {
     Auto,
     On,
     Off,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpeculativeDecoding {
+    #[default]
+    Auto,
+    Off,
+    Mtp,
 }
 
 #[derive(Clone, Debug, Serialize)]

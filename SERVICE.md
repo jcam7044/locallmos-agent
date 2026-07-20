@@ -83,6 +83,10 @@ to the available hardware. The installer no longer forces a global GPU-layer
 count; advanced unrelated flags can still be supplied with
 `LOCALLMOS_LLAMACPP_ARGS`.
 
+GGUFs with embedded Multi-Token Prediction layers are detected from their model
+metadata. The per-model **Recommended** speculative-decoding setting enables
+llama.cpp `draft-mtp` for those models and leaves it off for other GGUFs.
+
 Manual equivalent:
 
 ```bash

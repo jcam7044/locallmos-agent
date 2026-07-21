@@ -129,6 +129,9 @@ pub struct RuntimeSnapshot {
     /// One of the `runtime_kind` enum values, e.g. "ollama", "llamacpp".
     pub kind: String,
     pub version: Option<String>,
+    /// The active acceleration backend for llama.cpp (cuda|rocm|vulkan|cpu|metal),
+    /// from the installer env/marker. `None` for Ollama (which owns its own build).
+    pub backend: Option<String>,
     /// One of the `runtime_state` enum values: running|stopped|unknown|error.
     pub state: String,
     pub endpoint: Option<String>,

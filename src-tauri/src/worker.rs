@@ -206,6 +206,7 @@ async fn telemetry_tick(state: &Arc<AppState>) -> Result<()> {
         s.connected = true;
         s.last_error = None;
         s.runtime_kind = Some(snap.kind.clone());
+        s.runtime_backend = snap.backend.clone();
         s.runtime_state = Some(snap.state.clone());
         s.loaded_model = snap.models.iter().find(|m| m.loaded).map(|m| m.name.clone());
         s.cpu_pct = telemetry.cpu_utilization_pct;

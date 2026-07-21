@@ -266,7 +266,9 @@ impl Supabase {
             .json(&json!({
                 "rig_id": rig_id,
                 "kind": snap.kind,
-                "version": snap.version,
+                // Surface the llama.cpp backend in the free-text version column
+                // when there's no version string (zero schema change).
+                "version": snap.version.clone().or_else(|| snap.backend.clone()),
                 "state": snap.state,
                 "endpoint": snap.endpoint,
             }))

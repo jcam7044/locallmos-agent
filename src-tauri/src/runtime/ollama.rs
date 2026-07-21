@@ -365,6 +365,7 @@ impl RuntimeAdapter for OllamaAdapter {
             return RuntimeSnapshot {
                 kind: "ollama".into(),
                 version: None,
+                backend: None,
                 state: "stopped".into(),
                 endpoint: Some(self.base.clone()),
                 models: vec![],
@@ -397,6 +398,7 @@ impl RuntimeAdapter for OllamaAdapter {
         RuntimeSnapshot {
             kind: "ollama".into(),
             version,
+            backend: None,
             state: "running".into(),
             endpoint: Some(self.base.clone()),
             models,

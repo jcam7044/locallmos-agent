@@ -11,6 +11,7 @@
 mod chat;
 mod chat_store;
 mod config;
+mod hardware;
 mod hub;
 mod local_chat;
 mod monitor;
@@ -117,6 +118,13 @@ fn build_state() -> Arc<AppState> {
         .or_else(|| cfg.runtime.clone())
         .unwrap_or_else(|| "ollama".into());
     let runtime = Runtime::from_kind(http.clone(), &runtime_kind);
+    // One-shot hardware sanity check: warn if the provisioned llama.cpp backend
+    // looks wrong for the GPU we can see (the Unsloth detect_hardware() analog).
+    if runtime_kind == "llamacpp" {
+        if let Some(backend) = runtime::llama_server::active_backend() {
+            hardware::warn_on_mismatch(&backend);
+        }
+    }
     let hub = Arc::new(hub::HubState::new(
         http.clone(),
         runtime::llamacpp_models_dir(),
@@ -178,6 +186,7 @@ async fn local_status(state: State<'_, Arc<AppState>>) -> Result<Value, String> 
         "runtime": {
             "kind": snap.kind,
             "version": snap.version,
+            "backend": snap.backend,
             "state": snap.state,
             "endpoint": snap.endpoint,
             "modelsDir": state.runtime.models_dir().or_else(|| Some(llama_models_dir.clone())),

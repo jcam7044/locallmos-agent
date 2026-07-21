@@ -73,6 +73,9 @@ pub struct LlamaServerAdapter {
     port: u16,
     bin: String,
     models_dir: String,
+    /// Active acceleration backend (cuda|rocm|vulkan|cpu|metal), from the installer
+    /// env/marker. Surfaced in the snapshot; `None` when it can't be determined.
+    backend: Option<String>,
     /// Extra `llama-server` args (whitespace-split from `LOCALLMOS_LLAMACPP_ARGS`).
     extra_args: Vec<String>,
     /// Whether this rig's model reasons; toggles Qwen-style `enable_thinking` and
@@ -107,21 +110,24 @@ impl LlamaServerAdapter {
             .split_whitespace()
             .map(str::to_string)
             .collect();
+        // Fall back to the installer's conventional paths when unset, so a
+        // GUI-switched rig (no env) still finds its provisioned engine/models.
+        let bin = std::env::var("LOCALLMOS_LLAMACPP_BIN")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(default_bin);
+        let backend = resolve_backend(&bin);
         Self {
             http,
             base: format!("http://{host}:{port}"),
             host,
             port,
-            // Fall back to the installer's conventional paths when unset, so a
-            // GUI-switched rig (no env) still finds its provisioned engine/models.
-            bin: std::env::var("LOCALLMOS_LLAMACPP_BIN")
-                .ok()
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(default_bin),
             models_dir: std::env::var("LOCALLMOS_LLAMACPP_MODELS_DIR")
                 .ok()
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(default_models_dir),
+            backend,
+            bin,
             extra_args,
             thinking: !std::env::var("LOCALLMOS_LLAMACPP_THINKING")
                 .unwrap_or_default()
@@ -570,6 +576,7 @@ impl RuntimeAdapter for LlamaServerAdapter {
         RuntimeSnapshot {
             kind: "llamacpp".into(),
             version: None,
+            backend: self.backend.clone(),
             state: state.into(),
             endpoint: Some(self.base.clone()),
             models,
@@ -1073,6 +1080,13 @@ fn default_bin() -> String {
         roots.push(home.join(".local/opt/locallmos/llama"));
     }
     roots.push(PathBuf::from("/opt/locallmos/llama"));
+    // Windows install roots written by install.ps1 (§3).
+    #[cfg(windows)]
+    for var in ["ProgramFiles", "ProgramData"] {
+        if let Ok(pf) = std::env::var(var) {
+            roots.push(PathBuf::from(pf).join("LocalLMOS").join("llama"));
+        }
+    }
     for root in roots {
         if let Some(bin) = find_llama_server(&root) {
             return bin.to_string_lossy().into_owned();
@@ -1082,19 +1096,73 @@ fn default_bin() -> String {
 }
 
 /// Find `llama-server` directly under `root` or one level down (the release
-/// tarball extracts into a `llama-<tag>/` subdir).
+/// tarball extracts into a `llama-<tag>/` subdir). Matches the `.exe` on Windows.
 fn find_llama_server(root: &Path) -> Option<PathBuf> {
-    let direct = root.join("llama-server");
-    if direct.is_file() {
-        return Some(direct);
+    let names: &[&str] = if cfg!(windows) {
+        &["llama-server.exe", "llama-server"]
+    } else {
+        &["llama-server"]
+    };
+    for name in names {
+        let direct = root.join(name);
+        if direct.is_file() {
+            return Some(direct);
+        }
     }
     for entry in std::fs::read_dir(root).ok()?.flatten() {
-        let cand = entry.path().join("llama-server");
-        if cand.is_file() {
-            return Some(cand);
+        for name in names {
+            let cand = entry.path().join(name);
+            if cand.is_file() {
+                return Some(cand);
+            }
         }
     }
     None
+}
+
+/// The active backend label for llama.cpp: the installer-exported env var (the
+/// resolved backend, e.g. "cuda"/"vulkan"), else the `backend=` line from the
+/// `.locallmos-llamacpp` marker the installer writes at the install root.
+fn resolve_backend(bin: &str) -> Option<String> {
+    if let Ok(b) = std::env::var("LOCALLMOS_LLAMACPP_BACKEND") {
+        let b = b.trim();
+        if !b.is_empty() && b != "auto" {
+            return Some(b.to_string());
+        }
+    }
+    read_marker_backend(bin)
+}
+
+/// Read `backend=` from the `.locallmos-llamacpp` marker. The binary sits at
+/// `<root>/llama-server` or `<root>/llama-<tag>/llama-server`, and the marker is
+/// at `<root>/.locallmos-llamacpp`, so search up to three parents.
+fn read_marker_backend(bin: &str) -> Option<String> {
+    let mut dir = Path::new(bin).parent();
+    for _ in 0..3 {
+        let d = dir?;
+        if let Ok(text) = std::fs::read_to_string(d.join(".locallmos-llamacpp")) {
+            for line in text.lines() {
+                if let Some(rest) = line.strip_prefix("backend=") {
+                    let rest = rest.trim();
+                    if !rest.is_empty() {
+                        return Some(rest.to_string());
+                    }
+                }
+            }
+        }
+        dir = d.parent();
+    }
+    None
+}
+
+/// The active llama.cpp backend for the default/env-configured binary, for the
+/// startup hardware sanity check (before the adapter is built).
+pub fn active_backend() -> Option<String> {
+    let bin = std::env::var("LOCALLMOS_LLAMACPP_BIN")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(default_bin);
+    resolve_backend(&bin)
 }
 
 fn stem(p: &Path) -> String {

@@ -157,7 +157,9 @@ export function Dashboard({
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
           <strong style={{ fontSize: 13 }}>
             {local?.runtime.kind ?? "runtime"}{" "}
-            <span style={{ color: "#64748b", fontWeight: 400 }}>{local?.runtime.version ?? ""}</span>
+            <span style={{ color: "#64748b", fontWeight: 400 }}>
+              {local?.runtime.version ?? local?.runtime.backend ?? ""}
+            </span>
           </strong>
           <span style={{ color: "#34d399", fontSize: 12 }}>● running</span>
         </div>

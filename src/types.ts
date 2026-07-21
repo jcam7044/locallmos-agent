@@ -32,6 +32,8 @@ export type LocalStatus = {
   runtime: {
     kind: string;
     version: string | null;
+    /** Active llama.cpp acceleration backend (cuda|rocm|vulkan|cpu|metal); null for Ollama. */
+    backend: string | null;
     state: string;
     endpoint: string | null;
     modelsDir: string | null;

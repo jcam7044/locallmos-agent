@@ -23,7 +23,7 @@ function variant(totalGb: number, id = `${totalGb}gb`): GgufVariant {
 
 function hardware(ramGb: number, gpuGb = 0, vendor = "nvidia"): LocalStatus {
   return {
-    runtime: { kind: "llamacpp", version: null, state: "running", endpoint: null, modelsDir: "/models", contextSize: 8192 },
+    runtime: { kind: "llamacpp", version: null, backend: "cuda", state: "running", endpoint: null, modelsDir: "/models", contextSize: 8192 },
     configuredRuntime: "llamacpp",
     models: [],
     modelsStorage: { dir: "/models", availableBytes: 100 * GB, totalBytes: 100 * GB },

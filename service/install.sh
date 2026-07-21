@@ -26,8 +26,10 @@ NO_LAUNCH="${LOCALLMOS_NO_LAUNCH:-0}"
 # unchanged; "llamacpp" provisions llama-server (native, grammar-constrained tool
 # calling) and points the agent at it.
 RUNTIME="${LOCALLMOS_RUNTIME:-ollama}"
-LLAMACPP_REPO="${LOCALLMOS_LLAMACPP_REPO:-ggml-org/llama.cpp}"
+LLAMACPP_REPO="${LOCALLMOS_LLAMACPP_REPO:-ggml-org/llama.cpp}"           # vulkan/rocm/cpu/metal source
+LLAMACPP_CUDA_REPO="${LOCALLMOS_LLAMACPP_CUDA_REPO:-jcam7044/locallmos-agent}" # self-hosted Linux CUDA prebuilts
 LLAMACPP_VERSION="${LOCALLMOS_LLAMACPP_VERSION:-b10068}" # pinned release tag, or "latest"
+LLAMACPP_BACKEND="${LOCALLMOS_LLAMACPP_BACKEND:-auto}"   # auto|cuda|rocm|vulkan|cpu|metal (forced = no fallback)
 # Production locallmos.com backend baked in as defaults (both are public values —
 # the anon key ships in the web bundle and is gated by RLS). Override with
 # --supabase-url / --anon-key or the LOCALLMOS_SUPABASE_* env vars.
@@ -54,6 +56,7 @@ while [ $# -gt 0 ]; do
     --service|--headless) MODE="service"; shift ;;
     --runtime) RUNTIME="$2"; shift 2 ;;
     --llamacpp-version) LLAMACPP_VERSION="$2"; shift 2 ;;
+    --llamacpp-backend) LLAMACPP_BACKEND="$2"; shift 2 ;;
     --no-launch) NO_LAUNCH="1"; shift ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
@@ -65,6 +68,10 @@ esac
 case "$RUNTIME" in
   ollama|llamacpp) ;;
   *) echo "unknown runtime: $RUNTIME (expected ollama or llamacpp)" >&2; exit 2 ;;
+esac
+case "$LLAMACPP_BACKEND" in
+  auto|cuda|rocm|vulkan|cpu|metal) ;;
+  *) echo "unknown llamacpp backend: $LLAMACPP_BACKEND (expected auto|cuda|rocm|vulkan|cpu|metal)" >&2; exit 2 ;;
 esac
 if [ "$MODE" = "desktop" ] && [ "$(id -u)" = "0" ]; then
   echo "desktop install must be run as your login user so the tray app can appear." >&2
@@ -310,7 +317,7 @@ fi
 RUNTIME_ENV=""
 if [ "$RUNTIME" = "llamacpp" ]; then
   provision_llamacpp
-  RUNTIME_ENV="LOCALLMOS_RUNTIME=llamacpp LOCALLMOS_LLAMACPP_BIN=$LLAMA_BIN LOCALLMOS_LLAMACPP_MODELS_DIR=$MODELS_DIR"
+  RUNTIME_ENV="LOCALLMOS_RUNTIME=llamacpp LOCALLMOS_LLAMACPP_BIN=$LLAMA_BIN LOCALLMOS_LLAMACPP_MODELS_DIR=$MODELS_DIR LOCALLMOS_LLAMACPP_BACKEND=$LLAMA_BACKEND"
 fi
 
 # ---- desktop install -------------------------------------------------------
@@ -339,14 +346,25 @@ LOCALLMOS_SUPABASE_ANON_KEY=$ANON_KEY
 EOF
     sudo chmod 0600 "$CONFIG_DIR/agent.env"
   fi
-  # Point the service at the provisioned llama.cpp engine (idempotent).
-  if [ "$RUNTIME" = "llamacpp" ] \
-    && ! sudo grep -q '^LOCALLMOS_RUNTIME=' "$CONFIG_DIR/agent.env" 2>/dev/null; then
-    sudo tee -a "$CONFIG_DIR/agent.env" >/dev/null <<EOF
-LOCALLMOS_RUNTIME=llamacpp
-LOCALLMOS_LLAMACPP_BIN=$LLAMA_BIN
-LOCALLMOS_LLAMACPP_MODELS_DIR=$MODELS_DIR
-EOF
+  # Point the service at the provisioned llama.cpp engine. Rewrite the runtime
+  # keys (rather than append-if-absent) so a reprovision to a new bin/backend
+  # can't leave stale values behind.
+  if [ "$RUNTIME" = "llamacpp" ]; then
+    NEW_ENV="$TMP/agent.env.new"
+    # Read the root-owned 0600 agent.env via sudo; the redirect writes the temp as
+    # the invoking user (that's intended, not a sudo-redirect bug).
+    # shellcheck disable=SC2024
+    sudo grep -v -E '^LOCALLMOS_(RUNTIME|LLAMACPP_BIN|LLAMACPP_MODELS_DIR|LLAMACPP_BACKEND)=' \
+      "$CONFIG_DIR/agent.env" 2>/dev/null > "$NEW_ENV" || true
+    {
+      echo "LOCALLMOS_RUNTIME=llamacpp"
+      echo "LOCALLMOS_LLAMACPP_BIN=$LLAMA_BIN"
+      echo "LOCALLMOS_LLAMACPP_MODELS_DIR=$MODELS_DIR"
+      echo "LOCALLMOS_LLAMACPP_BACKEND=$LLAMA_BACKEND"
+    } >> "$NEW_ENV"
+    sudo cp "$NEW_ENV" "$CONFIG_DIR/agent.env"
+    sudo chmod 0600 "$CONFIG_DIR/agent.env"
+    rm -f "$NEW_ENV"
   fi
 
   # ---- service install -----------------------------------------------------
@@ -431,7 +449,7 @@ fi
 # ---- runtime check ---------------------------------------------------------
 if [ "$RUNTIME" = "llamacpp" ]; then
   echo
-  echo "==> Runtime: llama.cpp (llama-server) — $LLAMA_BIN"
+  echo "==> Runtime: llama.cpp (llama-server, backend=${LLAMA_BACKEND:-?}) — $LLAMA_BIN"
   echo "   Add a .gguf to $MODELS_DIR, then select it in the dashboard."
 elif ! command -v ollama >/dev/null 2>&1; then
   echo

@@ -13,20 +13,27 @@ NAME="$(hostname)"
 # Runtime selection, shared with install.sh (see service/lib-llamacpp.sh).
 MODE="service"
 RUNTIME="${LOCALLMOS_RUNTIME:-ollama}"
-LLAMACPP_REPO="${LOCALLMOS_LLAMACPP_REPO:-ggml-org/llama.cpp}"
+LLAMACPP_REPO="${LOCALLMOS_LLAMACPP_REPO:-ggml-org/llama.cpp}"           # vulkan/rocm/cpu/metal source
+LLAMACPP_CUDA_REPO="${LOCALLMOS_LLAMACPP_CUDA_REPO:-jcam7044/locallmos-agent}" # self-hosted Linux CUDA prebuilts
 LLAMACPP_VERSION="${LOCALLMOS_LLAMACPP_VERSION:-b10068}"
+LLAMACPP_BACKEND="${LOCALLMOS_LLAMACPP_BACKEND:-auto}"   # auto|cuda|rocm|vulkan|cpu|metal (forced = no fallback)
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --code) CODE="$2"; shift 2 ;;
     --name) NAME="$2"; shift 2 ;;
     --runtime) RUNTIME="$2"; shift 2 ;;
     --llamacpp-version) LLAMACPP_VERSION="$2"; shift 2 ;;
+    --llamacpp-backend) LLAMACPP_BACKEND="$2"; shift 2 ;;
     *) echo "unknown arg: $1"; exit 2 ;;
   esac
 done
 case "$RUNTIME" in
   ollama|llamacpp) ;;
   *) echo "unknown runtime: $RUNTIME (expected ollama or llamacpp)"; exit 2 ;;
+esac
+case "$LLAMACPP_BACKEND" in
+  auto|cuda|rocm|vulkan|cpu|metal) ;;
+  *) echo "unknown llamacpp backend: $LLAMACPP_BACKEND (expected auto|cuda|rocm|vulkan|cpu|metal)"; exit 2 ;;
 esac
 
 # Platform detection for the shared provisioning lib ("{os}"/"{arch}" values).
@@ -82,16 +89,26 @@ if [[ ! -f "$CONFIG_DIR/agent.env" ]]; then
   echo "    wrote $CONFIG_DIR/agent.env — verify LOCALLMOS_SUPABASE_URL / _ANON_KEY"
 fi
 
-# Provision llama-server and point the service at it (idempotent).
+# Provision llama-server and point the service at it. Rewrite the runtime keys
+# (rather than append-if-absent) so a reprovision to a new bin/backend can't leave
+# stale values behind.
 if [[ "$RUNTIME" == "llamacpp" ]]; then
   provision_llamacpp
-  if ! sudo grep -q '^LOCALLMOS_RUNTIME=' "$CONFIG_DIR/agent.env" 2>/dev/null; then
-    sudo tee -a "$CONFIG_DIR/agent.env" >/dev/null <<EOF
-LOCALLMOS_RUNTIME=llamacpp
-LOCALLMOS_LLAMACPP_BIN=$LLAMA_BIN
-LOCALLMOS_LLAMACPP_MODELS_DIR=$MODELS_DIR
-EOF
-  fi
+  NEW_ENV="$(mktemp)"
+  # Read the root-owned 0600 agent.env via sudo; the redirect writes the temp as
+  # the invoking user (that's intended, not a sudo-redirect bug).
+  # shellcheck disable=SC2024
+  sudo grep -v -E '^LOCALLMOS_(RUNTIME|LLAMACPP_BIN|LLAMACPP_MODELS_DIR|LLAMACPP_BACKEND)=' \
+    "$CONFIG_DIR/agent.env" 2>/dev/null > "$NEW_ENV" || true
+  {
+    echo "LOCALLMOS_RUNTIME=llamacpp"
+    echo "LOCALLMOS_LLAMACPP_BIN=$LLAMA_BIN"
+    echo "LOCALLMOS_LLAMACPP_MODELS_DIR=$MODELS_DIR"
+    echo "LOCALLMOS_LLAMACPP_BACKEND=$LLAMA_BACKEND"
+  } >> "$NEW_ENV"
+  sudo cp "$NEW_ENV" "$CONFIG_DIR/agent.env"
+  sudo chmod 0600 "$CONFIG_DIR/agent.env"
+  rm -f "$NEW_ENV"
 fi
 
 echo "==> Installing systemd unit"

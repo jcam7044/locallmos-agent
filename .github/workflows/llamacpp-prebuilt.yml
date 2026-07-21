@@ -1,0 +1,244 @@
+name: llama.cpp Linux prebuilts
+
+# Build Linux llama.cpp binaries that upstream ggml-org/llama.cpp does not ship
+# (CUDA), and host them as release assets on THIS repo so the installers can
+# download them on the existing releases/download/<tag>/<asset> code path
+# (service/lib-llamacpp.sh). See docs/llamacpp-prebuilt-hosting-plan.md.
+#
+# Trigger: push a git tag named after the llama.cpp build to build, e.g. `b10068`
+# (mirrors the v*-tag flow of the Release workflow; GitHub Desktop: right-click a
+# commit -> Create Tag -> push). The tag name IS the upstream llama.cpp tag: this
+# workflow checks out ggml-org/llama.cpp at that tag and publishes a same-named
+# release here. The Release workflow only fires on `v*`, so `b*` never collides
+# with an agent release, and make_latest:false keeps these off "Latest".
+#
+# NOTE: with a tag-push trigger GitHub runs the workflow AS IT EXISTS AT THE
+# TAGGED COMMIT — so the commit you tag must already contain this file. Tag a
+# commit on the default branch (or any branch) that includes it.
+#
+# workflow_dispatch is kept as a manual fallback (re-run a tag's build without
+# recreating the tag, and the only way to opt into mirror_backends).
+#
+# No extra secrets: publishing uses the built-in GITHUB_TOKEN (contents: write).
+
+on:
+  push:
+    tags:
+      - "b[0-9]*" # llama.cpp build tags, e.g. b10068 (the [0-9] avoids matching `beta` etc.)
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "llama.cpp release tag to build (e.g. b10068)"
+        required: true
+        type: string
+      mirror_backends:
+        description: "Also mirror upstream ROCm/Vulkan/CPU Linux assets into this release"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  build-cuda:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 12.4: Turing..Hopper. Floor for older drivers; no Blackwell (needs 12.8+).
+          - variant: "12.4"
+            image: "nvidia/cuda:12.4.1-devel-ubuntu22.04"
+            archs: "75;80;86;89;90"
+          # 13.3: adds Blackwell (sm_100/sm_120). Requires a newer NVIDIA driver.
+          - variant: "13.3"
+            image: "nvidia/cuda:13.3.0-devel-ubuntu22.04"
+            archs: "75;80;86;89;90;100;120"
+    runs-on: ubuntu-22.04
+    container: ${{ matrix.image }}
+    # The llama.cpp tag = the pushed git tag (ref_name) on a tag push, or the
+    # dispatch input on a manual run. Used as $TAG in every step below.
+    env:
+      TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+    steps:
+      # Build deps. The CUDA devel image ships nvcc + the host compiler but not
+      # cmake/git/patchelf. Runs before checkout because we don't need this repo.
+      - name: Install build deps
+        run: |
+          set -eux
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            git cmake ninja-build build-essential patchelf ca-certificates file
+
+      - name: Checkout llama.cpp @ ${{ env.TAG }}
+        uses: actions/checkout@v4
+        with:
+          repository: ggml-org/llama.cpp
+          ref: ${{ env.TAG }}
+          path: llama.cpp
+
+      - name: Configure + build llama-server (CUDA ${{ matrix.variant }})
+        working-directory: llama.cpp
+        run: |
+          set -eux
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_CUDA=ON \
+            -DCMAKE_CUDA_ARCHITECTURES="${{ matrix.archs }}" \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DLLAMA_CURL=OFF \
+            -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_EXAMPLES=ON \
+            -DLLAMA_BUILD_TOOLS=ON \
+            -DLLAMA_BUILD_SERVER=ON
+          cmake --build build --target llama-server -j"$(nproc)"
+
+      - name: Stage + bundle CUDA runtime libs
+        working-directory: llama.cpp
+        run: |
+          set -eux
+          NAME="llama-$TAG-bin-ubuntu-cuda-${{ matrix.variant }}-x64"
+          PKG="$GITHUB_WORKSPACE/dist/$NAME"
+          mkdir -p "$PKG"
+
+          cp build/bin/llama-server "$PKG/"
+          # Any co-located shared libs the build emitted (usually none: static build).
+          find build/bin -maxdepth 1 -name '*.so*' -exec cp -av {} "$PKG/" \; || true
+
+          # Bundle exactly the CUDA runtime libs the binary resolves — libcudart,
+          # libcublas, libcublasLt. Deliberately NOT libcuda.so.1: that is the
+          # driver stub in CI and must come from the target's real NVIDIA driver.
+          # ldd prints the SONAME path (e.g. .../libcudart.so.12); cp -L keeps that
+          # SONAME as the destination filename with real contents.
+          ldd build/bin/llama-server \
+            | awk '/libcudart|libcublas|libcublasLt/ {print $3}' \
+            | while read -r so; do [ -n "$so" ] && cp -Lv "$so" "$PKG/"; done
+
+          # Resolve bundled libs next to the binary at run time.
+          patchelf --set-rpath '$ORIGIN' "$PKG/llama-server"
+
+          echo "== packaged files =="; ls -la "$PKG"
+          echo "== NEEDED / RPATH =="; readelf -d "$PKG/llama-server" | grep -Ei 'needed|rpath|runpath'
+
+      - name: Structural check (GPU-independent gate)
+        working-directory: llama.cpp
+        run: |
+          set -eux
+          NAME="llama-$TAG-bin-ubuntu-cuda-${{ matrix.variant }}-x64"
+          PKG="$GITHUB_WORKSPACE/dist/$NAME"
+          BIN="$PKG/llama-server"
+          file "$BIN" | grep -q 'ELF 64-bit'
+          # RUNPATH/RPATH must be $ORIGIN so the bundled libs are found on target.
+          readelf -d "$BIN" | grep -Eiq '\$ORIGIN'
+          # cudart must be a bundled NEEDED lib.
+          readelf -d "$BIN" | grep -Eiq 'libcudart'
+          # The bundled runtime libs must physically be in the package.
+          ls "$PKG"/libcudart.so.* "$PKG"/libcublas.so.* "$PKG"/libcublasLt.so.*
+
+      - name: Smoke test --version (best effort, needs driver stub)
+        working-directory: llama.cpp
+        continue-on-error: true
+        run: |
+          set -eux
+          NAME="llama-$TAG-bin-ubuntu-cuda-${{ matrix.variant }}-x64"
+          BIN="$GITHUB_WORKSPACE/dist/$NAME/llama-server"
+          # The runner has no GPU/driver; use the toolkit's libcuda stub so the
+          # dynamic loader is satisfied. --version prints and exits without a real
+          # CUDA context, so this confirms the ELF + bundled libs load. A failure
+          # here does not block publishing (see structural gate above).
+          STUB="$(dirname "$(find /usr/local/cuda -name 'libcuda.so' -path '*stubs*' | head -n1)")"
+          ln -sf libcuda.so "$STUB/libcuda.so.1" || true
+          LD_LIBRARY_PATH="$STUB" "$BIN" --version
+
+      - name: Package tarball
+        working-directory: dist
+        run: |
+          set -eux
+          NAME="llama-$TAG-bin-ubuntu-cuda-${{ matrix.variant }}-x64"
+          tar -czf "$NAME.tar.gz" "$NAME"
+          sha256sum "$NAME.tar.gz" | awk '{print $1}' > "$NAME.tar.gz.sha256"
+          ls -la
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cuda-${{ matrix.variant }}
+          path: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+
+  # Optional: re-host upstream's Linux non-CUDA assets so the whole fallback chain
+  # (cuda -> vulkan -> cpu, and rocm) can be pinned to a single source. Off by
+  # default — this workflow's job is the CUDA gap.
+  mirror-upstream:
+    # Opt-in, manual only: tag pushes never mirror (there is no input to set).
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.mirror_backends }}
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Download + checksum upstream Linux assets
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -eux
+          mkdir -p dist && cd dist
+          BASE="https://github.com/ggml-org/llama.cpp/releases/download/$TAG"
+          for a in \
+            "llama-$TAG-bin-ubuntu-rocm-7.2-x64.tar.gz" \
+            "llama-$TAG-bin-ubuntu-vulkan-x64.tar.gz" \
+            "llama-$TAG-bin-ubuntu-vulkan-arm64.tar.gz" \
+            "llama-$TAG-bin-ubuntu-x64.tar.gz" \
+            "llama-$TAG-bin-ubuntu-arm64.tar.gz"; do
+            # Best-effort: skip assets a given tag doesn't publish.
+            if curl -fsSL "$BASE/$a" -o "$a"; then
+              sha256sum "$a" | awk '{print $1}' > "$a.sha256"
+            else
+              echo "skip (not published at $TAG): $a"
+            fi
+          done
+          ls -la
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mirror-upstream
+          path: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+
+  publish:
+    needs: [build-cuda, mirror-upstream]
+    # mirror-upstream is skipped when mirror_backends=false; don't let that block us.
+    if: ${{ always() && needs.build-cuda.result == 'success' }}
+    runs-on: ubuntu-22.04
+    env:
+      TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: staged
+          merge-multiple: true
+
+      - name: List assets
+        run: ls -la staged
+
+      - name: Publish release ${{ env.TAG }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          name: "llama.cpp ${{ env.TAG }} — LocalLMOS Linux builds"
+          body: |
+            Self-hosted Linux **CUDA** builds of llama.cpp `${{ env.TAG }}`
+            (upstream `ggml-org/llama.cpp` ships no Linux CUDA prebuilt).
+
+            Built by `.github/workflows/llamacpp-prebuilt.yml` from
+            `ggml-org/llama.cpp@${{ env.TAG }}`.
+
+            - `ubuntu-cuda-12.4-x64` — sm_75/80/86/89/90 (Turing→Hopper)
+            - `ubuntu-cuda-13.3-x64` — adds sm_100/120 (Blackwell); needs a newer NVIDIA driver
+
+            Each `llama-server` bundles the CUDA runtime libs
+            (`libcudart`/`libcublas`/`libcublasLt`, `$ORIGIN` rpath); the NVIDIA
+            **driver** (`libcuda.so.1`) comes from the target machine. NVIDIA CUDA
+            redistributable libraries are shipped under the NVIDIA CUDA EULA.
+          make_latest: "false"
+          prerelease: false
+          files: staged/*

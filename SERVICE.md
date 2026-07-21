@@ -69,13 +69,45 @@ curl -fsSL https://locallmos.com/install.sh | sh -s -- \
   --service --runtime llamacpp --code <PAIRING_CODE> --name "Basement 3090"
 ```
 
-The installer auto-detects your hardware, downloads a prebuilt `llama-server`
-(accelerated Vulkan build where a GPU is present, else CPU) into
-`/opt/locallmos/llama`, creates a models directory at `/var/lib/locallmos/models`,
-and writes the `LOCALLMOS_RUNTIME=llamacpp` + `LOCALLMOS_LLAMACPP_*` vars into
-`agent.env`. Drop a `.gguf` into the models directory, then select it in the
+The installer auto-detects your hardware and downloads the best prebuilt
+`llama-server` for it into `/opt/locallmos/llama`, creates a models directory at
+`/var/lib/locallmos/models`, and writes the `LOCALLMOS_RUNTIME=llamacpp` +
+`LOCALLMOS_LLAMACPP_*` vars (including the chosen `LOCALLMOS_LLAMACPP_BACKEND`)
+into `agent.env`. Drop a `.gguf` into the models directory, then select it in the
 dashboard. Pin a specific engine build with `--llamacpp-version bNNNNN` (default:
 a known-good pinned release; `latest` resolves the newest).
+
+**Backend detection** (a small integrated GPU never steers the choice — it must
+be a discrete card or a whitelisted unified-memory APU):
+
+| Detected | Backend | Source |
+|---|---|---|
+| NVIDIA GPU (`nvidia-smi`) | `cuda` — the driver's CUDA version picks the `12.4` or `13.3` build | Self-hosted LocalLMOS prebuilt (upstream ships no Linux CUDA) |
+| AMD discrete GPU + ROCm runtime | `rocm` | Upstream `ggml-org/llama.cpp` |
+| Other discrete GPU (e.g. Intel Arc), or AMD without ROCm | `vulkan` | Upstream |
+| No qualifying GPU | `cpu` | Upstream |
+
+CUDA is a plain download like every other backend — **no on-device compile, no
+CUDA toolkit required, no 10–30 min build.** The CUDA prebuilts are published by
+LocalLMOS's own CI (`.github/workflows/llamacpp-prebuilt.yml`); override their
+source with `LOCALLMOS_LLAMACPP_CUDA_REPO` if you self-host them elsewhere.
+
+Provisioning walks a **fallback chain** (`cuda → vulkan → cpu`, `rocm → vulkan →
+cpu`), downloading and smoke-testing each candidate in a staging directory and
+only replacing the current install once a replacement passes `--version`. A
+marker file (`/opt/locallmos/llama/.locallmos-llamacpp`, recording `backend=`/
+`tag=`) makes re-runs idempotent: an install is reused when the backend and tag
+match, and reprovisioned atomically otherwise (e.g. after `--llamacpp-version`).
+
+**Force a specific backend** with `--llamacpp-backend cuda|rocm|vulkan|cpu`
+(or `LOCALLMOS_LLAMACPP_BACKEND`). Forcing is for debugging/known hardware and
+takes **no fallback** — if the forced backend can't be downloaded or fails its
+smoke test, the install hard-fails. Drop the flag to get auto-detection with the
+fallback chain back.
+
+**Windows** has the same flow via `install.ps1 -Runtime llamacpp` (backends
+`cuda|hip|vulkan|cpu`, `-LlamaCppBackend` to force). Windows CUDA/HIP prebuilts
+come from upstream, so no self-hosted repo is involved there.
 
 Model launch settings are configured per GGUF in the tray app's **Models** tab.
 Leaving them on **Recommended** lets llama.cpp auto-fit context and GPU offload

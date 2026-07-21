@@ -118,9 +118,12 @@ To also remove enrollment, settings, and machine environment variables:
 ```powershell
 Remove-Item "$env:APPDATA\locallmos-agent" -Recurse -Force -ErrorAction SilentlyContinue
 Remove-Item "$env:ProgramData\locallmos-agent" -Recurse -Force -ErrorAction SilentlyContinue
-[Environment]::SetEnvironmentVariable("LOCALLMOS_CONFIG_DIR", $null, "Machine")
-[Environment]::SetEnvironmentVariable("LOCALLMOS_SUPABASE_URL", $null, "Machine")
-[Environment]::SetEnvironmentVariable("LOCALLMOS_SUPABASE_ANON_KEY", $null, "Machine")
+Remove-Item "$env:APPDATA\locallmos\models" -Recurse -Force -ErrorAction SilentlyContinue
+Remove-Item "$env:ProgramData\locallmos\models" -Recurse -Force -ErrorAction SilentlyContinue
+foreach ($v in "LOCALLMOS_CONFIG_DIR","LOCALLMOS_SUPABASE_URL","LOCALLMOS_SUPABASE_ANON_KEY",
+  "LOCALLMOS_RUNTIME","LOCALLMOS_LLAMACPP_BIN","LOCALLMOS_LLAMACPP_MODELS_DIR","LOCALLMOS_LLAMACPP_BACKEND") {
+  [Environment]::SetEnvironmentVariable($v, $null, "Machine")
+}
 ```
 
 ## Modes

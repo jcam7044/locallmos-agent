@@ -4,9 +4,11 @@ import type { SessionSettings } from "../types";
 export function SessionSettingsPanel({
   settings,
   onChange,
+  showContext,
 }: {
   settings: SessionSettings;
   onChange: (patch: Partial<SessionSettings>) => void;
+  showContext: boolean;
 }) {
   return (
     <div
@@ -36,7 +38,7 @@ export function SessionSettingsPanel({
         />
       </div>
       <div style={{ display: "flex", gap: 12 }}>
-        <div style={{ flex: 1 }}>
+        {showContext ? <div style={{ flex: 1 }}>
           <span style={label}>Temperature (0–2)</span>
           <input
             type="number"
@@ -50,7 +52,9 @@ export function SessionSettingsPanel({
             }
             style={{ ...inputStyle, marginTop: 4 }}
           />
-        </div>
+        </div> : <div style={{ flex: 1, color: "#718096", fontSize: 11, alignSelf: "center" }}>
+          Context allocation is configured per model in Models → Load settings.
+        </div>}
         <div style={{ flex: 1 }}>
           <span style={label}>Context length (num_ctx)</span>
           <input

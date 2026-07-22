@@ -13,6 +13,8 @@ pub struct AgentStatus {
     /// True when the last sync round-trip to Supabase succeeded.
     pub connected: bool,
     pub runtime_kind: Option<String>,
+    /// The active llama.cpp acceleration backend (cuda|rocm|vulkan|cpu|metal).
+    pub runtime_backend: Option<String>,
     pub runtime_state: Option<String>,
     pub loaded_model: Option<String>,
     pub cpu_pct: Option<f32>,

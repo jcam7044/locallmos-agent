@@ -1,5 +1,13 @@
 import { useState } from "react";
-import { enroll as enrollRig, loadModel, localUpdate, restartRuntime } from "../api";
+import {
+  enroll as enrollRig,
+  loadModel,
+  localUpdate,
+  openModelsDir,
+  restartRuntime,
+  setRuntime,
+  unloadModel,
+} from "../api";
 import { buttonStyle, card, inputStyle, label, secondaryButton } from "../styles";
 import { formatGB, type AgentStatus, type LocalStatus } from "../types";
 
@@ -27,6 +35,18 @@ export function Dashboard({
     }
   };
 
+  const eject = async (model: string) => {
+    setBusy(model);
+    try {
+      await unloadModel(model);
+      await onChanged();
+    } catch (e) {
+      setUpdateMsg(String(e));
+    } finally {
+      setBusy(null);
+    }
+  };
+
   const restart = async () => {
     setBusy("__restart");
     try {
@@ -37,6 +57,19 @@ export function Dashboard({
       setBusy(null);
     }
   };
+
+  const openFolder = async () => {
+    try {
+      await openModelsDir();
+    } catch (e) {
+      setUpdateMsg(String(e));
+    }
+  };
+
+  const kind = local?.runtime.kind ?? "ollama";
+  const isLlama = kind === "llamacpp";
+  const modelsDir = local?.runtime.modelsDir ?? null;
+  const configured = local?.configuredRuntime ?? kind;
 
   const checkUpdate = async () => {
     setBusy("__update");
@@ -53,16 +86,45 @@ export function Dashboard({
 
   if (!running) {
     return (
-      <div style={{ ...card, marginTop: 12, borderColor: "#78350f", background: "#1c1408" }}>
-        <strong style={{ color: "#fbbf24" }}>⚠ Ollama not detected</strong>
-        <p style={{ ...label, marginTop: 6 }}>
-          LocalLMOS uses Ollama to run models. Install it from{" "}
-          <span style={{ fontFamily: "monospace", color: "#e2e8f0" }}>ollama.com/download</span>, then
-          pull a model (e.g. <span style={{ fontFamily: "monospace" }}>ollama pull llama3.2</span>).
-        </p>
-        <button onClick={restart} disabled={busy === "__restart"} style={secondaryButton}>
-          {busy === "__restart" ? "Restarting…" : "Retry / restart Ollama"}
-        </button>
+      <div style={{ marginTop: 12, display: "flex", flexDirection: "column", gap: 12 }}>
+        <div style={{ ...card, borderColor: "#78350f", background: "#1c1408" }}>
+          {isLlama ? (
+            <>
+              <strong style={{ color: "#fbbf24" }}>⚠ No model available (llama.cpp)</strong>
+              <p style={{ ...label, marginTop: 6 }}>
+                Drop a <span style={{ fontFamily: "monospace" }}>.gguf</span> file into the models
+                folder, then it appears below to load.
+              </p>
+              {modelsDir && (
+                <p style={{ ...label, fontFamily: "monospace", color: "#e2e8f0" }}>{modelsDir}</p>
+              )}
+              <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+                <button onClick={openFolder} style={secondaryButton}>
+                  Open models folder
+                </button>
+                <button onClick={restart} disabled={busy === "__restart"} style={secondaryButton}>
+                  {busy === "__restart" ? "…" : "Refresh"}
+                </button>
+              </div>
+            </>
+          ) : (
+            <>
+              <strong style={{ color: "#fbbf24" }}>⚠ Ollama not detected</strong>
+              <p style={{ ...label, marginTop: 6 }}>
+                LocalLMOS uses Ollama to run models. Install it from{" "}
+                <span style={{ fontFamily: "monospace", color: "#e2e8f0" }}>ollama.com/download</span>
+                , then pull a model (e.g.{" "}
+                <span style={{ fontFamily: "monospace" }}>ollama pull llama3.2</span>).
+              </p>
+              <button onClick={restart} disabled={busy === "__restart"} style={secondaryButton}>
+                {busy === "__restart" ? "Restarting…" : "Retry / restart Ollama"}
+              </button>
+            </>
+          )}
+        </div>
+        <div style={card}>
+          <RuntimeControl configured={configured} activeKind={kind} onChanged={onChanged} />
+        </div>
       </div>
     );
   }
@@ -95,9 +157,14 @@ export function Dashboard({
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
           <strong style={{ fontSize: 13 }}>
             {local?.runtime.kind ?? "runtime"}{" "}
-            <span style={{ color: "#64748b", fontWeight: 400 }}>{local?.runtime.version ?? ""}</span>
+            <span style={{ color: "#64748b", fontWeight: 400 }}>
+              {local?.runtime.version ?? local?.runtime.backend ?? ""}
+            </span>
           </strong>
           <span style={{ color: "#34d399", fontSize: 12 }}>● running</span>
+        </div>
+        <div style={{ marginTop: 10 }}>
+          <RuntimeControl configured={configured} activeKind={kind} onChanged={onChanged} />
         </div>
         <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
           <button onClick={restart} disabled={busy === "__restart"} style={secondaryButton}>
@@ -114,15 +181,30 @@ export function Dashboard({
       <div style={card}>
         <strong style={{ fontSize: 13 }}>Models</strong>
         {(local?.models ?? []).length === 0 ? (
-          <p style={{ ...label, marginTop: 8 }}>
-            No models installed. Pull one, e.g.{" "}
-            <span style={{ fontFamily: "monospace" }}>ollama pull llama3.2</span>.
-          </p>
+          isLlama ? (
+            <div style={{ marginTop: 8 }}>
+              <p style={label}>
+                No models found. Drop a <span style={{ fontFamily: "monospace" }}>.gguf</span> into
+                the models folder{modelsDir ? ":" : "."}
+              </p>
+              {modelsDir && (
+                <p style={{ ...label, fontFamily: "monospace", color: "#e2e8f0" }}>{modelsDir}</p>
+              )}
+              <button onClick={openFolder} style={{ ...secondaryButton, marginTop: 6 }}>
+                Open models folder
+              </button>
+            </div>
+          ) : (
+            <p style={{ ...label, marginTop: 8 }}>
+              No models installed. Pull one, e.g.{" "}
+              <span style={{ fontFamily: "monospace" }}>ollama pull llama3.2</span>.
+            </p>
+          )
         ) : (
           <div style={{ marginTop: 6 }}>
             {(local?.models ?? []).map((m) => (
               <div
-                key={m.name}
+              key={m.id}
                 style={{
                   display: "flex",
                   alignItems: "center",
@@ -138,14 +220,20 @@ export function Dashboard({
                   <div style={label}>{formatGB(m.sizeBytes)}</div>
                 </div>
                 {m.loaded ? (
-                  <span style={{ color: "#34d399", fontSize: 12 }}>loaded</span>
+                  <button
+                    onClick={() => eject(m.id)}
+                    disabled={busy === m.id}
+                    style={{ ...secondaryButton, color: "#fca5a5", borderColor: "#7f3b3b" }}
+                  >
+                    {busy === m.id ? "Ejecting…" : "Eject"}
+                  </button>
                 ) : (
                   <button
-                    onClick={() => load(m.name)}
-                    disabled={busy === m.name}
+                    onClick={() => load(m.id)}
+                    disabled={busy === m.id}
                     style={secondaryButton}
                   >
-                    {busy === m.name ? "Loading…" : "Load"}
+                    {busy === m.id ? "Loading…" : "Load"}
                   </button>
                 )}
               </div>
@@ -223,6 +311,53 @@ export function ConnectCloud({
           {err && <p style={{ color: "#f87171", fontSize: 12, marginTop: 8 }}>{err}</p>}
         </div>
       )}
+    </div>
+  );
+}
+
+/** Engine selector. Persists the choice (config+restart); the active runtime is
+ * built at startup, so a change shows a "restart to apply" hint until relaunch. */
+function RuntimeControl({
+  configured,
+  activeKind,
+  onChanged,
+}: {
+  configured: string;
+  activeKind: string;
+  onChanged: () => void;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const change = async (kind: string) => {
+    if (kind === configured) return;
+    setBusy(true);
+    setErr(null);
+    try {
+      await setRuntime(kind);
+      await onChanged();
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const pending = configured !== activeKind;
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+      <span style={label}>Engine</span>
+      <select
+        value={configured}
+        disabled={busy}
+        onChange={(e) => change(e.target.value)}
+        style={inputStyle}
+      >
+        <option value="ollama">Ollama</option>
+        <option value="llamacpp">llama.cpp</option>
+      </select>
+      {pending && (
+        <p style={{ ...label, color: "#fbbf24" }}>Restart the app to switch to {configured}.</p>
+      )}
+      {err && <p style={{ color: "#f87171", fontSize: 12 }}>{err}</p>}
     </div>
   );
 }

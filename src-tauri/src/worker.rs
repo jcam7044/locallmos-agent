@@ -3,13 +3,13 @@
 //! reboot) shared with the runtime adapters.
 
 use crate::config::AgentConfig;
-use crate::runtime::RuntimeAdapter;
 use crate::status::AgentStatus;
 use crate::supabase::CredentialsRevoked;
 use crate::AppState;
 use anyhow::{anyhow, Result};
 use chrono::Utc;
 use serde_json::{json, Value};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -196,7 +196,7 @@ async fn telemetry_tick(state: &Arc<AppState>) -> Result<()> {
         .await?;
 
     // Runtime + model state.
-    let snap = state.ollama.snapshot().await;
+    let snap = state.runtime.snapshot().await;
     state.supabase.upsert_runtime(&token, &rid, &snap).await?;
     state.supabase.upsert_models(&token, &rid, &snap).await?;
 
@@ -206,6 +206,7 @@ async fn telemetry_tick(state: &Arc<AppState>) -> Result<()> {
         s.connected = true;
         s.last_error = None;
         s.runtime_kind = Some(snap.kind.clone());
+        s.runtime_backend = snap.backend.clone();
         s.runtime_state = Some(snap.state.clone());
         s.loaded_model = snap.models.iter().find(|m| m.loaded).map(|m| m.name.clone());
         s.cpu_pct = telemetry.cpu_utilization_pct;
@@ -272,10 +273,10 @@ async fn execute(state: &Arc<AppState>, kind: &str, payload: &Value) -> (bool, V
             if model.is_empty() {
                 Err(anyhow!("set_model: missing model"))
             } else {
-                state.ollama.load_model(model).await.map(|_| json!({ "model": model }))
+                state.load_model_configured(model, false).await.map(|_| json!({ "model": model }))
             }
         }
-        "restart_runtime" => state.ollama.restart().await.map(|_| json!({})),
+        "restart_runtime" => state.runtime.restart().await.map(|_| json!({})),
         "reboot_machine" => {
             let delay = payload.get("delaySeconds").and_then(|v| v.as_u64()).unwrap_or(0);
             reboot(delay).map(|_| json!({ "scheduled": true }))
@@ -310,25 +311,56 @@ async fn reconcile_tick(state: &Arc<AppState>) -> Result<()> {
     let rid = rig_id(state).await.ok_or_else(|| anyhow!("not enrolled"))?;
     let desired = state.supabase.fetch_desired(&token, &rid).await?;
 
-    let snap = state.ollama.snapshot().await;
+    let snap = state.runtime.snapshot().await;
 
     // Restart the runtime if it should be running but isn't.
     let want_running = desired.desired_runtime_state.as_deref() != Some("stopped");
     if want_running && snap.state != "running" {
         tracing::info!("reconcile: runtime down, restarting");
-        state.ollama.restart().await.ok();
+        state.runtime.restart().await.ok();
         return Ok(()); // reassess next tick
     }
 
-    // Ensure the desired model is loaded.
+    // An explicit local Eject takes precedence over the unchanged cloud
+    // desired-model value. This is persisted so a restarted agent does not
+    // immediately consume VRAM again. Selecting a different desired model in
+    // the web app clears the override on the next reconcile.
     if let Some(model) = desired.desired_model.as_deref() {
+        let suppressed = {
+            let mut config = state.config.lock().await;
+            match config.locally_ejected_model.as_deref() {
+                Some(ejected) if same_model(ejected, model) => true,
+                Some(_) => {
+                    config.locally_ejected_model = None;
+                    config.save().ok();
+                    false
+                }
+                None => false,
+            }
+        };
+        if suppressed {
+            tracing::debug!("reconcile: leaving locally ejected model {model} unloaded");
+            return Ok(());
+        }
         let loaded = snap.models.iter().any(|m| m.name == model && m.loaded);
         if !loaded {
             tracing::info!("reconcile: loading desired model {model}");
-            state.ollama.load_model(model).await.ok();
+            state.load_model_configured(model, false).await.ok();
         }
     }
     Ok(())
+}
+
+fn same_model(left: &str, right: &str) -> bool {
+    fn normalized(value: &str) -> String {
+        Path::new(value)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(value)
+            .trim_end_matches(".gguf")
+            .to_ascii_lowercase()
+    }
+    normalized(left) == normalized(right)
 }
 
 // ---------------------------------------------------------------------------
@@ -413,5 +445,19 @@ fn run_os(program: &str, args: &[String]) -> Result<()> {
         Ok(())
     } else {
         Err(anyhow!("{program} exited with {status}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::same_model;
+
+    #[test]
+    fn locally_ejected_file_id_matches_cloud_model_alias() {
+        assert!(same_model(
+            "huggingface/owner/repo/model-Q4_K_M.gguf",
+            "model-Q4_K_M"
+        ));
+        assert!(!same_model("model-Q4_K_M.gguf", "model-Q5_K_M"));
     }
 }

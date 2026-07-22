@@ -10,20 +10,64 @@ set -euo pipefail
 
 CODE=""
 NAME="$(hostname)"
+# Runtime selection, shared with install.sh (see service/lib-llamacpp.sh).
+MODE="service"
+RUNTIME="${LOCALLMOS_RUNTIME:-ollama}"
+LLAMACPP_REPO="${LOCALLMOS_LLAMACPP_REPO:-ggml-org/llama.cpp}"           # vulkan/rocm/cpu/metal source
+LLAMACPP_CUDA_REPO="${LOCALLMOS_LLAMACPP_CUDA_REPO:-jcam7044/locallmos-agent}" # self-hosted Linux CUDA prebuilts
+LLAMACPP_VERSION="${LOCALLMOS_LLAMACPP_VERSION:-b10068}"
+LLAMACPP_BACKEND="${LOCALLMOS_LLAMACPP_BACKEND:-auto}"   # auto|cuda|rocm|vulkan|cpu|metal (forced = no fallback)
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --code) CODE="$2"; shift 2 ;;
     --name) NAME="$2"; shift 2 ;;
+    --runtime) RUNTIME="$2"; shift 2 ;;
+    --llamacpp-version) LLAMACPP_VERSION="$2"; shift 2 ;;
+    --llamacpp-backend) LLAMACPP_BACKEND="$2"; shift 2 ;;
     *) echo "unknown arg: $1"; exit 2 ;;
   esac
 done
+case "$RUNTIME" in
+  ollama|llamacpp) ;;
+  *) echo "unknown runtime: $RUNTIME (expected ollama or llamacpp)"; exit 2 ;;
+esac
+case "$LLAMACPP_BACKEND" in
+  auto|cuda|rocm|vulkan|cpu|metal) ;;
+  *) echo "unknown llamacpp backend: $LLAMACPP_BACKEND (expected auto|cuda|rocm|vulkan|cpu|metal)"; exit 2 ;;
+esac
+
+# Platform detection for the shared provisioning lib ("{os}"/"{arch}" values).
+case "$(uname -s)" in
+  Linux)  OS="linux" ;;
+  Darwin) OS="macos" ;;
+  *) OS="linux" ;;
+esac
+case "$(uname -m)" in
+  x86_64|amd64)  ARCH="x86_64" ;;
+  arm64|aarch64) ARCH="aarch64" ;;
+  *) ARCH="x86_64" ;;
+esac
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib-llamacpp.sh
+. "$HERE/lib-llamacpp.sh"
 SRC_TAURI="$(cd "$HERE/../src-tauri" && pwd)"
 AGENT_DIR="$(cd "$HERE/.." && pwd)"
 CONFIG_DIR="/etc/locallmos-agent"
 BIN_DST="/usr/local/bin/locallmos-agent"
 UNIT_DST="/etc/systemd/system/locallmos-agent.service"
+
+# The release build embeds the built frontend; build.rs hard-fails without
+# ../dist/index.html. Build it first (the public install.sh path skips this — it
+# downloads a prebuilt binary whose frontend was built in CI).
+echo "==> Building frontend (dist/)"
+if ! command -v pnpm >/dev/null 2>&1; then
+  echo "!! pnpm not found on PATH — the release build needs the frontend built first." >&2
+  echo "   Install it, e.g.:  corepack enable && corepack prepare pnpm@9.15.9 --activate" >&2
+  echo "   or:                npm install -g pnpm" >&2
+  exit 1
+fi
+( cd "$AGENT_DIR" && pnpm install && pnpm build )
 
 echo "==> Building release binary (this can take a few minutes the first time)"
 ( cd "$SRC_TAURI" && cargo build --release )
@@ -43,6 +87,28 @@ if [[ ! -f "$CONFIG_DIR/agent.env" ]]; then
   fi
   sudo chmod 0600 "$CONFIG_DIR/agent.env"
   echo "    wrote $CONFIG_DIR/agent.env — verify LOCALLMOS_SUPABASE_URL / _ANON_KEY"
+fi
+
+# Provision llama-server and point the service at it. Rewrite the runtime keys
+# (rather than append-if-absent) so a reprovision to a new bin/backend can't leave
+# stale values behind.
+if [[ "$RUNTIME" == "llamacpp" ]]; then
+  provision_llamacpp
+  NEW_ENV="$(mktemp)"
+  # Read the root-owned 0600 agent.env via sudo; the redirect writes the temp as
+  # the invoking user (that's intended, not a sudo-redirect bug).
+  # shellcheck disable=SC2024
+  sudo grep -v -E '^LOCALLMOS_(RUNTIME|LLAMACPP_BIN|LLAMACPP_MODELS_DIR|LLAMACPP_BACKEND)=' \
+    "$CONFIG_DIR/agent.env" 2>/dev/null > "$NEW_ENV" || true
+  {
+    echo "LOCALLMOS_RUNTIME=llamacpp"
+    echo "LOCALLMOS_LLAMACPP_BIN=$LLAMA_BIN"
+    echo "LOCALLMOS_LLAMACPP_MODELS_DIR=$MODELS_DIR"
+    echo "LOCALLMOS_LLAMACPP_BACKEND=$LLAMA_BACKEND"
+  } >> "$NEW_ENV"
+  sudo cp "$NEW_ENV" "$CONFIG_DIR/agent.env"
+  sudo chmod 0600 "$CONFIG_DIR/agent.env"
+  rm -f "$NEW_ENV"
 fi
 
 echo "==> Installing systemd unit"

@@ -19,6 +19,7 @@
 //! need per-turn resumable streaming (out of scope for v1).
 
 use crate::runtime::ollama::{ChatDelta, ToolCall};
+use crate::runtime::tool_protocol;
 use crate::runtime::tools;
 use crate::supabase::{ChatPending, WebSearchOutcome};
 use crate::AppState;
@@ -56,6 +57,31 @@ fn topic(message_id: &str) -> String {
     format!("chat:{message_id}")
 }
 
+/// Append a tool result to the running message list. In prompt-injection mode
+/// the model's template ignores `role:"tool"` messages, so the result is
+/// replayed as plain user text the template renders; otherwise the standard
+/// Ollama tool-result shape is used.
+fn push_tool_result(messages: &mut Vec<Value>, prompt_tool_mode: bool, name: &str, content: &str) {
+    if prompt_tool_mode {
+        messages.push(json!({
+            "role": "user",
+            "content": format!("<tool_response name=\"{name}\">\n{content}\n</tool_response>"),
+        }));
+    } else {
+        messages.push(json!({ "role": "tool", "tool_name": name, "content": content }));
+    }
+}
+
+/// Content to persist for a turn. In prompt-injection mode any raw `<tool_call>`
+/// syntax is stripped so a partial/round-capped answer never shows call markup.
+fn finalize_content(prompt_tool_mode: bool, content: String) -> String {
+    if prompt_tool_mode {
+        tool_protocol::strip_tool_calls(&content)
+    } else {
+        content
+    }
+}
+
 /// Process one pending assistant turn end-to-end.
 pub async fn process(state: &Arc<AppState>, pending: ChatPending) -> Result<()> {
     let token = crate::worker::ensure_token(state).await?;
@@ -77,6 +103,7 @@ pub async fn process(state: &Arc<AppState>, pending: ChatPending) -> Result<()> 
             return Err(anyhow!(msg));
         }
     };
+    let (_, load_settings) = state.model_settings(&model).await?;
 
     // Build the Ollama chat history from prior completed messages, folding in
     // attachments: images become per-message base64 `images`; documents have
@@ -203,7 +230,7 @@ pub async fn process(state: &Arc<AppState>, pending: ChatPending) -> Result<()> 
     // (tens of seconds for large models). Heartbeat a "loading" ping so the web
     // shows a loading state instead of looking hung; stop it on the first token.
     let stop_loading = Arc::new(Notify::new());
-    let loading_task = if ws_ready && !state.ollama.is_model_loaded(&model).await {
+    let loading_task = if ws_ready && !state.runtime.is_model_loaded(&model).await {
         let state = state.clone();
         let chan = chan.clone();
         let stop = stop_loading.clone();
@@ -224,36 +251,76 @@ pub async fn process(state: &Arc<AppState>, pending: ChatPending) -> Result<()> 
 
     // Assemble tool schemas. Protocol v1 uses only the immutable server-authored
     // platform snapshot; protocol v0 retains the legacy Brave/web-fetch path for
-    // older control planes during the agent rollout.
-    let model_tools = state.ollama.model_supports_tools(&model).await;
+    // older control planes during the agent rollout. These schemas are built
+    // independently of how they're delivered to the model (native vs prompt).
     let platform_tools = if pending.tool_protocol_version >= 1 {
         tools::platform_tools(pending.platform_tools.as_ref())
     } else {
         Vec::new()
     };
     let mut tool_defs: Vec<Value> = Vec::new();
-    if model_tools {
-        if !platform_tools.is_empty() {
-            tool_defs.extend(tools::platform_defs(&platform_tools));
-        } else if pending.web_search {
-            if let Some(arr) = tools::builtin_defs().as_array() {
-                tool_defs.extend(arr.iter().cloned());
-            }
+    if !platform_tools.is_empty() {
+        tool_defs.extend(tools::platform_defs(&platform_tools));
+    } else if pending.web_search {
+        if let Some(arr) = tools::builtin_defs().as_array() {
+            tool_defs.extend(arr.iter().cloned());
         }
-        if let Some(reqt) = pending.request_tools.as_ref().and_then(|v| v.as_array()) {
-            // A caller-defined function must not shadow a platform capability.
-            for def in reqt {
-                let name = def
-                    .get("function")
-                    .and_then(|f| f.get("name"))
-                    .and_then(Value::as_str);
-                if !platform_tools.iter().any(|tool| Some(tool.name.as_str()) == name) {
-                    tool_defs.push(def.clone());
-                }
+    }
+    if let Some(reqt) = pending.request_tools.as_ref().and_then(|v| v.as_array()) {
+        // A caller-defined function must not shadow a platform capability.
+        for def in reqt {
+            let name = def
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(Value::as_str);
+            if !platform_tools.iter().any(|tool| Some(tool.name.as_str()) == name) {
+                tool_defs.push(def.clone());
             }
         }
     }
-    let tools_value = (!tool_defs.is_empty()).then(|| Value::Array(tool_defs));
+
+    // Choose the tool-delivery mode. Native tool calling only works when the
+    // model's chat template actually renders `.Tools`; a model can advertise the
+    // "tools" capability yet ship a passthrough template that never injects the
+    // schema (the model then invents a call as plain text the native parser
+    // drops). For those, inject the tools into the system prompt and parse
+    // `<tool_call>` blocks ourselves — keeping the feature model-agnostic.
+    let native_tools =
+        !tool_defs.is_empty() && state.runtime.template_supports_tools(&model).await;
+    let prompt_tool_mode = !tool_defs.is_empty() && !native_tools;
+    if prompt_tool_mode {
+        let manifest = tool_protocol::manifest_system_prompt(&tool_defs);
+        if !manifest.is_empty() {
+            // Inject into the latest user turn, not a system message. The very
+            // templates that put us in this mode (e.g. a bare `{{ .Prompt }}`)
+            // render only the user prompt and drop system/assistant content, so
+            // the user turn is the one delivery point guaranteed to reach the
+            // model. Templates that do render `.Messages` handle this fine too.
+            let last_user = messages
+                .iter_mut()
+                .rev()
+                .find(|m| m.get("role").and_then(Value::as_str) == Some("user"));
+            match last_user {
+                Some(msg) => {
+                    let existing = msg.get("content").and_then(Value::as_str).unwrap_or("");
+                    msg["content"] = json!(format!("{manifest}\n\n---\n\n{existing}"));
+                }
+                None => messages.push(json!({ "role": "user", "content": manifest })),
+            }
+        }
+    }
+    // Names of the tools we offered — used in prompt mode to tell a real tool
+    // call from a JSON-shaped answer. Captured before `tool_defs` is consumed.
+    let tool_names: Vec<String> = tool_defs
+        .iter()
+        .filter_map(|d| {
+            d.get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(Value::as_str)
+        })
+        .map(str::to_string)
+        .collect();
+    let tools_value = native_tools.then(|| Value::Array(tool_defs));
 
     // Tool loop: call Ollama; if it asks for a built-in tool, run it and feed the
     // result back; caller (passthrough) tool calls are returned unexecuted. Only
@@ -273,21 +340,37 @@ pub async fn process(state: &Arc<AppState>, pending: ChatPending) -> Result<()> 
             let first_token = first_token.clone();
             let stop_loading = stop_loading.clone();
             let tx = tx.clone();
+            // In prompt-injection mode the model writes its tool call as content;
+            // keep that bookkeeping out of the user-visible stream while the full
+            // raw content still accumulates in `out.content` for parsing.
+            let mut filter = tool_protocol::ToolCallStreamFilter::new();
             state
-                .ollama
+                .runtime
                 .chat_stream(
                     &model,
                     Value::Array(messages.clone()),
                     pending.think,
                     tools_value.as_ref(),
                     None,
+                    &load_settings,
                     cancel.clone(),
                     move |delta| {
                         if !first_token.swap(true, Ordering::Relaxed) {
                             stop_loading.notify_one();
                         }
                         let _ = match delta {
-                            ChatDelta::Content(s) => tx.send(StreamDelta::Content(s.to_string())),
+                            ChatDelta::Content(s) => {
+                                let shown = if prompt_tool_mode {
+                                    filter.push(s)
+                                } else {
+                                    s.to_string()
+                                };
+                                if shown.is_empty() {
+                                    Ok(())
+                                } else {
+                                    tx.send(StreamDelta::Content(shown))
+                                }
+                            }
                             ChatDelta::Thinking(s) => tx.send(StreamDelta::Thinking(s.to_string())),
                         };
                     },
@@ -295,7 +378,7 @@ pub async fn process(state: &Arc<AppState>, pending: ChatPending) -> Result<()> 
                 .await
         };
 
-        let out = match result {
+        let mut out = match result {
             Ok(o) => o,
             Err(e) => {
                 loop_err = Some(e);
@@ -304,6 +387,24 @@ pub async fn process(state: &Arc<AppState>, pending: ChatPending) -> Result<()> 
         };
         prompt_total += out.prompt_tokens.unwrap_or(0);
         completion_total += out.completion_tokens.unwrap_or(0);
+        // Recover text-format tool calls the model emitted as content (native
+        // `tool_calls` is always empty in prompt-injection mode).
+        if prompt_tool_mode {
+            out.tool_calls = tool_protocol::parse_text_tool_calls(&out.content, &tool_names);
+            if out.tool_calls.is_empty() {
+                // Surface the raw output so an unrecognised call format is
+                // diagnosable from the terminal without a debug build.
+                tracing::info!(
+                    chat = %pending.id,
+                    round,
+                    content = %out.content.trim(),
+                    "prompt-tool round parsed no tool call"
+                );
+            } else {
+                let names: Vec<&str> = out.tool_calls.iter().map(|c| c.name.as_str()).collect();
+                tracing::info!(chat = %pending.id, round, ?names, "parsed tool call(s) from text");
+            }
+        }
 
         // No tool calls (or cancelled) → this round's text is the final answer.
         if out.tool_calls.is_empty() || cancel.load(Ordering::Relaxed) {
@@ -337,19 +438,25 @@ pub async fn process(state: &Arc<AppState>, pending: ChatPending) -> Result<()> 
                     "function": { "name": c.name, "arguments": c.arguments.to_string() },
                 }));
             }
-            final_content = content;
+            final_content = finalize_content(prompt_tool_mode, content);
             final_thinking = thinking;
             break;
         }
 
-        // Execute built-in tools: echo an assistant tool_calls message, then one
-        // tool result per call, and loop so the model can use them.
-        let assistant_calls: Vec<Value> = platform_calls
-            .iter()
-            .map(|(c, _)| c.to_request_value())
-            .chain(builtin.iter().map(|c| c.to_request_value()))
-            .collect();
-        messages.push(json!({ "role": "assistant", "content": "", "tool_calls": assistant_calls }));
+        // Echo the assistant's tool call, then append one result per call, and
+        // loop so the model can use them. Prompt-injection templates ignore
+        // `tool_calls`/`role:"tool"` structure, so in that mode the call and its
+        // results are replayed as plain text the template will actually render.
+        if prompt_tool_mode {
+            messages.push(json!({ "role": "assistant", "content": content }));
+        } else {
+            let assistant_calls: Vec<Value> = platform_calls
+                .iter()
+                .map(|(c, _)| c.to_request_value())
+                .chain(builtin.iter().map(|c| c.to_request_value()))
+                .collect();
+            messages.push(json!({ "role": "assistant", "content": "", "tool_calls": assistant_calls }));
+        }
         for (call, tool) in &platform_calls {
             let invocation_id = Uuid::new_v4().to_string();
             let _ = tx.send(StreamDelta::Tool(call.name.clone(), call.arguments.to_string()));
@@ -366,7 +473,7 @@ pub async fn process(state: &Arc<AppState>, pending: ChatPending) -> Result<()> 
             if let Some(a) = activity {
                 tool_activity.push(a);
             }
-            messages.push(json!({ "role": "tool", "tool_name": call.name, "content": result_text }));
+            push_tool_result(&mut messages, prompt_tool_mode, &call.name, &result_text);
         }
         for call in &builtin {
             let _ = tx.send(StreamDelta::Tool(call.name.clone(), call.arguments.to_string()));
@@ -375,11 +482,11 @@ pub async fn process(state: &Arc<AppState>, pending: ChatPending) -> Result<()> 
             if let Some(a) = activity {
                 tool_activity.push(a);
             }
-            messages.push(json!({ "role": "tool", "tool_name": call.name, "content": result_text }));
+            push_tool_result(&mut messages, prompt_tool_mode, &call.name, &result_text);
         }
         // Hit the round cap without a final answer: persist what we have.
         if round == MAX_TOOL_ROUNDS - 1 {
-            final_content = content;
+            final_content = finalize_content(prompt_tool_mode, content);
             final_thinking = thinking;
         }
     }

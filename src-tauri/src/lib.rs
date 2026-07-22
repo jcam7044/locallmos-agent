@@ -11,6 +11,8 @@
 mod chat;
 mod chat_store;
 mod config;
+mod hardware;
+mod hub;
 mod local_chat;
 mod monitor;
 mod realtime;
@@ -22,14 +24,14 @@ mod updater;
 mod worker;
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 
 use config::AgentConfig;
 use monitor::Monitor;
-use runtime::ollama::OllamaAdapter;
-use runtime::RuntimeAdapter;
+use runtime::{ModelLoadSettings, Runtime};
 use serde_json::{json, Value};
 use settings::Settings;
 use status::AgentStatus;
@@ -45,7 +47,8 @@ pub struct AppState {
     pub supabase: Supabase,
     pub config: Mutex<AgentConfig>,
     pub status: Mutex<AgentStatus>,
-    pub ollama: OllamaAdapter,
+    /// The active local LLM runtime (Ollama or llama.cpp), chosen at startup.
+    pub runtime: Runtime,
     pub monitor: Mutex<Monitor>,
     pub realtime: Arc<realtime::RealtimeHandle>,
     /// In-flight chat turns → cancel flag, for stop-generation.
@@ -54,6 +57,37 @@ pub struct AppState {
     pub chat_lock: Mutex<()>,
     /// Shared HTTP client, reused for the web_fetch tool (direct GET from the rig).
     pub http: reqwest::Client,
+    pub hub: Arc<hub::HubState>,
+}
+
+impl AppState {
+    pub(crate) async fn model_settings(
+        &self,
+        model: &str,
+    ) -> anyhow::Result<(String, ModelLoadSettings)> {
+        let key = self.runtime.canonical_model_id(model)?;
+        let settings = self
+            .config
+            .lock()
+            .await
+            .model_load_settings
+            .get(&key)
+            .cloned()
+            .unwrap_or_default();
+        Ok((key, settings))
+    }
+
+    pub(crate) async fn load_model_configured(
+        &self,
+        model: &str,
+        force_reload: bool,
+    ) -> anyhow::Result<()> {
+        let (_, settings) = self.model_settings(model).await?;
+        if force_reload && self.runtime.is_model_loaded(model).await {
+            self.runtime.unload_model(model).await?;
+        }
+        self.runtime.load_model_configured(model, &settings).await
+    }
 }
 
 fn build_state() -> Arc<AppState> {
@@ -76,19 +110,38 @@ fn build_state() -> Arc<AppState> {
         rig_name: cfg.rig_name.clone(),
         ..Default::default()
     };
-    let ollama = OllamaAdapter::new(http.clone());
+    // Runtime precedence: env `LOCALLMOS_RUNTIME` (installer/service-managed) wins,
+    // else the tray-GUI choice persisted in config, else the default.
+    let runtime_kind = std::env::var("LOCALLMOS_RUNTIME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| cfg.runtime.clone())
+        .unwrap_or_else(|| "ollama".into());
+    let runtime = Runtime::from_kind(http.clone(), &runtime_kind);
+    // One-shot hardware sanity check: warn if the provisioned llama.cpp backend
+    // looks wrong for the GPU we can see (the Unsloth detect_hardware() analog).
+    if runtime_kind == "llamacpp" {
+        if let Some(backend) = runtime::llama_server::active_backend() {
+            hardware::warn_on_mismatch(&backend);
+        }
+    }
+    let hub = Arc::new(hub::HubState::new(
+        http.clone(),
+        runtime::llamacpp_models_dir(),
+    ));
 
     Arc::new(AppState {
         settings,
         supabase,
         config: Mutex::new(cfg),
         status: Mutex::new(status),
-        ollama,
+        runtime,
         monitor: Mutex::new(Monitor::new()),
         realtime: Arc::new(realtime::RealtimeHandle::new()),
         cancels: Mutex::new(HashMap::new()),
         chat_lock: Mutex::new(()),
         http,
+        hub,
     })
 }
 
@@ -120,25 +173,43 @@ async fn enroll(
 /// Does not touch Supabase — works fully offline / unenrolled.
 #[tauri::command]
 async fn local_status(state: State<'_, Arc<AppState>>) -> Result<Value, String> {
-    let snap = state.ollama.snapshot().await;
+    let snap = state.runtime.snapshot().await;
+    let context_size = state.runtime.context_size().await;
     let telemetry = {
         let mut mon = state.monitor.lock().await;
         mon.sample().await
     };
+    let configured_runtime = state.config.lock().await.runtime.clone();
+    let llama_models_dir = runtime::llamacpp_models_dir();
+    let (models_disk_total, disk_available) = models_disk_space(&llama_models_dir);
     Ok(json!({
         "runtime": {
             "kind": snap.kind,
             "version": snap.version,
+            "backend": snap.backend,
             "state": snap.state,
             "endpoint": snap.endpoint,
+            "modelsDir": state.runtime.models_dir().or_else(|| Some(llama_models_dir.clone())),
+            "contextSize": context_size,
         },
+        "configuredRuntime": configured_runtime,
         "models": snap.models.iter().map(|m| json!({
+            "id": m.id,
             "name": m.name,
             "sizeBytes": m.size_bytes,
             "quantization": m.quantization,
             "loaded": m.loaded,
             "capabilities": m.capabilities,
+            "sourceRepo": m.source_repo,
+            "revision": m.revision,
+            "variantId": m.variant_id,
+            "files": m.files,
         })).collect::<Vec<_>>(),
+        "modelsStorage": {
+            "dir": llama_models_dir,
+            "availableBytes": disk_available,
+            "totalBytes": models_disk_total,
+        },
         "telemetry": {
             "cpuPct": telemetry.cpu_utilization_pct,
             "memoryUsedBytes": telemetry.memory_used_bytes,
@@ -148,16 +219,210 @@ async fn local_status(state: State<'_, Arc<AppState>>) -> Result<Value, String> 
     }))
 }
 
+fn models_disk_space(models_dir: &str) -> (Option<u64>, Option<u64>) {
+    let path = Path::new(models_dir);
+    let disks = sysinfo::Disks::new_with_refreshed_list();
+    disks
+        .iter()
+        .filter(|disk| path.starts_with(disk.mount_point()))
+        .max_by_key(|disk| disk.mount_point().components().count())
+        .map(|disk| (Some(disk.total_space()), Some(disk.available_space())))
+        .unwrap_or((None, None))
+}
+
+#[tauri::command]
+async fn hub_search_models(
+    state: State<'_, Arc<AppState>>,
+    query: String,
+    capability: String,
+    sort: String,
+    cursor: Option<String>,
+) -> Result<hub::HubModelPage, String> {
+    state.hub.search(&query, &capability, &sort, cursor.as_deref()).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn hub_get_model(
+    state: State<'_, Arc<AppState>>,
+    repo_id: String,
+) -> Result<hub::HubModelDetail, String> {
+    state.hub.detail(&repo_id).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn hub_get_author_avatars(
+    state: State<'_, Arc<AppState>>,
+    authors: Vec<String>,
+) -> Result<HashMap<String, String>, String> {
+    let authors: std::collections::HashSet<_> = authors.into_iter().take(50).collect();
+    let pairs = futures_util::future::join_all(authors.into_iter().map(|author| {
+        let hub = state.hub.clone();
+        async move {
+            let avatar = hub.author_avatar(&author).await.ok().flatten();
+            (author, avatar)
+        }
+    }))
+    .await;
+    Ok(pairs
+        .into_iter()
+        .filter_map(|(author, avatar)| avatar.map(|url| (author, url)))
+        .collect())
+}
+
+#[tauri::command]
+async fn hub_start_download(
+    app: tauri::AppHandle,
+    state: State<'_, Arc<AppState>>,
+    repo_id: String,
+    revision: String,
+    variant_id: String,
+) -> Result<hub::DownloadState, String> {
+    state.hub.start_download(app, repo_id, revision, variant_id).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn hub_list_downloads(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<hub::DownloadState>, String> {
+    Ok(state.hub.list_downloads().await)
+}
+
+#[tauri::command]
+async fn hub_cancel_download(
+    app: tauri::AppHandle,
+    state: State<'_, Arc<AppState>>,
+    id: String,
+) -> Result<hub::DownloadState, String> {
+    state.hub.cancel_download(&app, &id).await.map_err(|e| e.to_string())
+}
+
 /// Load/keep a model resident in the runtime.
 #[tauri::command]
 async fn load_model(state: State<'_, Arc<AppState>>, model: String) -> Result<(), String> {
-    state.ollama.load_model(&model).await.map_err(|e| e.to_string())
+    state.load_model_configured(&model, false).await.map_err(|e| e.to_string())?;
+    let mut config = state.config.lock().await;
+    if config.locally_ejected_model.is_some() {
+        config.locally_ejected_model = None;
+        config.save().map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Eject a resident model from memory while retaining its local files.
+#[tauri::command]
+async fn unload_model(state: State<'_, Arc<AppState>>, model: String) -> Result<(), String> {
+    state.runtime.unload_model(&model).await.map_err(|e| e.to_string())?;
+    let mut config = state.config.lock().await;
+    config.locally_ejected_model = Some(model);
+    config.save().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Delete a completed Hub download. Loaded models must be ejected first.
+#[tauri::command]
+async fn delete_local_model(state: State<'_, Arc<AppState>>, model_id: String) -> Result<(), String> {
+    if state.runtime.snapshot().await.models.iter().any(|model| model.id == model_id && model.loaded) {
+        return Err("eject this model before removing its files".into());
+    }
+    let key = state.runtime.canonical_model_id(&model_id).map_err(|error| error.to_string())?;
+    runtime::llama_server::delete_hub_model(&runtime::llamacpp_models_dir(), &model_id)
+        .map_err(|error| error.to_string())?;
+    let mut config = state.config.lock().await;
+    if config.model_load_settings.remove(&key).is_some() {
+        config.save().map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn get_model_load_settings(
+    state: State<'_, Arc<AppState>>,
+    model_id: String,
+) -> Result<ModelLoadSettings, String> {
+    if state.runtime.kind() != "llamacpp" {
+        return Err("model load settings are only available for llama.cpp".into());
+    }
+    state
+        .model_settings(&model_id)
+        .await
+        .map(|(_, settings)| settings)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn save_model_load_settings(
+    state: State<'_, Arc<AppState>>,
+    model_id: String,
+    settings: ModelLoadSettings,
+    load_now: bool,
+) -> Result<(), String> {
+    if state.runtime.kind() != "llamacpp" {
+        return Err("model load settings are only available for llama.cpp".into());
+    }
+    settings.validate().map_err(|error| error.to_string())?;
+    let key = state.runtime.canonical_model_id(&model_id).map_err(|error| error.to_string())?;
+    {
+        let mut config = state.config.lock().await;
+        if settings.is_recommended() {
+            config.model_load_settings.remove(&key);
+        } else {
+            config.model_load_settings.insert(key, settings);
+        }
+        config.save().map_err(|error| error.to_string())?;
+    }
+    if load_now {
+        state
+            .load_model_configured(&model_id, true)
+            .await
+            .map_err(|error| format!("settings were saved, but the model failed to load: {error}"))?;
+        let mut config = state.config.lock().await;
+        if config.locally_ejected_model.take().is_some() {
+            config.save().map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(())
 }
 
 /// Restart the local runtime service.
 #[tauri::command]
 async fn restart_runtime(state: State<'_, Arc<AppState>>) -> Result<(), String> {
-    state.ollama.restart().await.map_err(|e| e.to_string())
+    state.runtime.restart().await.map_err(|e| e.to_string())
+}
+
+/// Persist the user's local-runtime choice ("ollama" | "llamacpp"). Takes effect
+/// on the next launch (the active `Runtime` is built at startup); the GUI prompts
+/// for a restart. No-op vs. env: if `LOCALLMOS_RUNTIME` is set it still wins.
+#[tauri::command]
+async fn set_runtime(state: State<'_, Arc<AppState>>, kind: String) -> Result<(), String> {
+    if kind != "ollama" && kind != "llamacpp" {
+        return Err(format!("unknown runtime: {kind}"));
+    }
+    let mut cfg = state.config.lock().await;
+    cfg.runtime = Some(kind);
+    cfg.save().map_err(|e| e.to_string())
+}
+
+/// Open the current runtime's models directory in the OS file manager (llama.cpp
+/// only — Ollama manages its own store).
+#[tauri::command]
+async fn open_models_dir(state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    let dir = state
+        .runtime
+        .models_dir()
+        .ok_or("this runtime has no models directory")?;
+    std::fs::create_dir_all(&dir).ok();
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else if cfg!(target_os = "windows") {
+        "explorer"
+    } else {
+        "xdg-open"
+    };
+    std::process::Command::new(opener)
+        .arg(&dir)
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// Run one persisted local chat turn. Deltas stream as `local-chat` events
@@ -434,7 +699,19 @@ fn run_gui() {
             enroll,
             local_status,
             load_model,
+            get_model_load_settings,
+            save_model_load_settings,
+            unload_model,
+            delete_local_model,
             restart_runtime,
+            set_runtime,
+            open_models_dir,
+            hub_search_models,
+            hub_get_model,
+            hub_get_author_avatars,
+            hub_start_download,
+            hub_list_downloads,
+            hub_cancel_download,
             local_chat_send,
             local_chat_cancel,
             local_update,

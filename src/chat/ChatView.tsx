@@ -33,10 +33,12 @@ export function ChatView({
   models,
   running,
   enrolled,
+  runtimeKind,
 }: {
   models: LocalModel[];
   running: boolean;
   enrolled: boolean;
+  runtimeKind: string;
 }) {
   const [sessions, setSessions] = useState<SessionMeta[]>([]);
   const [active, setActive] = useState<ChatSession | null>(null);
@@ -47,7 +49,7 @@ export function ChatView({
   const activeRequest = useRef<string | null>(null);
   const saveTimer = useRef<number | undefined>(undefined);
 
-  const defaultModel = () => (models.find((m) => m.loaded) ?? models[0])?.name ?? "";
+  const defaultModel = () => (models.find((m) => m.loaded) ?? models[0])?.id ?? "";
 
   const refreshList = async () => {
     try {
@@ -120,7 +122,7 @@ export function ChatView({
     }, 400);
   };
 
-  const selectedModel = models.find((m) => m.name === active?.model);
+  const selectedModel = models.find((m) => m.id === active?.model || m.name === active?.model);
   const canThink = selectedModel?.capabilities.includes("thinking") ?? false;
   const canVision = selectedModel?.capabilities.includes("vision") ?? false;
   const canWebTools = selectedModel?.capabilities.includes("tools") ?? false;
@@ -237,7 +239,9 @@ export function ChatView({
   if (!running) {
     return (
       <div style={{ ...card, marginTop: 12 }}>
-        <p style={{ ...label, margin: 0 }}>Start Ollama to chat with a local model.</p>
+        <p style={{ ...label, margin: 0 }}>
+          No local model running — load one from the Dashboard tab to chat.
+        </p>
       </div>
     );
   }
@@ -296,7 +300,7 @@ export function ChatView({
         </div>
 
         {settingsOpen && active && (
-          <SessionSettingsPanel settings={active.settings} onChange={patchSettings} />
+          <SessionSettingsPanel settings={active.settings} onChange={patchSettings} showContext={runtimeKind !== "llamacpp"} />
         )}
 
         <Conversation

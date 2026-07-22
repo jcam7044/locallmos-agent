@@ -16,7 +16,7 @@ export function ModelPicker({
   value: string;
   onChange: (model: string) => void;
 }) {
-  const selected = models.find((m) => m.name === value);
+  const selected = models.find((m) => m.id === value || m.name === value);
   return (
     <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
       <select
@@ -25,11 +25,14 @@ export function ModelPicker({
         style={{ ...inputStyle, marginTop: 0, width: "auto", maxWidth: 300 }}
       >
         {models.length === 0 && <option value="">No models installed</option>}
-        {value && !models.some((m) => m.name === value) && (
+        {value && selected && selected.id !== value && (
+          <option value={value}>{selected.name}</option>
+        )}
+        {value && !models.some((m) => m.id === value || m.name === value) && (
           <option value={value}>{value} (missing)</option>
         )}
         {models.map((m) => (
-          <option key={m.name} value={m.name}>
+          <option key={m.id} value={m.id}>
             {m.name}
             {m.loaded ? " (loaded)" : ""}
           </option>

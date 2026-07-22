@@ -6,6 +6,7 @@
 
 use crate::chat_store::{self, StoredMessage};
 use crate::runtime::ollama::{ChatDelta, ToolCall};
+use crate::runtime::GenerationMetrics;
 use crate::runtime::tools;
 use crate::AppState;
 use serde_json::{json, Value};
@@ -16,8 +17,6 @@ use tauri::Emitter;
 /// Event name for streamed deltas; payloads carry `requestId`/`sessionId` so a
 /// single frontend listener can route concurrent turns.
 const EVENT: &str = "local-chat";
-
-const MAX_TOOL_ROUNDS: usize = 5;
 
 fn emit(app: &tauri::AppHandle, request_id: &str, session_id: &str, mut payload: Value) {
     payload["requestId"] = json!(request_id);
@@ -103,11 +102,11 @@ pub async fn send(
     }
     let options = (!opts.is_empty()).then(|| Value::Object(opts));
 
-    let think = session.settings.think && state.ollama.model_supports_thinking(&model).await;
+    let think = session.settings.think && state.runtime.model_supports_thinking(&model).await;
 
     // Built-in web tools when enabled and the model can call tools. Unenrolled
     // rigs get web_fetch only — web_search relays through the cloud.
-    let tools_value = if session.settings.web_tools && state.ollama.model_supports_tools(&model).await
+    let tools_value = if session.settings.web_tools && state.runtime.model_supports_tools(&model).await
     {
         let enrolled = state.config.lock().await.is_enrolled();
         Some(if enrolled { tools::builtin_defs() } else { tools::fetch_only_defs() })
@@ -140,6 +139,8 @@ pub async fn send(
     assistant.thinking = (!turn.thinking.is_empty()).then_some(turn.thinking);
     assistant.prompt_tokens = (turn.prompt_tokens > 0).then_some(turn.prompt_tokens);
     assistant.completion_tokens = (turn.completion_tokens > 0).then_some(turn.completion_tokens);
+    assistant.generation_metrics = turn.generation_metrics;
+    assistant.tool_limit_reached = turn.tool_limit_reached;
     assistant.tool_activity =
         (!turn.tool_activity.is_empty()).then(|| Value::Array(turn.tool_activity));
     assistant.cancelled = cancel.load(Ordering::Relaxed);
@@ -163,6 +164,8 @@ struct TurnOutput {
     thinking: String,
     prompt_tokens: u32,
     completion_tokens: u32,
+    generation_metrics: Option<GenerationMetrics>,
+    tool_limit_reached: Option<u16>,
     tool_activity: Vec<Value>,
 }
 
@@ -179,27 +182,34 @@ async fn run_turn(
     options: Option<Value>,
     cancel: Arc<AtomicBool>,
 ) -> anyhow::Result<TurnOutput> {
+    let (_, load_settings) = state.model_settings(model).await?;
+    let tool_call_limit = load_settings.tool_call_limit();
     let mut out = TurnOutput {
         content: String::new(),
         thinking: String::new(),
         prompt_tokens: 0,
         completion_tokens: 0,
+        generation_metrics: None,
+        tool_limit_reached: None,
         tool_activity: Vec::new(),
     };
+    let mut executed_tool_calls = 0usize;
+    let mut synthesis_only = false;
 
-    for round in 0..MAX_TOOL_ROUNDS {
+    loop {
         let round_out = {
             let app = app.clone();
             let request_id = request_id.to_string();
             let session_id = session_id.to_string();
             state
-                .ollama
+                .runtime
                 .chat_stream(
                     model,
                     Value::Array(messages.clone()),
                     think,
-                    tools_value.as_ref(),
+                    if synthesis_only { None } else { tools_value.as_ref() },
                     options.as_ref(),
+                    &load_settings,
                     cancel.clone(),
                     move |delta| match delta {
                         ChatDelta::Content(s) => emit(
@@ -226,6 +236,17 @@ async fn run_turn(
         if round_out.tool_calls.is_empty() || cancel.load(Ordering::Relaxed) {
             out.content = round_out.content;
             out.thinking = round_out.thinking;
+            out.generation_metrics = round_out.generation_metrics;
+            return Ok(out);
+        }
+
+        // The reserve pass is deliberately tool-disabled. Native tool calling
+        // should make this unreachable, but returning here prevents a malformed
+        // provider response from creating an unbounded loop.
+        if synthesis_only {
+            out.content = round_out.content;
+            out.thinking = round_out.thinking;
+            out.generation_metrics = round_out.generation_metrics;
             return Ok(out);
         }
 
@@ -233,16 +254,29 @@ async fn run_turn(
         // tool result per call, and loop so the model can use them.
         let calls: Vec<ToolCall> =
             round_out.tool_calls.into_iter().filter(|c| tools::is_builtin(&c.name)).collect();
+        if calls.is_empty() {
+            return Err(anyhow::anyhow!("model requested an unsupported tool"));
+        }
         let assistant_calls: Vec<Value> = calls.iter().map(|c| c.to_request_value()).collect();
         messages.push(json!({ "role": "assistant", "content": "", "tool_calls": assistant_calls }));
-        for call in &calls {
+        let remaining = tool_call_limit.saturating_sub(executed_tool_calls);
+        for (index, call) in calls.iter().enumerate() {
             emit(
                 app,
                 request_id,
                 session_id,
                 json!({ "type": "tool", "name": call.name, "arguments": call.arguments.to_string() }),
             );
-            let (result_text, activity, summary) = run_builtin(state, call).await;
+            let (result_text, activity, summary) = if index < remaining {
+                executed_tool_calls += 1;
+                run_builtin(state, call).await
+            } else {
+                (
+                    "Tool call was not run because the maximum tool count for this message was reached. Use the completed tool results to answer the user.".into(),
+                    None,
+                    "not run: maximum tool count reached".into(),
+                )
+            };
             emit(
                 app,
                 request_id,
@@ -255,13 +289,17 @@ async fn run_turn(
             messages.push(json!({ "role": "tool", "tool_name": call.name, "content": result_text }));
         }
 
-        // Hit the round cap without a final answer: return what we have.
-        if round == MAX_TOOL_ROUNDS - 1 {
-            out.content = round_out.content;
-            out.thinking = round_out.thinking;
+        if calls.len() >= remaining {
+            out.tool_limit_reached = u16::try_from(tool_call_limit).ok();
+            synthesis_only = true;
+            // Reserve one final, tool-disabled request so a model that used its
+            // full budget still returns an answer instead of an empty tool call.
+            messages.push(json!({
+                "role": "system",
+                "content": "The maximum tool call count for this message has been reached. Use the completed results above to provide the final answer now. Do not request more tools."
+            }));
         }
     }
-    Ok(out)
 }
 
 /// Execute a built-in tool for a local turn. Like `chat::run_builtin`, errors are

@@ -3,7 +3,10 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
+
+use crate::runtime::ModelLoadSettings;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct AgentConfig {
@@ -15,6 +18,20 @@ pub struct AgentConfig {
     /// Unix seconds at which `token` expires.
     pub token_expires_at: Option<i64>,
     pub rig_name: Option<String>,
+    /// User-selected local runtime ("ollama" | "llamacpp"). Chosen from the tray
+    /// GUI; consulted at startup unless `LOCALLMOS_RUNTIME` is set (env wins, for
+    /// installer/service-managed rigs). `None` → default ("ollama").
+    #[serde(default)]
+    pub runtime: Option<String>,
+    /// A model explicitly ejected from the local UI. While the cloud still
+    /// requests this same model, reconciliation leaves it unloaded. A changed
+    /// desired model (or an explicit local load) clears this override.
+    #[serde(default)]
+    pub locally_ejected_model: Option<String>,
+    /// Per-GGUF llama.cpp launch overrides. Keys are canonical paths relative to
+    /// the configured models directory, so cloud aliases and local IDs converge.
+    #[serde(default)]
+    pub model_load_settings: BTreeMap<String, ModelLoadSettings>,
 }
 
 /// Resolved agent config dir (credentials, chat sessions, …), created on demand.
@@ -56,5 +73,36 @@ impl AgentConfig {
         let path = Self::path()?;
         std::fs::write(path, serde_json::to_string_pretty(self)?)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn older_config_without_model_settings_remains_compatible() {
+        let config: AgentConfig = serde_json::from_str(r#"{"rig_name":"old rig"}"#).unwrap();
+        assert_eq!(config.rig_name.as_deref(), Some("old rig"));
+        assert!(config.model_load_settings.is_empty());
+    }
+
+    #[test]
+    fn model_settings_round_trip_by_canonical_key() {
+        let mut config = AgentConfig::default();
+        config.model_load_settings.insert(
+            "huggingface/owner/model/model-Q4_K_M.gguf".into(),
+            ModelLoadSettings {
+                context_size: Some(16384),
+                ..Default::default()
+            },
+        );
+        let json = serde_json::to_string(&config).unwrap();
+        let restored: AgentConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            restored.model_load_settings["huggingface/owner/model/model-Q4_K_M.gguf"]
+                .context_size,
+            Some(16384)
+        );
     }
 }

@@ -1,6 +1,9 @@
 //! Ollama adapter over its local HTTP API (default http://127.0.0.1:11434).
 
 use super::{ModelInfo, RuntimeAdapter, RuntimeSnapshot};
+// Shared streaming types now live in `runtime::mod`; re-export so existing
+// `crate::runtime::ollama::{ChatDelta, ChatOutput, ToolCall}` imports keep working.
+pub use super::{ChatDelta, ChatOutput, ToolCall};
 use anyhow::{anyhow, Result};
 use futures_util::StreamExt;
 use serde::Deserialize;
@@ -21,6 +24,12 @@ pub struct OllamaAdapter {
     /// Per-model capabilities from `/api/show`, cached so we don't re-query on
     /// every telemetry snapshot (model metadata rarely changes).
     caps_cache: Mutex<HashMap<String, Vec<String>>>,
+    /// Per-model: does the chat template actually render `.Tools`? Cached like
+    /// `caps_cache`. This is the ground truth for native tool-calling — a model
+    /// can advertise the "tools" capability yet ship a template (e.g. a bare
+    /// `{{ .Prompt }}`) that never injects the tool schema, in which case the
+    /// agent must fall back to prompt-injected tools.
+    tool_template_cache: Mutex<HashMap<String, bool>>,
 }
 
 #[derive(Deserialize)]
@@ -71,6 +80,7 @@ impl OllamaAdapter {
             http,
             keep_alive,
             caps_cache: Mutex::new(HashMap::new()),
+            tool_template_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -121,6 +131,50 @@ impl OllamaAdapter {
     /// capabilities). Used to decide whether to advertise tools for a turn.
     pub async fn model_supports_tools(&self, model: &str) -> bool {
         self.capabilities(model).await.iter().any(|c| c == "tools")
+    }
+
+    /// Whether `model`'s chat template actually renders `.Tools` — i.e. Ollama
+    /// will inject the tool schema and parse native `tool_calls`. Unlike
+    /// `model_supports_tools` (which trusts the advertised capability), this
+    /// inspects the template itself, so a model with a stripped/passthrough
+    /// template is correctly treated as *not* natively tool-capable and routed
+    /// through prompt-injected tools instead. Cached, best-effort (unreachable
+    /// Ollama returns false → the safe prompt-injection path).
+    pub async fn template_supports_tools(&self, model: &str) -> bool {
+        if let Some(v) = self.tool_template_cache.lock().await.get(model) {
+            return *v;
+        }
+        #[derive(Deserialize)]
+        struct ShowResp {
+            #[serde(default)]
+            template: String,
+        }
+        let template = match self
+            .http
+            .post(format!("{}/api/show", self.base))
+            .json(&serde_json::json!({ "model": model }))
+            .send()
+            .await
+        {
+            Ok(resp) => resp
+                .json::<ShowResp>()
+                .await
+                .map(|s| s.template)
+                .unwrap_or_default(),
+            // Don't cache a transient failure; retry on the next turn.
+            Err(_) => return false,
+        };
+        if template.is_empty() {
+            return false;
+        }
+        // Go-template field access for the tool list, e.g. `{{ .Tools }}` or
+        // `range .Tools`. Whitespace-insensitive: match the `.Tools` selector.
+        let supported = template.contains(".Tools");
+        self.tool_template_cache
+            .lock()
+            .await
+            .insert(model.to_string(), supported);
+        supported
     }
 
     /// Whether `model` advertises reasoning ("thinking") support.
@@ -224,6 +278,7 @@ impl OllamaAdapter {
                     thinking,
                     prompt_tokens: None,
                     completion_tokens: None,
+                    generation_metrics: None,
                     tool_calls,
                 });
             }
@@ -281,6 +336,7 @@ impl OllamaAdapter {
                         thinking,
                         prompt_tokens,
                         completion_tokens,
+                        generation_metrics: None,
                         tool_calls,
                     });
                 }
@@ -291,43 +347,10 @@ impl OllamaAdapter {
             thinking,
             prompt_tokens: None,
             completion_tokens: None,
+            generation_metrics: None,
             tool_calls,
         })
     }
-}
-
-/// A streamed delta from a chat turn — reasoning ("thinking") or answer content.
-pub enum ChatDelta<'a> {
-    Content(&'a str),
-    Thinking(&'a str),
-}
-
-/// A tool call the model requested during a round. `arguments` is Ollama's parsed
-/// argument object; `name` is the function name.
-#[derive(Clone, Debug)]
-pub struct ToolCall {
-    pub name: String,
-    pub arguments: Value,
-}
-
-impl ToolCall {
-    /// Rebuild the tool_call object to echo back in the assistant message that
-    /// precedes the tool results (Ollama request format).
-    pub fn to_request_value(&self) -> Value {
-        serde_json::json!({ "function": { "name": self.name, "arguments": self.arguments } })
-    }
-}
-
-/// The assembled result of a chat turn.
-pub struct ChatOutput {
-    pub content: String,
-    pub thinking: String,
-    /// Ollama token counts from the final `done` line; `None` if the turn was
-    /// cancelled or the stream ended without one.
-    pub prompt_tokens: Option<u32>,
-    pub completion_tokens: Option<u32>,
-    /// Tool calls the model requested this round (empty when it answered directly).
-    pub tool_calls: Vec<ToolCall>,
 }
 
 impl RuntimeAdapter for OllamaAdapter {
@@ -342,6 +365,7 @@ impl RuntimeAdapter for OllamaAdapter {
             return RuntimeSnapshot {
                 kind: "ollama".into(),
                 version: None,
+                backend: None,
                 state: "stopped".into(),
                 endpoint: Some(self.base.clone()),
                 models: vec![],
@@ -356,11 +380,16 @@ impl RuntimeAdapter for OllamaAdapter {
                     let is_loaded = loaded.contains(&m.name);
                     let capabilities = self.capabilities(&m.name).await;
                     models.push(ModelInfo {
+                        id: m.name.clone(),
                         quantization: m.details.and_then(|d| d.quantization_level),
                         size_bytes: m.size,
                         loaded: is_loaded,
                         capabilities,
                         name: m.name,
+                        source_repo: None,
+                        revision: None,
+                        variant_id: None,
+                        files: Vec::new(),
                     });
                 }
             }
@@ -369,6 +398,7 @@ impl RuntimeAdapter for OllamaAdapter {
         RuntimeSnapshot {
             kind: "ollama".into(),
             version,
+            backend: None,
             state: "running".into(),
             endpoint: Some(self.base.clone()),
             models,
@@ -387,6 +417,22 @@ impl RuntimeAdapter for OllamaAdapter {
             Ok(())
         } else {
             Err(anyhow!("ollama load_model failed: HTTP {}", resp.status()))
+        }
+    }
+
+    async fn unload_model(&self, model: &str) -> Result<()> {
+        // Ollama unloads a resident model when a request sets keep_alive to 0.
+        // No model files are touched.
+        let resp = self
+            .http
+            .post(format!("{}/api/generate", self.base))
+            .json(&serde_json::json!({ "model": model, "keep_alive": 0, "stream": false }))
+            .send()
+            .await?;
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            Err(anyhow!("ollama unload_model failed: HTTP {}", resp.status()))
         }
     }
 

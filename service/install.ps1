@@ -31,7 +31,7 @@ param(
   # upstream ships a Windows CUDA build), so LlamaCppRepo defaults there.
   [string]$Runtime         = $(if ($env:LOCALLMOS_RUNTIME) { $env:LOCALLMOS_RUNTIME } else { "ollama" }),
   [string]$LlamaCppRepo    = $(if ($env:LOCALLMOS_LLAMACPP_REPO) { $env:LOCALLMOS_LLAMACPP_REPO } else { "ggml-org/llama.cpp" }),
-  [string]$LlamaCppVersion = $(if ($env:LOCALLMOS_LLAMACPP_VERSION) { $env:LOCALLMOS_LLAMACPP_VERSION } else { "b10068" }),
+  [string]$LlamaCppVersion = $(if ($env:LOCALLMOS_LLAMACPP_VERSION) { $env:LOCALLMOS_LLAMACPP_VERSION } else { "" }), # empty = resolve from manifest
   [string]$LlamaCppBackend = $(if ($env:LOCALLMOS_LLAMACPP_BACKEND) { $env:LOCALLMOS_LLAMACPP_BACKEND } else { "auto" }),
   [switch]$Service,
   [switch]$Headless,
@@ -40,6 +40,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 $mode = if ($Service -or $Headless) { "service" } else { "desktop" }
+$LlamaCppVersionFallback = "b10087"  # offline safety net if the version manifest can't be fetched
 
 $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
@@ -109,6 +110,21 @@ function Resolve-LlamaCppTag([string]$Version, [string]$Repo) {
       -Headers @{ "User-Agent" = "locallmos-installer" }
     return $rel.tag_name
   } catch { return "" }
+}
+
+# The blessed tag from the repo's service/LLAMACPP_VERSION manifest (first non-
+# blank, non-comment line), so bumping the default needs no installer redeploy.
+# Falls back to $Fallback when the manifest can't be fetched.
+function Resolve-PinnedLlamaCppVersion([string]$Repo, [string]$Ref, [string]$Fallback) {
+  try {
+    $txt = Invoke-RestMethod -Uri "https://raw.githubusercontent.com/$Repo/$Ref/service/LLAMACPP_VERSION" `
+      -Headers @{ "User-Agent" = "locallmos-installer" }
+    foreach ($line in ($txt -split "`n")) {
+      $t = $line.Trim()
+      if ($t -and -not $t.StartsWith("#")) { return $t }
+    }
+  } catch {}
+  return $Fallback
 }
 
 # Echo the hosted CUDA variant this rig's NVIDIA driver can load (mirrors the
@@ -295,6 +311,12 @@ function Install-LlamaCpp([string]$Backend, [string]$Tag, [string]$Repo, [string
 # startup task and the desktop launch.
 $llama = $null
 if ($Runtime -eq "llamacpp") {
+  # Fill the version from the repo manifest (then fallback) unless set explicitly.
+  if (-not $LlamaCppVersion) {
+    $libRef = if ($env:LOCALLMOS_LIB_REF) { $env:LOCALLMOS_LIB_REF } else { "main" }
+    $LlamaCppVersion = Resolve-PinnedLlamaCppVersion $Repo $libRef $LlamaCppVersionFallback
+    Write-Host "==> llama.cpp version $LlamaCppVersion"
+  }
   $llamaTag = Resolve-LlamaCppTag $LlamaCppVersion $LlamaCppRepo
   if (-not $llamaTag) { throw "could not resolve llama.cpp version" }
   $llama = Install-LlamaCpp $LlamaCppBackend $llamaTag $LlamaCppRepo $mode

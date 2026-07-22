@@ -74,8 +74,11 @@ The installer auto-detects your hardware and downloads the best prebuilt
 `/var/lib/locallmos/models`, and writes the `LOCALLMOS_RUNTIME=llamacpp` +
 `LOCALLMOS_LLAMACPP_*` vars (including the chosen `LOCALLMOS_LLAMACPP_BACKEND`)
 into `agent.env`. Drop a `.gguf` into the models directory, then select it in the
-dashboard. Pin a specific engine build with `--llamacpp-version bNNNNN` (default:
-a known-good pinned release; `latest` resolves the newest).
+dashboard. Pin a specific engine build with `--llamacpp-version bNNNNN`
+(`latest` resolves the newest upstream tag). When unset, the installer reads the
+blessed default from the repo's `service/LLAMACPP_VERSION` manifest (fetched from
+GitHub), falling back to a built-in tag if that can't be reached — so the default
+version can be rolled forward by editing one file, with no installer redeploy.
 
 **Backend detection** (a small integrated GPU never steers the choice — it must
 be a discrete card or a whitelisted unified-memory APU):

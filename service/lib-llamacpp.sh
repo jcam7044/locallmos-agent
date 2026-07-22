@@ -18,6 +18,13 @@ _llamacpp_need() {
   command -v "$1" >/dev/null 2>&1 || { echo "missing required tool: $1" >&2; exit 1; }
 }
 
+# Parse a version-manifest file (service/LLAMACPP_VERSION) from stdin: echo the
+# first non-blank, non-comment line, whitespace-stripped. Empty if none. awk (not
+# grep) so it always exits 0 — safe under `set -e`/`pipefail` in either installer.
+_llamacpp_parse_version() {
+  awk 'NF && $1 !~ /^#/ { gsub(/[ \t\r]/, "", $0); print; exit }'
+}
+
 # Resolve the release tag ("latest" → newest tag via the GitHub API; else as-is).
 resolve_llamacpp_tag() {
   if [ "$LLAMACPP_VERSION" != "latest" ]; then

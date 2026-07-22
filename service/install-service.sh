@@ -15,7 +15,8 @@ MODE="service"
 RUNTIME="${LOCALLMOS_RUNTIME:-ollama}"
 LLAMACPP_REPO="${LOCALLMOS_LLAMACPP_REPO:-ggml-org/llama.cpp}"           # vulkan/rocm/cpu/metal source
 LLAMACPP_CUDA_REPO="${LOCALLMOS_LLAMACPP_CUDA_REPO:-jcam7044/locallmos-agent}" # self-hosted Linux CUDA prebuilts
-LLAMACPP_VERSION="${LOCALLMOS_LLAMACPP_VERSION:-b10068}"
+LLAMACPP_VERSION="${LOCALLMOS_LLAMACPP_VERSION:-}"       # empty = resolve from the LLAMACPP_VERSION manifest
+LLAMACPP_VERSION_FALLBACK="b10087"                       # offline safety net only
 LLAMACPP_BACKEND="${LOCALLMOS_LLAMACPP_BACKEND:-auto}"   # auto|cuda|rocm|vulkan|cpu|metal (forced = no fallback)
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -93,6 +94,12 @@ fi
 # (rather than append-if-absent) so a reprovision to a new bin/backend can't leave
 # stale values behind.
 if [[ "$RUNTIME" == "llamacpp" ]]; then
+  # Fill the version from the local manifest (then fallback) unless set explicitly.
+  if [[ -z "$LLAMACPP_VERSION" ]]; then
+    LLAMACPP_VERSION="$(_llamacpp_parse_version < "$HERE/LLAMACPP_VERSION" 2>/dev/null || true)"
+    [[ -n "$LLAMACPP_VERSION" ]] || LLAMACPP_VERSION="$LLAMACPP_VERSION_FALLBACK"
+    echo "==> llama.cpp version $LLAMACPP_VERSION"
+  fi
   provision_llamacpp
   NEW_ENV="$(mktemp)"
   # Read the root-owned 0600 agent.env via sudo; the redirect writes the temp as

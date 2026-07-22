@@ -1,0 +1,12 @@
+# The blessed llama.cpp release tag the installers pin by default.
+#
+# Bump the tag below and push to `main` to roll a new default out to fresh
+# installs — the installers fetch THIS file from GitHub (raw.githubusercontent),
+# so no installer redeploy is needed. Before bumping, make sure the Linux CUDA
+# build for the tag exists in this repo's releases (push the tag to run
+# .github/workflows/llamacpp-prebuilt.yml).
+#
+# Precedence: an explicit --llamacpp-version / LOCALLMOS_LLAMACPP_VERSION always
+# wins over this file, and this file wins over the installers' built-in fallback
+# (used only when this file can't be fetched).
+b10087

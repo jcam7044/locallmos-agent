@@ -28,7 +28,10 @@ NO_LAUNCH="${LOCALLMOS_NO_LAUNCH:-0}"
 RUNTIME="${LOCALLMOS_RUNTIME:-ollama}"
 LLAMACPP_REPO="${LOCALLMOS_LLAMACPP_REPO:-ggml-org/llama.cpp}"           # vulkan/rocm/cpu/metal source
 LLAMACPP_CUDA_REPO="${LOCALLMOS_LLAMACPP_CUDA_REPO:-jcam7044/locallmos-agent}" # self-hosted Linux CUDA prebuilts
-LLAMACPP_VERSION="${LOCALLMOS_LLAMACPP_VERSION:-b10068}" # pinned release tag, or "latest"
+# Version resolution: an explicit env/flag wins; else the repo LLAMACPP_VERSION
+# manifest (fetched in the llamacpp block below); else the built-in fallback.
+LLAMACPP_VERSION="${LOCALLMOS_LLAMACPP_VERSION:-}"       # empty = resolve from manifest
+LLAMACPP_VERSION_FALLBACK="b10087"                       # offline safety net only
 LLAMACPP_BACKEND="${LOCALLMOS_LLAMACPP_BACKEND:-auto}"   # auto|cuda|rocm|vulkan|cpu|metal (forced = no fallback)
 # Production locallmos.com backend baked in as defaults (both are public values —
 # the anon key ships in the web bundle and is gated by RLS). Override with
@@ -298,16 +301,28 @@ desktop_service_notice() {
 # so they can't drift. From a checkout it's beside this script; when piped via
 # `curl | sh` there's no local copy, so fetch it from the repo.
 if [ "$RUNTIME" = "llamacpp" ]; then
+  LIB_REF="${LOCALLMOS_LIB_REF:-main}"
   _here="$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd)"
   if [ -n "$_here" ] && [ -f "$_here/lib-llamacpp.sh" ]; then
     . "$_here/lib-llamacpp.sh"
+    _manifest="$(cat "$_here/LLAMACPP_VERSION" 2>/dev/null || true)"
   else
-    LIB_REF="${LOCALLMOS_LIB_REF:-main}"
     echo "==> Fetching llama.cpp provisioning helper ($REPO@$LIB_REF)"
     curl -fsSL "https://raw.githubusercontent.com/$REPO/$LIB_REF/service/lib-llamacpp.sh" \
       -o "$TMP/lib-llamacpp.sh" \
       || { echo "could not fetch lib-llamacpp.sh" >&2; exit 1; }
     . "$TMP/lib-llamacpp.sh"
+    _manifest="$(curl -fsSL "https://raw.githubusercontent.com/$REPO/$LIB_REF/service/LLAMACPP_VERSION" 2>/dev/null || true)"
+  fi
+  # Fill the version from the manifest (then fallback) unless it was set explicitly.
+  if [ -z "$LLAMACPP_VERSION" ]; then
+    LLAMACPP_VERSION="$(printf '%s\n' "$_manifest" | _llamacpp_parse_version || true)"
+    if [ -n "$LLAMACPP_VERSION" ]; then
+      echo "==> llama.cpp version $LLAMACPP_VERSION (from repo manifest)"
+    else
+      LLAMACPP_VERSION="$LLAMACPP_VERSION_FALLBACK"
+      echo "==> llama.cpp version $LLAMACPP_VERSION (built-in fallback; manifest unavailable)"
+    fi
   fi
 fi
 

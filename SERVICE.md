@@ -60,13 +60,12 @@ installs the unit, enrolls, and enables the service.
 
 ### Choosing the runtime
 
-By default the agent drives **Ollama**. To run **llama.cpp** instead — which gives
-native, grammar-constrained tool calling (the same mechanism Codex/OpenCode rely
-on) — pass `--runtime llamacpp`:
+By default the installer provisions **llama.cpp**, with native,
+grammar-constrained tool calling (the same mechanism Codex/OpenCode rely on):
 
 ```bash
 curl -fsSL https://locallmos.com/install.sh | sh -s -- \
-  --service --runtime llamacpp --code <PAIRING_CODE> --name "Basement 3090"
+  --service --code <PAIRING_CODE> --name "Basement 3090"
 ```
 
 The installer auto-detects your hardware and downloads the best prebuilt
@@ -108,9 +107,10 @@ takes **no fallback** — if the forced backend can't be downloaded or fails its
 smoke test, the install hard-fails. Drop the flag to get auto-detection with the
 fallback chain back.
 
-**Windows** has the same flow via `install.ps1 -Runtime llamacpp` (backends
-`cuda|hip|vulkan|cpu`, `-LlamaCppBackend` to force). Windows CUDA/HIP prebuilts
-come from upstream, so no self-hosted repo is involved there.
+To use an existing **Ollama** installation instead, pass `--runtime ollama` (or
+`install.ps1 -Runtime ollama` on Windows). Windows llama.cpp supports the
+`cuda|hip|vulkan|cpu` backends; use `-LlamaCppBackend` to force one. Windows
+CUDA/HIP prebuilts come from upstream, so no self-hosted repo is involved there.
 
 Model launch settings are configured per GGUF in the tray app's **Models** tab.
 Leaving them on **Recommended** lets llama.cpp auto-fit context and GPU offload

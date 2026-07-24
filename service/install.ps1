@@ -10,9 +10,10 @@
 # signed-in user's config dir when -Code is given, then launch the tray GUI. Pass
 # -Service for a headless SYSTEM startup task instead.
 #
-# Pass -Runtime llamacpp to provision a hardware-appropriate llama-server
-# (cuda/hip/vulkan/cpu, auto-detected) instead of using Ollama; -LlamaCppBackend
-# forces a specific one (no fallback).
+# By default, the installer provisions a hardware-appropriate llama-server
+# (cuda/hip/vulkan/cpu, auto-detected). Pass -Runtime ollama to use an existing
+# Ollama installation instead; -LlamaCppBackend forces a specific llama.cpp
+# backend (no fallback).
 
 # Production locallmos.com backend is baked in as the default (both values are
 # public — the anon key ships in the web bundle and is gated by RLS). Override
@@ -25,11 +26,11 @@ param(
   [string]$Code        = "",
   [string]$SupabaseUrl = $(if ($env:LOCALLMOS_SUPABASE_URL) { $env:LOCALLMOS_SUPABASE_URL } else { "https://fvpjkpfshbvszbcknkqq.supabase.co" }),
   [string]$AnonKey     = $(if ($env:LOCALLMOS_SUPABASE_ANON_KEY) { $env:LOCALLMOS_SUPABASE_ANON_KEY } else { "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZ2cGprcGZzaGJ2c3piY2tua3FxIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODI5NzI3MjYsImV4cCI6MjA5ODU0ODcyNn0.b0FDzCAweH6VIwcumLKjNP959unJCUN_egZpb7KdCwg" }),
-  # Local LLM engine. "ollama" (default) leaves current installs unchanged;
-  # "llamacpp" provisions a hardware-appropriate llama-server. Windows CUDA/HIP/
+  # Local LLM engine. "llamacpp" (default) provisions a hardware-appropriate
+  # llama-server; "ollama" leaves current installs unchanged. Windows CUDA/HIP/
   # Vulkan/CPU prebuilts all come from upstream ggml-org/llama.cpp (unlike Linux,
   # upstream ships a Windows CUDA build), so LlamaCppRepo defaults there.
-  [string]$Runtime         = $(if ($env:LOCALLMOS_RUNTIME) { $env:LOCALLMOS_RUNTIME } else { "ollama" }),
+  [string]$Runtime         = $(if ($env:LOCALLMOS_RUNTIME) { $env:LOCALLMOS_RUNTIME } else { "llamacpp" }),
   [string]$LlamaCppRepo    = $(if ($env:LOCALLMOS_LLAMACPP_REPO) { $env:LOCALLMOS_LLAMACPP_REPO } else { "ggml-org/llama.cpp" }),
   [string]$LlamaCppVersion = $(if ($env:LOCALLMOS_LLAMACPP_VERSION) { $env:LOCALLMOS_LLAMACPP_VERSION } else { "" }), # empty = resolve from manifest
   [string]$LlamaCppBackend = $(if ($env:LOCALLMOS_LLAMACPP_BACKEND) { $env:LOCALLMOS_LLAMACPP_BACKEND } else { "auto" }),

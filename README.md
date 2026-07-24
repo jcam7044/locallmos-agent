@@ -41,7 +41,9 @@ iex ((curl.exe -fsSL https://locallmos.com/install.ps1) -join "`n")
 
 This installs a signed binary to `/usr/local/bin` on Linux, a `.app` bundle to
 `/Applications` on macOS, or `%ProgramFiles%\LocalLMOS` on Windows. It launches
-the tray app and — when you pass a pairing code — enrolls the rig.
+the tray app and — when you pass a pairing code — enrolls the rig. The installer
+provisions llama.cpp by default; pass `--runtime ollama` on Linux/macOS or
+`-Runtime ollama` on Windows to use an existing Ollama installation instead.
 Binaries are verified by SHA-256 and [minisign](https://jedisct1.github.io/minisign/)
 signature; the agent re-verifies every self-update against an embedded public key.
 

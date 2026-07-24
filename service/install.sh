@@ -22,10 +22,10 @@ NAME="$(hostname 2>/dev/null || echo my-rig)"
 CODE=""
 MODE="${LOCALLMOS_INSTALL_MODE:-desktop}"          # desktop or service
 NO_LAUNCH="${LOCALLMOS_NO_LAUNCH:-0}"
-# Which local LLM engine the rig runs. "ollama" (default) leaves current installs
-# unchanged; "llamacpp" provisions llama-server (native, grammar-constrained tool
-# calling) and points the agent at it.
-RUNTIME="${LOCALLMOS_RUNTIME:-ollama}"
+# Which local LLM engine the rig runs. "llamacpp" (default) provisions
+# llama-server (native, grammar-constrained tool calling) and points the agent at
+# it; pass --runtime ollama to use an existing Ollama installation instead.
+RUNTIME="${LOCALLMOS_RUNTIME:-llamacpp}"
 LLAMACPP_REPO="${LOCALLMOS_LLAMACPP_REPO:-ggml-org/llama.cpp}"           # vulkan/rocm/cpu/metal source
 LLAMACPP_CUDA_REPO="${LOCALLMOS_LLAMACPP_CUDA_REPO:-jcam7044/locallmos-agent}" # self-hosted Linux CUDA prebuilts
 # Version resolution: an explicit env/flag wins; else the repo LLAMACPP_VERSION

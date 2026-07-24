@@ -12,7 +12,7 @@ CODE=""
 NAME="$(hostname)"
 # Runtime selection, shared with install.sh (see service/lib-llamacpp.sh).
 MODE="service"
-RUNTIME="${LOCALLMOS_RUNTIME:-ollama}"
+RUNTIME="${LOCALLMOS_RUNTIME:-llamacpp}"
 LLAMACPP_REPO="${LOCALLMOS_LLAMACPP_REPO:-ggml-org/llama.cpp}"           # vulkan/rocm/cpu/metal source
 LLAMACPP_CUDA_REPO="${LOCALLMOS_LLAMACPP_CUDA_REPO:-jcam7044/locallmos-agent}" # self-hosted Linux CUDA prebuilts
 LLAMACPP_VERSION="${LOCALLMOS_LLAMACPP_VERSION:-}"       # empty = resolve from the LLAMACPP_VERSION manifest

@@ -102,6 +102,13 @@ export type DownloadState = {
   error: string | null;
 };
 
+export type OllamaPullProgress = {
+  model: string;
+  status: string;
+  completed: number | null;
+  total: number | null;
+};
+
 export type ModelLoadSettings = {
   contextSize: number | null;
   kvCacheType: "auto" | "f16" | "q8_0" | "q4_0";

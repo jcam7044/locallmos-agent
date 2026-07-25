@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { renderToStaticMarkup } from "react-dom/server";
-import type { HubModelDetail } from "../types";
-import { isRecommendedModelLoadSettings, isVariantOnDevice, ModelCardReadme, modelLoadSettingsError, modelLogo, recommendedModelLoadSettings, variantsBySizeAscending } from "./ModelsView";
+import type { HubModelDetail, LocalModel, LocalStatus } from "../types";
+import { isLocalModelRemovable, isRecommendedModelLoadSettings, isVariantOnDevice, ModelCardReadme, ModelsView, modelLoadSettingsError, modelLogo, recommendedModelLoadSettings, variantsBySizeAscending } from "./ModelsView";
 
 function detail(readmeMarkdown: string): HubModelDetail {
   return {
@@ -85,5 +85,31 @@ describe("model load settings", () => {
     expect(modelLoadSettingsError({ ...recommended, cpuThreads: 513 })).toContain("CPU threads");
     expect(modelLoadSettingsError({ ...recommended, maxToolCalls: 101 })).toContain("Max tool calls");
     expect(modelLoadSettingsError({ ...recommended, contextSize: 32768, cpuThreads: 12 })).toBeNull();
+  });
+});
+
+describe("Ollama model management", () => {
+  const ollamaModel: LocalModel = {
+    id: "qwen3:8b", name: "qwen3:8b", sizeBytes: 5_200_000_000, quantization: "Q4_K_M",
+    loaded: false, capabilities: ["tools"], sourceRepo: null, revision: null, variantId: null, files: [],
+  };
+
+  it("offers the Ollama pull experience when Ollama is active", () => {
+    const local: LocalStatus = {
+      runtime: { kind: "ollama", version: "0.9.0", backend: null, state: "running", endpoint: "http://127.0.0.1:11434", modelsDir: null, contextSize: 8192 },
+      configuredRuntime: "ollama",
+      modelsStorage: { dir: "/models", availableBytes: null, totalBytes: null },
+      models: [ollamaModel],
+      telemetry: { cpuPct: null, memoryUsedBytes: null, memoryTotalBytes: null, gpus: [] },
+    };
+    const html = renderToStaticMarkup(<ModelsView local={local} onChanged={() => undefined} />);
+    expect(html).toContain("Pull from the Ollama registry");
+    expect(html).toContain("On Device <span>1</span>");
+    expect(html).not.toContain("Popular GGUF Models");
+  });
+
+  it("allows runtime-managed Ollama models to be removed without Hub metadata", () => {
+    expect(isLocalModelRemovable(ollamaModel, true)).toBe(true);
+    expect(isLocalModelRemovable(ollamaModel, false)).toBe(false);
   });
 });

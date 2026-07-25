@@ -36,7 +36,7 @@ use serde_json::{json, Value};
 use settings::Settings;
 use status::AgentStatus;
 use supabase::Supabase;
-use tauri::State;
+use tauri::{Emitter, State};
 use tauri_plugin_autostart::MacosLauncher;
 use tokio::sync::Mutex;
 
@@ -325,13 +325,37 @@ async fn delete_local_model(state: State<'_, Arc<AppState>>, model_id: String) -
         return Err("eject this model before removing its files".into());
     }
     let key = state.runtime.canonical_model_id(&model_id).map_err(|error| error.to_string())?;
-    runtime::llama_server::delete_hub_model(&runtime::llamacpp_models_dir(), &model_id)
-        .map_err(|error| error.to_string())?;
+    if state.runtime.kind() == "ollama" {
+        state
+            .runtime
+            .delete_model(&model_id)
+            .await
+            .map_err(|error| error.to_string())?;
+    } else {
+        runtime::llama_server::delete_hub_model(&runtime::llamacpp_models_dir(), &model_id)
+            .map_err(|error| error.to_string())?;
+    }
     let mut config = state.config.lock().await;
     if config.model_load_settings.remove(&key).is_some() {
         config.save().map_err(|error| error.to_string())?;
     }
     Ok(())
+}
+
+/// Pull a registry model into Ollama's managed model store.
+#[tauri::command]
+async fn ollama_pull_model(
+    app: tauri::AppHandle,
+    state: State<'_, Arc<AppState>>,
+    model: String,
+) -> Result<(), String> {
+    state
+        .runtime
+        .pull_ollama_model(&model, |progress| {
+            let _ = app.emit("ollama-pull", progress);
+        })
+        .await
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -703,6 +727,7 @@ fn run_gui() {
             save_model_load_settings,
             unload_model,
             delete_local_model,
+            ollama_pull_model,
             restart_runtime,
             set_runtime,
             open_models_dir,

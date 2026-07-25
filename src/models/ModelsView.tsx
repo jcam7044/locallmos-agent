@@ -4,7 +4,7 @@ import ReactMarkdown from "react-markdown";
 import rehypeRaw from "rehype-raw";
 import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
 import remarkGfm from "remark-gfm";
-import { deleteLocalModel, getModelLoadSettings, hubCancelDownload, hubGetAuthorAvatars, hubGetModel, hubListDownloads, hubSearchModels, hubStartDownload, loadModel, saveModelLoadSettings, unloadModel } from "../api";
+import { deleteLocalModel, getModelLoadSettings, hubCancelDownload, hubGetAuthorAvatars, hubGetModel, hubListDownloads, hubSearchModels, hubStartDownload, loadModel, ollamaPullModel, saveModelLoadSettings, unloadModel } from "../api";
 import type {
   DownloadState,
   GgufVariant,
@@ -13,6 +13,7 @@ import type {
   LocalModel,
   LocalStatus,
   ModelLoadSettings,
+  OllamaPullProgress,
 } from "../types";
 import { assessFit, chooseVariant, formatBytes } from "./fit";
 import "./models.css";
@@ -52,6 +53,7 @@ export function ModelsView({ local, onChanged }: { local: LocalStatus | null; on
   const [modelAction, setModelAction] = useState<string | null>(null);
   const [settingsModel, setSettingsModel] = useState<LocalModel | null>(null);
   const request = useRef(0);
+  const isOllama = local?.runtime.kind === "ollama";
 
   useEffect(() => {
     const timer = window.setTimeout(() => setDebounced(query.trim()), 320);
@@ -90,7 +92,7 @@ export function ModelsView({ local, onChanged }: { local: LocalStatus | null; on
     }
   };
 
-  useEffect(() => { if (mode === "discover") void loadPage(); }, [debounced, capability, sort, mode]);
+  useEffect(() => { if (mode === "discover" && local && !isOllama) void loadPage(); }, [debounced, capability, sort, mode, local?.runtime.kind]);
 
   useEffect(() => {
     if (isWebPreview() || !models.length) return;
@@ -187,17 +189,17 @@ export function ModelsView({ local, onChanged }: { local: LocalStatus | null; on
       <header className="hub-header">
         <div>
           <h2>Models</h2>
-          <p>Discover GGUF models, compare quantizations, and download them for llama.cpp.</p>
+          <p>{isOllama ? "Pull, load, and remove models managed by Ollama." : "Discover GGUF models, compare quantizations, and download them for llama.cpp."}</p>
         </div>
         <HardwareChips local={local} />
       </header>
 
       <div className="hub-toolbar">
         <div className="hub-segmented" aria-label="Model source">
-          <button className={mode === "discover" ? "active" : ""} onClick={() => setMode("discover")}>Discover</button>
+          <button className={mode === "discover" ? "active" : ""} onClick={() => setMode("discover")}>{isOllama ? "Pull from Ollama" : "Discover"}</button>
           <button className={mode === "device" ? "active" : ""} onClick={() => setMode("device")}>On Device <span>{local?.models.length ?? 0}</span></button>
         </div>
-        {mode === "discover" && <>
+        {mode === "discover" && !isOllama && <>
           <label className="hub-search"><span>⌕</span><input aria-label="Search all models" placeholder="Search all models" value={query} onChange={(e) => setQuery(e.target.value)} /></label>
           <select aria-label="Capability" value={capability} onChange={(e) => setCapability(e.target.value as Capability)}>
             <option value="all">All capabilities</option><option value="text">Text</option><option value="vision">Vision</option>
@@ -208,9 +210,9 @@ export function ModelsView({ local, onChanged }: { local: LocalStatus | null; on
         </>}
       </div>
 
-      {error && <div className="hub-error"><span>{error}</span><button onClick={() => void loadPage()}>Retry</button></div>}
+      {error && <div className="hub-error"><span>{error}</span>{!isOllama && <button onClick={() => void loadPage()}>Retry</button>}</div>}
 
-      {mode === "discover" ? (
+      {mode === "discover" && isOllama ? <OllamaPull onChanged={onChanged} /> : mode === "discover" ? (
         <div className={`hub-workspace ${selectedId ? "has-selection" : ""}`}>
           <section className="hub-list-pane">
             <div className="hub-pane-title"><strong>{debounced ? `Results for “${debounced}”` : "Popular GGUF Models"}</strong><span>{models.length}</span></div>
@@ -246,10 +248,66 @@ export function ModelsView({ local, onChanged }: { local: LocalStatus | null; on
             ) : <Empty title="Select a model" body="Choose a repository to compare its available GGUF downloads." />}
           </section>
         </div>
-      ) : <OnDevice models={local?.models ?? []} onSelect={selectDevice} busy={modelAction} onLoad={load} onEject={eject} onRemove={remove} onSettings={local?.runtime.kind === "llamacpp" ? setSettingsModel : undefined} />}
+      ) : <OnDevice models={local?.models ?? []} runtimeKind={local?.runtime.kind} onSelect={selectDevice} busy={modelAction} onLoad={load} onEject={eject} onRemove={remove} onSettings={local?.runtime.kind === "llamacpp" ? setSettingsModel : undefined} />}
       {settingsModel && <ModelLoadSettingsDialog model={settingsModel} onClose={() => setSettingsModel(null)} onChanged={onChanged} />}
     </main>
   );
+}
+
+function OllamaPull({ onChanged }: { onChanged: () => void }) {
+  const [model, setModel] = useState("");
+  const [pulling, setPulling] = useState(false);
+  const [progress, setProgress] = useState<OllamaPullProgress | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    void listen<OllamaPullProgress>("ollama-pull", ({ payload }) => setProgress(payload))
+      .then((stop) => { unlisten = stop; });
+    return () => unlisten?.();
+  }, []);
+
+  const pull = async () => {
+    const name = model.trim();
+    if (!name || pulling) return;
+    setPulling(true);
+    setError(null);
+    setProgress({ model: name, status: "starting", completed: null, total: null });
+    try {
+      await ollamaPullModel(name);
+      setProgress({ model: name, status: "success", completed: 1, total: 1 });
+      setModel("");
+      await onChanged();
+    } catch (cause) {
+      setError(readError(cause));
+    } finally {
+      setPulling(false);
+    }
+  };
+  const percent = progress?.total && progress.completed != null
+    ? Math.min(100, Math.round(progress.completed / progress.total * 100))
+    : null;
+
+  return <section className="ollama-pull-panel">
+    <div className="ollama-pull-card">
+      <span className="ollama-mark">O</span>
+      <div>
+        <h3>Pull from the Ollama registry</h3>
+        <p>Enter a model name and optional tag, just as you would with <code>ollama pull</code>.</p>
+      </div>
+      <form onSubmit={(event) => { event.preventDefault(); void pull(); }}>
+        <input aria-label="Ollama model name" autoCapitalize="none" autoCorrect="off" spellCheck={false} placeholder="e.g. qwen3:8b" value={model} onChange={(event) => setModel(event.target.value)} disabled={pulling} />
+        <button type="submit" disabled={!model.trim() || pulling}>{pulling ? "Pulling…" : "Pull model"}</button>
+      </form>
+      <div className="ollama-examples"><span>Examples</span>{["qwen3:8b", "gemma3:4b", "llama3.2:3b"].map((name) => <button key={name} disabled={pulling} onClick={() => setModel(name)}>{name}</button>)}</div>
+      {progress && (pulling || progress.status === "success") && <div className="ollama-pull-progress">
+        <div><strong>{progress.model}</strong><span>{progress.status === "success" ? "Pulled" : progress.status}{percent != null && progress.status !== "success" ? ` · ${percent}%` : ""}</span></div>
+        <div className={percent == null && pulling ? "indeterminate" : ""}><i style={{ width: `${percent ?? (progress.status === "success" ? 100 : 30)}%` }} /></div>
+      </div>}
+      {error && <p className="hub-inline-error">{error}</p>}
+    </div>
+    <p className="ollama-pull-note">Ollama owns the model files and selects the appropriate format. Installed models appear under <b>On Device</b>.</p>
+  </section>;
 }
 
 function HardwareChips({ local }: { local: LocalStatus | null }) {
@@ -364,20 +422,20 @@ export function ModelCardReadme({ detail }: { detail: HubModelDetail }) {
   </article>;
 }
 
-function OnDevice({ models, onSelect, busy, onLoad, onEject, onRemove, onSettings }: { models: LocalModel[]; onSelect: (model: LocalModel) => void; busy: string | null; onLoad: (model: LocalModel) => Promise<void>; onEject: (model: LocalModel) => Promise<void>; onRemove: (model: LocalModel) => Promise<void>; onSettings?: (model: LocalModel) => void }) {
+function OnDevice({ models, runtimeKind, onSelect, busy, onLoad, onEject, onRemove, onSettings }: { models: LocalModel[]; runtimeKind?: string; onSelect: (model: LocalModel) => void; busy: string | null; onLoad: (model: LocalModel) => Promise<void>; onEject: (model: LocalModel) => Promise<void>; onRemove: (model: LocalModel) => Promise<void>; onSettings?: (model: LocalModel) => void }) {
   return <section className="hub-device">
     <div className="hub-pane-title"><strong>Models on this device</strong><span>{models.length}</span></div>
     {models.length ? <div className="hub-device-grid">{models.map((model) => <article key={model.id} className="hub-device-card">
       <button className="hub-device-select" onClick={() => onSelect(model)} disabled={!model.sourceRepo}>
-        <span className="hub-device-icon">◫</span><span><strong>{model.name}</strong><small>{model.sourceRepo ?? "Local GGUF"}</small><em>{model.quantization ?? "GGUF"} · {formatBytes(model.sizeBytes)}</em></span><b className={model.loaded ? "loaded" : ""}>{model.loaded ? "Loaded" : "On Device"}</b>
+        <span className="hub-device-icon">◫</span><span><strong>{model.name}</strong><small>{model.sourceRepo ?? (runtimeKind === "ollama" ? "Ollama" : "Local GGUF")}</small><em>{model.quantization ?? (runtimeKind === "ollama" ? "Managed model" : "GGUF")} · {formatBytes(model.sizeBytes)}</em></span><b className={model.loaded ? "loaded" : ""}>{model.loaded ? "Loaded" : "On Device"}</b>
       </button>
-      <ModelAction model={model} busy={busy === model.id} onLoad={onLoad} onEject={onEject} onRemove={onRemove} onSettings={onSettings} compact />
-    </article>)}</div> : <Empty title="No models on device" body="Download a GGUF model or place one in the llama.cpp models directory." />}
+      <ModelAction model={model} busy={busy === model.id} onLoad={onLoad} onEject={onEject} onRemove={onRemove} onSettings={onSettings} canRemove={runtimeKind === "ollama"} compact />
+    </article>)}</div> : <Empty title="No models on device" body={runtimeKind === "ollama" ? "Pull a model from Ollama to get started." : "Download a GGUF model or place one in the llama.cpp models directory."} />}
   </section>;
 }
 
-function ModelAction({ model, busy, onLoad, onEject, onRemove, onSettings, compact = false }: { model: LocalModel; busy: boolean; onLoad: (model: LocalModel) => Promise<void>; onEject: (model: LocalModel) => Promise<void>; onRemove: (model: LocalModel) => Promise<void>; onSettings?: (model: LocalModel) => void; compact?: boolean }) {
-  const removable = !!model.sourceRepo && !!model.revision && !!model.variantId;
+function ModelAction({ model, busy, onLoad, onEject, onRemove, onSettings, canRemove = false, compact = false }: { model: LocalModel; busy: boolean; onLoad: (model: LocalModel) => Promise<void>; onEject: (model: LocalModel) => Promise<void>; onRemove: (model: LocalModel) => Promise<void>; onSettings?: (model: LocalModel) => void; canRemove?: boolean; compact?: boolean }) {
+  const removable = isLocalModelRemovable(model, canRemove);
   return <div className={`hub-model-actions ${compact ? "compact" : ""}`}>
     <div className="hub-model-action-buttons">
       {model.loaded ? <button className="hub-eject-button" disabled={busy} onClick={() => void onEject(model)}>{busy ? "Ejecting…" : "Eject"}</button> : <button className="hub-load-button" disabled={busy} onClick={() => void onLoad(model)}>{busy ? "Loading…" : "Load"}</button>}
@@ -386,6 +444,10 @@ function ModelAction({ model, busy, onLoad, onEject, onRemove, onSettings, compa
     </div>
     <small>{model.loaded ? "Releases model memory; files stay on disk." : "Loads this model into memory."}</small>
   </div>;
+}
+
+export function isLocalModelRemovable(model: LocalModel, runtimeManaged = false) {
+  return runtimeManaged || (!!model.sourceRepo && !!model.revision && !!model.variantId);
 }
 
 export const recommendedModelLoadSettings = (): ModelLoadSettings => ({

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { renderToStaticMarkup } from "react-dom/server";
 import type { HubModelDetail, LocalModel, LocalStatus } from "../types";
-import { isLocalModelRemovable, isRecommendedModelLoadSettings, isVariantOnDevice, ModelCardReadme, ModelsView, modelLoadSettingsError, modelLogo, recommendedModelLoadSettings, variantsBySizeAscending } from "./ModelsView";
+import { isLocalModelRemovable, isRecommendedModelLoadSettings, isVariantOnDevice, localModelAction, ModelCardReadme, ModelsView, modelLoadSettingsError, modelLogo, recommendedModelLoadSettings, variantsBySizeAscending } from "./ModelsView";
 
 function detail(readmeMarkdown: string): HubModelDetail {
   return {
@@ -111,5 +111,13 @@ describe("Ollama model management", () => {
   it("allows runtime-managed Ollama models to be removed without Hub metadata", () => {
     expect(isLocalModelRemovable(ollamaModel, true)).toBe(true);
     expect(isLocalModelRemovable(ollamaModel, false)).toBe(false);
+  });
+});
+
+describe("model action labels", () => {
+  it("keeps the pending action attached to its model across a status refresh", () => {
+    expect(localModelAction({ id: "model-a", type: "load" }, "model-a")).toBe("load");
+    expect(localModelAction({ id: "model-a", type: "load" }, "model-b")).toBeNull();
+    expect(localModelAction({ id: "model-a", type: "eject" }, "model-a")).toBe("eject");
   });
 });

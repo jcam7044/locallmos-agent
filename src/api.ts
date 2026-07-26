@@ -4,9 +4,9 @@ import type {
   ApprovalPolicy,
   Attachment,
   ChatSession,
-  CodingMessage,
+  CodingSession,
   CodingSessionMeta,
-  CodingWorkspace,
+  CodingStoredMessage,
   LocalStatus,
   SessionMeta,
   SessionSettings,
@@ -73,32 +73,28 @@ export const chatDeleteSession = (id: string) => invoke("chat_delete_session", {
 export const chatUpdateSettings = (id: string, model: string, settings: SessionSettings) =>
   invoke("chat_update_settings", { id, model, settings });
 
-// --- Coding sessions --------------------------------------------------------
+// --- Local coding sessions (offline, on-disk; no cloud required) ------------
 
-export const codingRegisterWorkspace = (
-  name: string,
-  path: string,
+export const codingCreateSession = (
+  workspacePath: string,
+  model: string,
   approvalPolicy: ApprovalPolicy,
-) => invoke<{ workspaceId: string }>("coding_register_workspace", { name, path, approvalPolicy });
+) => invoke<CodingSession>("coding_local_create_session", { workspacePath, model, approvalPolicy });
 
-export const codingListWorkspaces = () => invoke<CodingWorkspace[]>("coding_list_workspaces");
+export const codingListSessions = () =>
+  invoke<CodingSessionMeta[]>("coding_local_list_sessions");
 
-export const codingStartSession = (workspaceId: string, model: string, prompt: string) =>
-  invoke<{ conversationId: string; assistantId: string }>("coding_start_session", {
-    workspaceId,
-    model,
-    prompt,
-  });
+export const codingGetSession = (id: string) =>
+  invoke<CodingSession>("coding_local_get_session", { id });
 
-export const codingSend = (conversationId: string, prompt: string, model?: string) =>
-  invoke<{ assistantId: string }>("coding_send", { conversationId, prompt, model });
+export const codingDeleteSession = (id: string) =>
+  invoke("coding_local_delete_session", { id });
 
-export const codingListSessions = () => invoke<CodingSessionMeta[]>("coding_list_sessions");
+export const codingSend = (sessionId: string, requestId: string, content: string) =>
+  invoke<CodingStoredMessage>("coding_local_send", { sessionId, requestId, content });
 
-export const codingGetSession = (conversationId: string) =>
-  invoke<CodingMessage[]>("coding_get_session", { conversationId });
+export const codingApprove = (invocationId: string, approved: boolean) =>
+  invoke("coding_local_approve", { invocationId, approved });
 
-export const codingApprove = (invocationId: string, decision: "approved" | "denied") =>
-  invoke("coding_approve", { invocationId, decision });
-
-export const codingCancel = (messageId: string) => invoke("coding_cancel", { messageId });
+export const codingCancel = (requestId: string) =>
+  invoke("coding_local_cancel", { requestId });

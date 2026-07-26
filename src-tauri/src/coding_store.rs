@@ -1,0 +1,180 @@
+//! Persistent local coding sessions: one JSON file per session under
+//! `<config_dir>/coding/{id}.json`. Mirrors `chat_store.rs` — the file is the
+//! source of truth, and the whole feature works fully offline (no cloud).
+
+use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::path::PathBuf;
+
+fn default_policy() -> String {
+    "approve_writes".to_string()
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodingSession {
+    pub id: String,
+    pub title: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub model: String,
+    /// Absolute, canonicalized workspace root on this machine.
+    pub workspace_root: String,
+    #[serde(default = "default_policy")]
+    pub approval_policy: String,
+    #[serde(default)]
+    pub messages: Vec<CodingStoredMessage>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodingStoredMessage {
+    pub role: String,
+    pub content: String,
+    #[serde(default)]
+    pub thinking: Option<String>,
+    /// Persisted record of tool runs this turn (summaries), for re-render.
+    #[serde(default)]
+    pub tool_activity: Option<Value>,
+    #[serde(default)]
+    pub cancelled: bool,
+    pub created_at: DateTime<Utc>,
+}
+
+impl CodingStoredMessage {
+    pub fn new(role: &str, content: String) -> Self {
+        Self {
+            role: role.to_string(),
+            content,
+            thinking: None,
+            tool_activity: None,
+            cancelled: false,
+            created_at: Utc::now(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodingSessionMeta {
+    pub id: String,
+    pub title: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub model: String,
+    pub workspace_root: String,
+    pub approval_policy: String,
+    pub message_count: usize,
+}
+
+impl CodingSession {
+    pub fn new(model: String, workspace_root: String, approval_policy: String) -> Self {
+        let now = Utc::now();
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            title: "New session".to_string(),
+            created_at: now,
+            updated_at: now,
+            model,
+            workspace_root,
+            approval_policy,
+            messages: Vec::new(),
+        }
+    }
+
+    pub fn meta(&self) -> CodingSessionMeta {
+        CodingSessionMeta {
+            id: self.id.clone(),
+            title: self.title.clone(),
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+            model: self.model.clone(),
+            workspace_root: self.workspace_root.clone(),
+            approval_policy: self.approval_policy.clone(),
+            message_count: self.messages.iter().filter(|m| m.role != "system").count(),
+        }
+    }
+}
+
+fn coding_dir() -> Result<PathBuf> {
+    let dir = crate::config::config_dir()?.join("coding");
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+fn session_path(id: &str) -> Result<PathBuf> {
+    if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        anyhow::bail!("invalid session id");
+    }
+    Ok(coding_dir()?.join(format!("{id}.json")))
+}
+
+pub fn list() -> Result<Vec<CodingSessionMeta>> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(coding_dir()?)? {
+        let path = entry?.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else { continue };
+        if let Ok(session) = serde_json::from_str::<CodingSession>(&text) {
+            out.push(session.meta());
+        }
+    }
+    out.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    Ok(out)
+}
+
+pub fn load(id: &str) -> Result<CodingSession> {
+    let text = std::fs::read_to_string(session_path(id)?).context("coding session not found")?;
+    Ok(serde_json::from_str(&text)?)
+}
+
+pub fn save(session: &CodingSession) -> Result<()> {
+    let path = session_path(&session.id)?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_string_pretty(session)?)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+pub fn delete(id: &str) -> Result<()> {
+    std::fs::remove_file(session_path(id)?)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn coding_session_roundtrip() {
+        let _lock = crate::config::TEST_CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("locallmos-coding-test-{}", uuid::Uuid::new_v4()));
+        std::env::set_var("LOCALLMOS_CONFIG_DIR", &dir);
+
+        let mut s = CodingSession::new("qwen2.5-coder".into(), "/tmp/repo".into(), "approve_writes".into());
+        s.messages.push(CodingStoredMessage::new("user", "add a test".into()));
+        save(&s).unwrap();
+
+        let loaded = load(&s.id).unwrap();
+        assert_eq!(loaded.workspace_root, "/tmp/repo");
+        assert_eq!(loaded.messages.len(), 1);
+
+        let metas = list().unwrap();
+        assert_eq!(metas.len(), 1);
+        assert_eq!(metas[0].message_count, 1);
+
+        delete(&s.id).unwrap();
+        assert!(list().unwrap().is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn rejects_bad_ids() {
+        assert!(session_path("../evil").is_err());
+        assert!(session_path("").is_err());
+    }
+}

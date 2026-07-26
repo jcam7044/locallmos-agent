@@ -59,6 +59,64 @@ pub struct ToolRun {
     pub activity: Option<Value>,
 }
 
+/// True for the coding tool function names the agent executes locally.
+pub fn is_known_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "read_file" | "list_dir" | "search" | "write_file" | "edit_file" | "run_command" | "git"
+    )
+}
+
+/// Ollama-style tool schemas for all coding tools, for the local (offline)
+/// engine which has no server-authored snapshot to draw from. Mirrors the
+/// `tool_catalog` rows in supabase migration 0036.
+pub fn tool_defs() -> Vec<Value> {
+    fn def(name: &str, description: &str, params: Value) -> Value {
+        serde_json::json!({
+            "type": "function",
+            "function": { "name": name, "description": description, "parameters": params },
+        })
+    }
+    let s = |t: &str| serde_json::json!({ "type": t });
+    vec![
+        def(
+            "read_file",
+            "Read a UTF-8 text file inside the workspace. Optionally limit to a line range.",
+            serde_json::json!({"type":"object","properties":{"path":s("string"),"start_line":s("integer"),"end_line":s("integer")},"required":["path"]}),
+        ),
+        def(
+            "list_dir",
+            "List files and subdirectories inside the workspace.",
+            serde_json::json!({"type":"object","properties":{"path":s("string")}}),
+        ),
+        def(
+            "search",
+            "Regex-search file contents in the workspace; returns matching lines with paths.",
+            serde_json::json!({"type":"object","properties":{"query":s("string"),"path":s("string"),"max_results":s("integer")},"required":["query"]}),
+        ),
+        def(
+            "write_file",
+            "Create or overwrite a file in the workspace with full content. Requires approval.",
+            serde_json::json!({"type":"object","properties":{"path":s("string"),"content":s("string")},"required":["path","content"]}),
+        ),
+        def(
+            "edit_file",
+            "Replace an exact substring in a workspace file. old_string must be unique unless replace_all. Requires approval.",
+            serde_json::json!({"type":"object","properties":{"path":s("string"),"old_string":s("string"),"new_string":s("string"),"replace_all":s("boolean")},"required":["path","old_string","new_string"]}),
+        ),
+        def(
+            "run_command",
+            "Run a shell command with the working directory pinned to the workspace root. Requires approval.",
+            serde_json::json!({"type":"object","properties":{"command":s("string")},"required":["command"]}),
+        ),
+        def(
+            "git",
+            "Run a git subcommand in the workspace. Read-only subcommands run without approval.",
+            serde_json::json!({"type":"object","properties":{"args":s("string")},"required":["args"]}),
+        ),
+    ]
+}
+
 /// If this call must be approved before it runs, return the human-readable
 /// preview (a diff or the command) to show the approver. `None` means run now.
 pub fn approval_preview(cx: &CodingContext, name: &str, args: &Value) -> Option<String> {

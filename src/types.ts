@@ -196,34 +196,41 @@ export type LocalChatEvent = { requestId: string; sessionId: string } & (
 
 export type ApprovalPolicy = "plan" | "approve_writes" | "auto";
 
-export type CodingWorkspace = {
-  id: string;
-  name: string;
-  root_path: string;
-  approval_policy: ApprovalPolicy;
-};
-
+// Local (offline) coding sessions — camelCase, mirror src-tauri/src/coding_store.rs.
 export type CodingSessionMeta = {
   id: string;
-  title: string | null;
-  model: string | null;
-  workspace_id: string | null;
-  updated_at: string;
+  title: string;
+  createdAt: string;
+  updatedAt: string;
+  model: string;
+  workspaceRoot: string;
+  approvalPolicy: ApprovalPolicy;
+  messageCount: number;
 };
 
-export type CodingMessage = {
-  id: string;
+export type CodingStoredMessage = {
   role: "system" | "user" | "assistant";
   content: string;
-  status: "pending" | "streaming" | "done" | "error";
   thinking: string | null;
-  tool_activity: unknown;
-  created_at: string;
+  toolActivity: unknown;
+  cancelled: boolean;
+  createdAt: string;
+};
+
+export type CodingSession = {
+  id: string;
+  title: string;
+  createdAt: string;
+  updatedAt: string;
+  model: string;
+  workspaceRoot: string;
+  approvalPolicy: ApprovalPolicy;
+  messages: CodingStoredMessage[];
 };
 
 /**
- * The `event` payload inside a Tauri "coding" event. Mirrors the coding subset
- * of the shared ChatStreamEvent union (packages/shared/src/chat.ts).
+ * The `event` payload inside a Tauri "local-coding" event. Mirrors the coding
+ * subset of the shared ChatStreamEvent union (packages/shared/src/chat.ts).
  */
 export type CodingStreamEvent =
   | { type: "loading"; model: string }
@@ -238,9 +245,9 @@ export type CodingStreamEvent =
   | { type: "done" }
   | { type: "error"; message: string };
 
-/** Envelope the agent emits on the Tauri "coding" event. */
+/** Envelope the agent emits on the Tauri "local-coding" event. */
 export type CodingEvent = {
-  conversationId: string;
+  sessionId: string;
   messageId: string;
   event: CodingStreamEvent;
 };

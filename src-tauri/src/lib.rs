@@ -11,7 +11,9 @@
 mod chat;
 mod chat_store;
 mod coding;
+mod coding_store;
 mod config;
+mod local_coding;
 mod hardware;
 mod hub;
 mod local_chat;
@@ -54,6 +56,9 @@ pub struct AppState {
     pub realtime: Arc<realtime::RealtimeHandle>,
     /// In-flight chat turns → cancel flag, for stop-generation.
     pub cancels: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    /// Pending local coding-tool approvals → decision sender. Resolved by the
+    /// `coding_local_approve` command (in-process; no cloud round-trip).
+    pub coding_approvals: Mutex<HashMap<String, tokio::sync::oneshot::Sender<bool>>>,
     /// Serializes chat-session file writes (save vs rename vs delete).
     pub chat_lock: Mutex<()>,
     /// Shared HTTP client, reused for the web_fetch tool (direct GET from the rig).
@@ -143,6 +148,7 @@ fn build_state() -> Arc<AppState> {
         monitor: Mutex::new(Monitor::new()),
         realtime: Arc::new(realtime::RealtimeHandle::new()),
         cancels: Mutex::new(HashMap::new()),
+        coding_approvals: Mutex::new(HashMap::new()),
         chat_lock: Mutex::new(()),
         http,
         hub,
@@ -666,6 +672,86 @@ async fn coding_cancel(state: State<'_, Arc<AppState>>, message_id: String) -> R
     Ok(())
 }
 
+// --- Local coding sessions (offline, on-disk; no cloud required) ------------
+
+/// Create an on-disk coding session bound to a workspace folder on this machine.
+/// The path is validated + canonicalized here (rejects a missing folder).
+#[tauri::command]
+async fn coding_local_create_session(
+    state: State<'_, Arc<AppState>>,
+    workspace_path: String,
+    model: String,
+    approval_policy: Option<String>,
+) -> Result<coding_store::CodingSession, String> {
+    let workspace = coding::Workspace::new(&workspace_path).map_err(|e| e.to_string())?;
+    let _guard = state.chat_lock.lock().await;
+    let session = coding_store::CodingSession::new(
+        model,
+        workspace.root_str(),
+        approval_policy.unwrap_or_else(|| "approve_writes".into()),
+    );
+    coding_store::save(&session).map_err(|e| e.to_string())?;
+    Ok(session)
+}
+
+#[tauri::command]
+async fn coding_local_list_sessions(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<coding_store::CodingSessionMeta>, String> {
+    let _guard = state.chat_lock.lock().await;
+    coding_store::list().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn coding_local_get_session(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+) -> Result<coding_store::CodingSession, String> {
+    let _guard = state.chat_lock.lock().await;
+    coding_store::load(&id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn coding_local_delete_session(state: State<'_, Arc<AppState>>, id: String) -> Result<(), String> {
+    let _guard = state.chat_lock.lock().await;
+    coding_store::delete(&id).map_err(|e| e.to_string())
+}
+
+/// Run one local coding turn. Deltas stream as `local-coding` events (carrying
+/// `sessionId`/`messageId`); the assistant message is returned once persisted.
+#[tauri::command]
+async fn coding_local_send(
+    app: tauri::AppHandle,
+    state: State<'_, Arc<AppState>>,
+    session_id: String,
+    request_id: String,
+    content: String,
+) -> Result<coding_store::CodingStoredMessage, String> {
+    local_coding::send(app, state.inner().clone(), session_id, request_id, content).await
+}
+
+/// Approve or deny a paused local coding tool call.
+#[tauri::command]
+async fn coding_local_approve(
+    state: State<'_, Arc<AppState>>,
+    invocation_id: String,
+    approved: bool,
+) -> Result<(), String> {
+    if let Some(tx) = state.coding_approvals.lock().await.remove(&invocation_id) {
+        let _ = tx.send(approved);
+    }
+    Ok(())
+}
+
+/// Stop an in-flight local coding turn (also releases a pending approval wait).
+#[tauri::command]
+async fn coding_local_cancel(state: State<'_, Arc<AppState>>, request_id: String) -> Result<(), String> {
+    if let Some(flag) = state.cancels.lock().await.get(&request_id) {
+        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    Ok(())
+}
+
 /// Check GitHub Releases directly (no account) and self-update if a newer version
 /// exists. Returns the new version when it updated, `None` when already current.
 #[tauri::command]
@@ -866,7 +952,14 @@ fn run_gui() {
             coding_list_sessions,
             coding_get_session,
             coding_approve,
-            coding_cancel
+            coding_cancel,
+            coding_local_create_session,
+            coding_local_list_sessions,
+            coding_local_get_session,
+            coding_local_delete_session,
+            coding_local_send,
+            coding_local_approve,
+            coding_local_cancel
         ])
         .run(tauri::generate_context!())
         .expect("error while running LocalLMOS agent");

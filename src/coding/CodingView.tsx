@@ -2,19 +2,13 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   codingApprove,
   codingCancel,
+  codingCreateSession,
+  codingDeleteSession,
   codingGetSession,
   codingListSessions,
-  codingListWorkspaces,
-  codingRegisterWorkspace,
   codingSend,
-  codingStartSession,
 } from "../api";
-import type {
-  ApprovalPolicy,
-  CodingMessage,
-  CodingSessionMeta,
-  CodingWorkspace,
-} from "../types";
+import type { ApprovalPolicy, CodingSessionMeta, CodingStoredMessage } from "../types";
 import { Markdown } from "../chat/Markdown";
 import { useCodingStream, type CodingLive, type CodingTrace } from "./useCodingStream";
 
@@ -27,33 +21,33 @@ const C = {
   muted: "#94a3b8",
 };
 
-export function CodingView({ models, enrolled }: { models: ModelOption[]; enrolled: boolean }) {
+const uuid = () =>
+  (crypto.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`);
+
+export function CodingView({ models }: { models: ModelOption[] }) {
   const [sessions, setSessions] = useState<CodingSessionMeta[]>([]);
-  const [workspaces, setWorkspaces] = useState<CodingWorkspace[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
-  const [messages, setMessages] = useState<CodingMessage[]>([]);
+  const [messages, setMessages] = useState<CodingStoredMessage[]>([]);
   const [model, setModel] = useState("");
   const [prompt, setPrompt] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const requestIdRef = useRef<string | null>(null);
   const { live, reset } = useCodingStream(activeId);
 
-  const refreshLists = useCallback(async () => {
-    if (!enrolled) return;
+  const refreshSessions = useCallback(async () => {
     try {
-      const [s, w] = await Promise.all([codingListSessions(), codingListWorkspaces()]);
+      const s = await codingListSessions();
       setSessions(Array.isArray(s) ? s : []);
-      setWorkspaces(Array.isArray(w) ? w : []);
     } catch (e) {
       setError(String(e));
     }
-  }, [enrolled]);
+  }, []);
 
   useEffect(() => {
-    void refreshLists();
-  }, [refreshLists]);
+    void refreshSessions();
+  }, [refreshSessions]);
 
-  // Default the model picker to a loaded model, else the first available.
   useEffect(() => {
     if (!model && models.length) {
       const def = models.find((m) => m.loaded) ?? models[0];
@@ -61,156 +55,138 @@ export function CodingView({ models, enrolled }: { models: ModelOption[]; enroll
     }
   }, [models, model]);
 
-  const loadMessages = useCallback(async (id: string) => {
+  const loadSession = useCallback(async (id: string) => {
     try {
-      const msgs = await codingGetSession(id);
-      setMessages(Array.isArray(msgs) ? msgs : []);
+      const session = await codingGetSession(id);
+      setMessages(Array.isArray(session?.messages) ? session.messages : []);
     } catch (e) {
       setError(String(e));
     }
   }, []);
 
   useEffect(() => {
-    if (activeId) void loadMessages(activeId);
+    if (activeId) void loadSession(activeId);
     else setMessages([]);
-  }, [activeId, loadMessages]);
+  }, [activeId, loadSession]);
 
-  // When a turn finishes, fold the live overlay into the persisted transcript.
+  // Fold the live overlay into the persisted transcript when a turn finishes.
   const prevStatus = useRef(live.status);
   useEffect(() => {
-    if (prevStatus.current !== "done" && live.status === "done" && activeId) {
-      void loadMessages(activeId);
-      void refreshLists();
+    if (prevStatus.current !== "done" && (live.status === "done" || live.status === "error")) {
+      if (activeId) void loadSession(activeId);
+      void refreshSessions();
     }
     prevStatus.current = live.status;
-  }, [live.status, activeId, loadMessages, refreshLists]);
+  }, [live.status, activeId, loadSession, refreshSessions]);
 
   const streaming = live.status === "loading" || live.status === "streaming" || live.approvals.length > 0;
 
-  async function onStart(workspaceId: string) {
-    if (!prompt.trim() || !model) return;
+  async function runTurn(sessionId: string, text: string) {
+    const requestId = uuid();
+    requestIdRef.current = requestId;
     setBusy(true);
     setError(null);
     try {
-      const { conversationId } = await codingStartSession(workspaceId, model, prompt.trim());
-      setPrompt("");
-      reset();
-      setActiveId(conversationId);
-      await refreshLists();
+      await codingSend(sessionId, requestId, text);
     } catch (e) {
       setError(String(e));
     } finally {
       setBusy(false);
+      requestIdRef.current = null;
     }
   }
 
   async function onSend() {
-    if (!activeId || !prompt.trim()) return;
+    if (!activeId || !prompt.trim() || streaming) return;
+    const text = prompt.trim();
+    setPrompt("");
+    setMessages((m) => [...m, optimisticUser(text)]);
+    await runTurn(activeId, text);
+  }
+
+  async function onStart(workspacePath: string, policy: ApprovalPolicy) {
+    if (!prompt.trim() || !model || !workspacePath.trim()) return;
+    const text = prompt.trim();
     setBusy(true);
     setError(null);
     try {
-      await codingSend(activeId, prompt.trim(), model || undefined);
+      const session = await codingCreateSession(workspacePath.trim(), model, policy);
       setPrompt("");
-      // Optimistically show the user's message; the stream fills in the reply.
-      setMessages((m) => [
-        ...m,
-        {
-          id: `local-${Date.now()}`,
-          role: "user",
-          content: prompt.trim(),
-          status: "done",
-          thinking: null,
-          tool_activity: null,
-          created_at: new Date().toISOString(),
-        },
-      ]);
+      reset();
+      setActiveId(session.id);
+      setMessages([optimisticUser(text)]);
+      await refreshSessions();
+      await runTurn(session.id, text);
     } catch (e) {
       setError(String(e));
-    } finally {
       setBusy(false);
     }
   }
 
-  async function decide(invocationId: string, decision: "approved" | "denied") {
+  async function decide(invocationId: string, approved: boolean) {
     try {
-      await codingApprove(invocationId, decision);
+      await codingApprove(invocationId, approved);
     } catch (e) {
       setError(String(e));
     }
   }
 
-  if (!enrolled) {
-    return (
-      <div style={{ padding: 24, color: C.muted, maxWidth: 520 }}>
-        <h2 style={{ color: "#e2e8f0", fontSize: 16 }}>Coding sessions</h2>
-        <p>
-          Coding sessions sync through the cloud so you can pick them up from the web. Connect this
-          rig from the <strong>Dashboard</strong> tab to get started.
-        </p>
-      </div>
-    );
+  async function onDelete(id: string) {
+    if (!confirm("Delete this coding session?")) return;
+    try {
+      await codingDeleteSession(id);
+      if (activeId === id) setActiveId(null);
+      await refreshSessions();
+    } catch (e) {
+      setError(String(e));
+    }
   }
 
   return (
     <div style={{ display: "flex", gap: 12, flex: 1, minHeight: 0, marginTop: 12 }}>
-      {/* Sidebar */}
       <aside style={{ width: 240, display: "flex", flexDirection: "column", gap: 8, borderRight: C.border, paddingRight: 12 }}>
         <button onClick={() => { setActiveId(null); reset(); }} style={btn(activeId === null)}>
           + New session
         </button>
         <div style={{ overflowY: "auto", display: "flex", flexDirection: "column", gap: 4 }}>
           {sessions.map((s) => (
-            <button key={s.id} onClick={() => setActiveId(s.id)} style={sessionBtn(activeId === s.id)}>
-              <div style={{ fontSize: 13, color: "#e2e8f0", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                {s.title || "Untitled session"}
-              </div>
-              <div style={{ fontSize: 11, color: C.muted }}>{s.model ?? ""}</div>
-            </button>
+            <div key={s.id} style={{ position: "relative" }}>
+              <button onClick={() => setActiveId(s.id)} style={sessionBtn(activeId === s.id)}>
+                <div style={{ fontSize: 13, color: "#e2e8f0", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                  {s.title || "Coding session"}
+                </div>
+                <div style={{ fontSize: 11, color: C.muted, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                  {folderName(s.workspaceRoot)} · {s.model}
+                </div>
+              </button>
+            </div>
           ))}
           {sessions.length === 0 && <p style={{ fontSize: 12, color: C.muted }}>No sessions yet.</p>}
         </div>
       </aside>
 
-      {/* Main */}
       <main style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column" }}>
         {error && <div style={{ color: "#f87171", fontSize: 12, marginBottom: 8 }}>{error}</div>}
 
         {activeId === null ? (
           <NewSession
-            workspaces={workspaces}
             models={models}
             model={model}
             setModel={setModel}
-            onRegister={async (name, path, policy) => {
-              setBusy(true);
-              setError(null);
-              try {
-                const { workspaceId } = await codingRegisterWorkspace(name, path, policy);
-                await refreshLists();
-                return workspaceId;
-              } catch (e) {
-                setError(String(e));
-                return null;
-              } finally {
-                setBusy(false);
-              }
-            }}
-            onStart={onStart}
             prompt={prompt}
             setPrompt={setPrompt}
             busy={busy}
+            onStart={onStart}
           />
         ) : (
           <>
+            <SessionHeader meta={sessions.find((s) => s.id === activeId)} onDelete={() => onDelete(activeId)} />
             <div style={{ flex: 1, overflowY: "auto", display: "flex", flexDirection: "column", gap: 12, paddingRight: 4 }}>
-              {messages
-                .filter((m) => m.role !== "system")
-                .map((m) => (
-                  <MessageBubble key={m.id} role={m.role} content={m.content} />
-                ))}
-              {(live.status !== "idle" && live.messageId) && <LiveTurn live={live} onDecide={decide} />}
+              {messages.filter((m) => m.role !== "system").map((m, i) => (
+                <MessageBubble key={i} role={m.role} content={m.content} />
+              ))}
+              {live.status !== "idle" && <LiveTurn live={live} onDecide={decide} />}
             </div>
-
             <Composer
               models={models}
               model={model}
@@ -220,7 +196,7 @@ export function CodingView({ models, enrolled }: { models: ModelOption[]; enroll
               onSend={onSend}
               busy={busy}
               streaming={streaming}
-              onStop={() => live.messageId && codingCancel(live.messageId)}
+              onStop={() => requestIdRef.current && codingCancel(requestIdRef.current)}
             />
           </>
         )}
@@ -230,99 +206,63 @@ export function CodingView({ models, enrolled }: { models: ModelOption[]; enroll
 }
 
 function NewSession({
-  workspaces,
   models,
   model,
   setModel,
-  onRegister,
-  onStart,
   prompt,
   setPrompt,
   busy,
+  onStart,
 }: {
-  workspaces: CodingWorkspace[];
   models: ModelOption[];
   model: string;
   setModel: (m: string) => void;
-  onRegister: (name: string, path: string, policy: ApprovalPolicy) => Promise<string | null>;
-  onStart: (workspaceId: string) => void;
   prompt: string;
   setPrompt: (p: string) => void;
   busy: boolean;
+  onStart: (path: string, policy: ApprovalPolicy) => void;
 }) {
-  const [workspaceId, setWorkspaceId] = useState<string>("");
-  const [showAttach, setShowAttach] = useState(false);
   const [path, setPath] = useState("");
-  const [name, setName] = useState("");
   const [policy, setPolicy] = useState<ApprovalPolicy>("approve_writes");
 
-  useEffect(() => {
-    if (!workspaceId && workspaces.length) {
-      const first = workspaces[0];
-      if (first) setWorkspaceId(first.id);
-    }
-  }, [workspaces, workspaceId]);
-
-  async function attach() {
-    if (!path.trim()) return;
-    const derivedName = name.trim() || path.trim().replace(/\/+$/, "").split(/[/\\]/).pop() || "workspace";
-    const id = await onRegister(derivedName, path.trim(), policy);
-    if (id) {
-      setWorkspaceId(id);
-      setShowAttach(false);
-      setPath("");
-      setName("");
-    }
-  }
-
   return (
-    <div style={{ maxWidth: 620, display: "flex", flexDirection: "column", gap: 14 }}>
+    <div style={{ maxWidth: 640, display: "flex", flexDirection: "column", gap: 14 }}>
       <h2 style={{ color: "#e2e8f0", fontSize: 16, margin: 0 }}>Start a coding session</h2>
+      <p style={{ fontSize: 12, color: C.muted, margin: 0 }}>
+        Runs entirely on this machine — no account needed. The agent can read, search, edit, and run
+        commands only inside the folder you attach.
+      </p>
 
       <div>
-        <label style={label}>Workspace</label>
-        <div style={{ display: "flex", gap: 8 }}>
-          <select value={workspaceId} onChange={(e) => setWorkspaceId(e.target.value)} style={{ ...input, flex: 1 }}>
-            {workspaces.length === 0 && <option value="">No workspaces yet — attach one</option>}
-            {workspaces.map((w) => (
-              <option key={w.id} value={w.id}>
-                {w.name} — {w.root_path} ({w.approval_policy})
+        <label style={label}>Project folder (absolute path on this machine)</label>
+        <input
+          value={path}
+          onChange={(e) => setPath(e.target.value)}
+          placeholder="/home/you/projects/my-repo"
+          style={{ ...input, width: "100%" }}
+        />
+      </div>
+
+      <div style={{ display: "flex", gap: 8 }}>
+        <div style={{ flex: 1 }}>
+          <label style={label}>Model</label>
+          <select value={model} onChange={(e) => setModel(e.target.value)} style={{ ...input, width: "100%" }}>
+            {models.length === 0 && <option value="">No local models</option>}
+            {models.map((m) => (
+              <option key={m.name} value={m.name}>
+                {m.name} {m.loaded ? "• loaded" : ""}
               </option>
             ))}
           </select>
-          <button onClick={() => setShowAttach((s) => !s)} style={btn(false)}>
-            Attach folder
-          </button>
         </div>
-      </div>
-
-      {showAttach && (
-        <div style={{ display: "flex", flexDirection: "column", gap: 8, padding: 12, border: C.border, borderRadius: 8, background: C.panel }}>
-          <label style={label}>Absolute folder path on this rig</label>
-          <input value={path} onChange={(e) => setPath(e.target.value)} placeholder="/home/you/projects/my-repo" style={input} />
-          <div style={{ display: "flex", gap: 8 }}>
-            <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Name (optional)" style={{ ...input, flex: 1 }} />
-            <select value={policy} onChange={(e) => setPolicy(e.target.value as ApprovalPolicy)} style={input}>
-              <option value="approve_writes">Approve writes &amp; commands</option>
-              <option value="plan">Plan (approve everything)</option>
-              <option value="auto">Auto (no approvals)</option>
-            </select>
-          </div>
-          <button onClick={attach} disabled={busy || !path.trim()} style={primaryBtn}>
-            Attach
-          </button>
+        <div style={{ flex: 1 }}>
+          <label style={label}>Approvals</label>
+          <select value={policy} onChange={(e) => setPolicy(e.target.value as ApprovalPolicy)} style={{ ...input, width: "100%" }}>
+            <option value="approve_writes">Approve writes &amp; commands</option>
+            <option value="plan">Plan (approve everything)</option>
+            <option value="auto">Auto (no approvals)</option>
+          </select>
         </div>
-      )}
-
-      <div>
-        <label style={label}>Model</label>
-        <select value={model} onChange={(e) => setModel(e.target.value)} style={{ ...input, width: "100%" }}>
-          {models.map((m) => (
-            <option key={m.name} value={m.name}>
-              {m.name} {m.loaded ? "• loaded" : ""}
-            </option>
-          ))}
-        </select>
       </div>
 
       <div>
@@ -337,8 +277,8 @@ function NewSession({
       </div>
 
       <button
-        onClick={() => workspaceId && onStart(workspaceId)}
-        disabled={busy || !workspaceId || !prompt.trim() || !model}
+        onClick={() => onStart(path, policy)}
+        disabled={busy || !path.trim() || !prompt.trim() || !model}
         style={primaryBtn}
       >
         {busy ? "Starting…" : "Start session"}
@@ -347,7 +287,25 @@ function NewSession({
   );
 }
 
-function LiveTurn({ live, onDecide }: { live: CodingLive; onDecide: (id: string, d: "approved" | "denied") => void }) {
+function SessionHeader({ meta, onDelete }: { meta?: CodingSessionMeta; onDelete: () => void }) {
+  return (
+    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", borderBottom: C.border, paddingBottom: 8, marginBottom: 8 }}>
+      <div style={{ minWidth: 0 }}>
+        <div style={{ fontSize: 14, color: "#e2e8f0", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+          {meta?.title ?? "Coding session"}
+        </div>
+        <div style={{ fontSize: 11, color: C.muted, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+          {meta?.workspaceRoot} · {meta?.model} · {meta?.approvalPolicy}
+        </div>
+      </div>
+      <button onClick={onDelete} style={{ ...btn(false), color: "#f87171" }}>
+        Delete
+      </button>
+    </div>
+  );
+}
+
+function LiveTurn({ live, onDecide }: { live: CodingLive; onDecide: (id: string, approved: boolean) => void }) {
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
       {live.status === "loading" && (
@@ -361,10 +319,10 @@ function LiveTurn({ live, onDecide }: { live: CodingLive; onDecide: (id: string,
           <div style={{ fontSize: 12, color: C.accent, marginBottom: 6 }}>Approval needed — {a.name}</div>
           <pre style={preStyle}>{a.preview}</pre>
           <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
-            <button onClick={() => onDecide(a.invocationId, "approved")} style={primaryBtn}>
+            <button onClick={() => onDecide(a.invocationId, true)} style={primaryBtn}>
               Approve
             </button>
-            <button onClick={() => onDecide(a.invocationId, "denied")} style={btn(false)}>
+            <button onClick={() => onDecide(a.invocationId, false)} style={btn(false)}>
               Deny
             </button>
           </div>
@@ -468,12 +426,20 @@ function Composer({
           rows={2}
           style={{ ...input, flex: 1, resize: "vertical" }}
         />
-        <button onClick={onSend} disabled={busy || !prompt.trim()} style={primaryBtn}>
+        <button onClick={onSend} disabled={busy || streaming || !prompt.trim()} style={primaryBtn}>
           Send
         </button>
       </div>
     </div>
   );
+}
+
+function optimisticUser(content: string): CodingStoredMessage {
+  return { role: "user", content, thinking: null, toolActivity: null, cancelled: false, createdAt: new Date().toISOString() };
+}
+
+function folderName(path: string): string {
+  return path.replace(/[/\\]+$/, "").split(/[/\\]/).pop() || path;
 }
 
 // --- styles ---------------------------------------------------------------
@@ -520,6 +486,8 @@ function btn(active: boolean): React.CSSProperties {
 }
 function sessionBtn(active: boolean): React.CSSProperties {
   return {
+    display: "block",
+    width: "100%",
     background: active ? "rgba(56,189,248,0.12)" : "transparent",
     border: C.border,
     borderRadius: 8,

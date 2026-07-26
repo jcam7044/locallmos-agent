@@ -283,6 +283,7 @@ mod tests {
 
     #[test]
     fn session_roundtrip() {
+        let _lock = crate::config::TEST_CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("locallmos-test-{}", uuid::Uuid::new_v4()));
         std::env::set_var("LOCALLMOS_CONFIG_DIR", &dir);
 

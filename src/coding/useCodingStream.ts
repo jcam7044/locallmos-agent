@@ -30,26 +30,26 @@ const EMPTY: CodingLive = {
 };
 
 /**
- * Accumulate live coding-stream state for the active conversation from the
- * agent's Tauri "coding" events. Resets when the conversation changes or a new
+ * Accumulate live coding-stream state for the active session from the agent's
+ * Tauri "local-coding" events. Resets when the session changes or a new
  * assistant turn begins.
  */
-export function useCodingStream(conversationId: string | null) {
+export function useCodingStream(sessionId: string | null) {
   const [live, setLive] = useState<CodingLive>(EMPTY);
-  const convRef = useRef(conversationId);
-  convRef.current = conversationId;
+  const sessionRef = useRef(sessionId);
+  sessionRef.current = sessionId;
 
   useEffect(() => {
     setLive(EMPTY);
     let unlisten: (() => void) | undefined;
-    void listen<CodingEvent>("coding", ({ payload }) => {
-      if (payload.conversationId !== convRef.current) return;
+    void listen<CodingEvent>("local-coding", ({ payload }) => {
+      if (payload.sessionId !== sessionRef.current) return;
       setLive((s) => reduce(s, payload.messageId, payload.event));
     }).then((u) => {
       unlisten = u;
     });
     return () => unlisten?.();
-  }, [conversationId]);
+  }, [sessionId]);
 
   return { live, reset: () => setLive(EMPTY) };
 }

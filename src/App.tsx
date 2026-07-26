@@ -99,7 +99,7 @@ export function App() {
           runtimeKind={local?.runtime.kind ?? "ollama"}
         />
       ) : tab === "code" ? (
-        <CodingView models={local?.models ?? []} enrolled={status?.enrolled ?? false} />
+        <CodingView models={local?.models ?? []} />
       ) : (
         <ModelsView local={local} onChanged={refresh} />
       )}

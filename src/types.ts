@@ -192,6 +192,59 @@ export type LocalChatEvent = { requestId: string; sessionId: string } & (
   | { type: "tool_result"; name: string; summary: string }
 );
 
+// --- Coding sessions (cloud-backed; mirror supabase 0036 + shared chat.ts) --
+
+export type ApprovalPolicy = "plan" | "approve_writes" | "auto";
+
+export type CodingWorkspace = {
+  id: string;
+  name: string;
+  root_path: string;
+  approval_policy: ApprovalPolicy;
+};
+
+export type CodingSessionMeta = {
+  id: string;
+  title: string | null;
+  model: string | null;
+  workspace_id: string | null;
+  updated_at: string;
+};
+
+export type CodingMessage = {
+  id: string;
+  role: "system" | "user" | "assistant";
+  content: string;
+  status: "pending" | "streaming" | "done" | "error";
+  thinking: string | null;
+  tool_activity: unknown;
+  created_at: string;
+};
+
+/**
+ * The `event` payload inside a Tauri "coding" event. Mirrors the coding subset
+ * of the shared ChatStreamEvent union (packages/shared/src/chat.ts).
+ */
+export type CodingStreamEvent =
+  | { type: "loading"; model: string }
+  | { type: "token"; delta: string }
+  | { type: "thinking"; delta: string }
+  | { type: "tool"; name: string; arguments: string }
+  | { type: "tool_result"; name: string; summary: string }
+  | { type: "file_edit"; path: string; diff: string; summary: string; invocationId?: string }
+  | { type: "command"; command: string; chunk: string; exitCode?: number | null; invocationId?: string }
+  | { type: "approval_needed"; invocationId: string; name: string; preview: string }
+  | { type: "approval_resolved"; invocationId: string; decision: "approved" | "denied" }
+  | { type: "done" }
+  | { type: "error"; message: string };
+
+/** Envelope the agent emits on the Tauri "coding" event. */
+export type CodingEvent = {
+  conversationId: string;
+  messageId: string;
+  event: CodingStreamEvent;
+};
+
 export function newUserMessage(content: string, attachments: Attachment[] = []): StoredMessage {
   return {
     role: "user",

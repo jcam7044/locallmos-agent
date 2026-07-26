@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { getAgentStatus, getLocalStatus, hubCancelDownload, hubListDownloads } from "./api";
 import { ChatView } from "./chat/ChatView";
+import { CodingView } from "./coding/CodingView";
 import { ConnectCloud, Dashboard } from "./dashboard/Dashboard";
 import { DownloadBanner } from "./downloads/DownloadBanner";
 import type { AgentStatus, DownloadState, LocalStatus } from "./types";
@@ -56,7 +57,7 @@ export function App() {
         maxWidth: tab === "dashboard" ? 480 : undefined,
         margin: "0 auto",
         boxSizing: "border-box",
-        ...(tab === "chat" || tab === "models"
+        ...(tab === "chat" || tab === "models" || tab === "code"
           ? { height: "100vh", display: "flex", flexDirection: "column", overflow: "hidden" }
           : {}),
       }}
@@ -80,6 +81,9 @@ export function App() {
         <TabButton active={tab === "chat"} onClick={() => setTab("chat")}>
           Chat
         </TabButton>
+        <TabButton active={tab === "code"} onClick={() => setTab("code")}>
+          Code
+        </TabButton>
       </nav>
 
       {tab === "dashboard" ? (
@@ -94,6 +98,8 @@ export function App() {
           enrolled={status?.enrolled ?? false}
           runtimeKind={local?.runtime.kind ?? "ollama"}
         />
+      ) : tab === "code" ? (
+        <CodingView models={local?.models ?? []} enrolled={status?.enrolled ?? false} />
       ) : (
         <ModelsView local={local} onChanged={refresh} />
       )}

@@ -18,6 +18,7 @@
 //! A mid-stream socket drop is not retried for the *current* turn; that would
 //! need per-turn resumable streaming (out of scope for v1).
 
+use crate::coding;
 use crate::runtime::ollama::{ChatDelta, ToolCall};
 use crate::runtime::tool_protocol;
 use crate::runtime::tools;
@@ -29,8 +30,29 @@ use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use tauri::Emitter;
 use tokio::sync::Notify;
 use uuid::Uuid;
+
+/// Mirror one stream event to the local webview during a coding turn. No-op for
+/// ordinary chat turns and in headless service mode (no app handle).
+fn emit_local(
+    state: &Arc<AppState>,
+    is_coding: bool,
+    conversation_id: &str,
+    message_id: &str,
+    event: &Value,
+) {
+    if !is_coding {
+        return;
+    }
+    if let Some(app) = state.app.get() {
+        let _ = app.emit(
+            "coding",
+            json!({ "conversationId": conversation_id, "messageId": message_id, "event": event }),
+        );
+    }
+}
 
 /// A streamed delta batched by the broadcaster into a `token`/`thinking` event,
 /// or a discrete tool-progress event flushed immediately.
@@ -41,6 +63,9 @@ enum StreamDelta {
     Tool(String, String),
     /// A built-in tool finished (name + short human summary).
     ToolResult(String, String),
+    /// A pre-built coding event (file_edit / command / approval_needed /
+    /// approval_resolved) broadcast verbatim (seq is stamped by the broadcaster).
+    Event(Value),
 }
 
 /// Broadcast event name on the `chat:{id}` channel (mirrors CHAT_STREAM_EVENT
@@ -139,6 +164,42 @@ pub async fn process(state: &Arc<AppState>, pending: ChatPending) -> Result<()> 
         messages.push(obj);
     }
 
+    // Coding session? Resolve the confined workspace + approval policy and
+    // prepend the coding system prompt. A missing/inaccessible workspace fails
+    // the turn cleanly rather than silently running unscoped.
+    let coding_ctx = match state
+        .supabase
+        .fetch_coding_context(&token, &pending.conversation_id)
+        .await
+    {
+        Ok(Some(meta)) => match coding::Workspace::new(&meta.root_path) {
+            Ok(workspace) => {
+                messages.insert(
+                    0,
+                    json!({ "role": "system", "content": coding::system_prompt(&workspace.root_str()) }),
+                );
+                Some(coding::CodingContext {
+                    workspace,
+                    policy: coding::ApprovalPolicy::parse(&meta.approval_policy),
+                })
+            }
+            Err(e) => {
+                let msg = format!("coding workspace unavailable: {e}");
+                state
+                    .supabase
+                    .update_chat_message(&token, &pending.id, "error", None, None, Some(&msg), None, None, None, None)
+                    .await
+                    .ok();
+                return Err(anyhow!(msg));
+            }
+        },
+        Ok(None) => None,
+        Err(e) => {
+            tracing::warn!("chat {}: coding context lookup failed: {e}", pending.id);
+            None
+        }
+    };
+
     // Join the private broadcast channel over the websocket. If the socket is
     // down we still generate + persist the reply, just without live streaming.
     let chan = topic(&pending.id);
@@ -150,9 +211,15 @@ pub async fn process(state: &Arc<AppState>, pending: ChatPending) -> Result<()> 
     // Async broadcaster: batches content + thinking deltas from the sync stream
     // callback into `token`/`thinking` events on the shared channel.
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<StreamDelta>();
+    // Coding turns also mirror every stream event to the local webview (the
+    // device can't receive its own Realtime broadcast, so the local UI relies on
+    // these Tauri events for live streaming).
+    let is_coding = coding_ctx.is_some();
     let broadcaster = {
         let state = state.clone();
         let chan = chan.clone();
+        let conv_id = pending.conversation_id.clone();
+        let msg_id = pending.id.clone();
         tokio::spawn(async move {
             let mut seq: u64 = 0;
             let mut content = String::new();
@@ -167,8 +234,9 @@ pub async fn process(state: &Arc<AppState>, pending: ChatPending) -> Result<()> 
                         let payload = json!({ "type": $ty, "seq": seq, "delta": $buf.as_str() });
                         seq += 1;
                         if ws_ready {
-                            state.realtime.broadcast(&chan, CHAT_EVENT, payload).await.ok();
+                            state.realtime.broadcast(&chan, CHAT_EVENT, payload.clone()).await.ok();
                         }
+                        emit_local(&state, is_coding, &conv_id, &msg_id, &payload);
                         $buf.clear();
                     }
                 }};
@@ -184,8 +252,9 @@ pub async fn process(state: &Arc<AppState>, pending: ChatPending) -> Result<()> 
                     p["seq"] = json!(seq);
                     seq += 1;
                     if ws_ready {
-                        state.realtime.broadcast(&chan, CHAT_EVENT, p).await.ok();
+                        state.realtime.broadcast(&chan, CHAT_EVENT, p.clone()).await.ok();
                     }
+                    emit_local(&state, is_coding, &conv_id, &msg_id, &p);
                 }};
             }
 
@@ -205,6 +274,9 @@ pub async fn process(state: &Arc<AppState>, pending: ChatPending) -> Result<()> 
                         }
                         Some(StreamDelta::ToolResult(name, summary)) => {
                             emit_tool!(json!({ "type": "tool_result", "name": name, "summary": summary }));
+                        }
+                        Some(StreamDelta::Event(payload)) => {
+                            emit_tool!(payload);
                         }
                         None => {
                             emit!("thinking", thinking);
@@ -458,17 +530,15 @@ pub async fn process(state: &Arc<AppState>, pending: ChatPending) -> Result<()> 
             messages.push(json!({ "role": "assistant", "content": "", "tool_calls": assistant_calls }));
         }
         for (call, tool) in &platform_calls {
-            let invocation_id = Uuid::new_v4().to_string();
             let _ = tx.send(StreamDelta::Tool(call.name.clone(), call.arguments.to_string()));
-            let (result_text, activity, summary) = run_platform_tool(
-                state,
-                &token,
-                &pending.id,
-                &invocation_id,
-                tool,
-                call,
-            )
-            .await;
+            // Local coding tools run on the rig itself (with the approval gate);
+            // hosted tools relay to the cloud gateway as before.
+            let (result_text, activity, summary) = if tool.execution == "local" {
+                run_local_tool(state, coding_ctx.as_ref(), &token, &pending.id, &tx, &cancel, tool, call).await
+            } else {
+                let invocation_id = Uuid::new_v4().to_string();
+                run_platform_tool(state, &token, &pending.id, &invocation_id, tool, call).await
+            };
             let _ = tx.send(StreamDelta::ToolResult(call.name.clone(), summary));
             if let Some(a) = activity {
                 tool_activity.push(a);
@@ -505,13 +575,11 @@ pub async fn process(state: &Arc<AppState>, pending: ChatPending) -> Result<()> 
 
     let outcome = match loop_err {
         None => {
+            let done = json!({ "type": "done", "seq": last_seq });
             if ws_ready {
-                state
-                    .realtime
-                    .broadcast(&chan, CHAT_EVENT, json!({ "type": "done", "seq": last_seq }))
-                    .await
-                    .ok();
+                state.realtime.broadcast(&chan, CHAT_EVENT, done.clone()).await.ok();
             }
+            emit_local(state, is_coding, &pending.conversation_id, &pending.id, &done);
             let thinking = (!final_thinking.is_empty()).then_some(final_thinking.as_str());
             state
                 .supabase
@@ -532,17 +600,11 @@ pub async fn process(state: &Arc<AppState>, pending: ChatPending) -> Result<()> 
         }
         Some(e) => {
             let msg = e.to_string();
+            let error_event = json!({ "type": "error", "seq": last_seq, "message": msg });
             if ws_ready {
-                state
-                    .realtime
-                    .broadcast(
-                        &chan,
-                        CHAT_EVENT,
-                        json!({ "type": "error", "seq": last_seq, "message": msg }),
-                    )
-                    .await
-                    .ok();
+                state.realtime.broadcast(&chan, CHAT_EVENT, error_event.clone()).await.ok();
             }
+            emit_local(state, is_coding, &pending.conversation_id, &pending.id, &error_event);
             state
                 .supabase
                 .update_chat_message(&token, &pending.id, "error", None, None, Some(&msg), None, None, None, None)
@@ -602,6 +664,125 @@ async fn run_platform_tool(
             (format!("{} failed: {e}", call.name), Some(activity), summary)
         }
     }
+}
+
+/// Execute one local coding tool against the confined workspace. Mutating calls
+/// (writes, commands, non-read git) pause on an `awaiting_approval` invocation
+/// until either surface sets a decision; reads run immediately. Structured
+/// `file_edit`/`command`/`approval_*` events stream to the UI via `tx`.
+#[allow(clippy::too_many_arguments)]
+async fn run_local_tool(
+    state: &Arc<AppState>,
+    coding_ctx: Option<&coding::CodingContext>,
+    token: &str,
+    message_id: &str,
+    tx: &tokio::sync::mpsc::UnboundedSender<StreamDelta>,
+    cancel: &Arc<AtomicBool>,
+    tool: &tools::PlatformTool,
+    call: &ToolCall,
+) -> (String, Option<Value>, String) {
+    let Some(cx) = coding_ctx else {
+        return (
+            "coding tools are unavailable for this turn".into(),
+            None,
+            "unavailable".into(),
+        );
+    };
+    let invocation_id = Uuid::new_v4().to_string();
+    let args_hash = sha256_hex(&call.arguments);
+
+    if let Some(preview) = coding::approval_preview(cx, &call.name, &call.arguments) {
+        state
+            .supabase
+            .create_tool_invocation(
+                token, message_id, &invocation_id, &tool.id, &tool.provider, &args_hash,
+                Some(&preview), &call.name, true,
+            )
+            .await
+            .ok();
+        let _ = tx.send(StreamDelta::Event(json!({
+            "type": "approval_needed", "invocationId": invocation_id,
+            "name": call.name, "preview": preview,
+        })));
+        let decision = await_decision(state, token, &invocation_id, cancel).await;
+        let _ = tx.send(StreamDelta::Event(json!({
+            "type": "approval_resolved", "invocationId": invocation_id, "decision": decision,
+        })));
+        if decision != "approved" {
+            state
+                .supabase
+                .finalize_tool_invocation(token, &invocation_id, "cancelled", &decision)
+                .await
+                .ok();
+            return (
+                format!(
+                    "The user denied the {} action. Do not retry it; propose an alternative or ask the user how to proceed.",
+                    call.name
+                ),
+                None,
+                "denied".into(),
+            );
+        }
+    } else {
+        state
+            .supabase
+            .create_tool_invocation(
+                token, message_id, &invocation_id, &tool.id, &tool.provider, &args_hash,
+                None, &call.name, false,
+            )
+            .await
+            .ok();
+    }
+
+    let run = coding::execute(cx, &call.name, &call.arguments).await;
+    if let Some(mut event) = run.event {
+        event["invocationId"] = json!(invocation_id);
+        let _ = tx.send(StreamDelta::Event(event));
+    }
+    let status = if run.summary == "error" { "failed" } else { "succeeded" };
+    state
+        .supabase
+        .finalize_tool_invocation(token, &invocation_id, status, &run.summary)
+        .await
+        .ok();
+    (run.content, run.activity, run.summary)
+}
+
+/// Poll the invocation's decision until it is approved/denied, the turn is
+/// cancelled, or the approval window elapses. Both surfaces write the decision
+/// (web via the set_tool_decision RPC, local app via a device PATCH).
+async fn await_decision(
+    state: &Arc<AppState>,
+    token: &str,
+    invocation_id: &str,
+    cancel: &Arc<AtomicBool>,
+) -> String {
+    const TIMEOUT: Duration = Duration::from_secs(1800);
+    const POLL: Duration = Duration::from_millis(1500);
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return "denied".into();
+        }
+        if let Ok(Some(decision)) = state.supabase.poll_tool_decision(token, invocation_id).await {
+            if decision == "approved" || decision == "denied" {
+                return decision;
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return "denied".into();
+        }
+        tokio::time::sleep(POLL).await;
+    }
+}
+
+/// SHA-256 of a tool call's arguments (stable across retries; matches the
+/// gateway's arguments_hash convention).
+fn sha256_hex(args: &Value) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(args.to_string().as_bytes());
+    hex::encode(hasher.finalize())
 }
 
 /// Execute a single built-in tool call. Returns `(tool_message_content, activity,

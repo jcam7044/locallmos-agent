@@ -10,6 +10,7 @@
 
 mod chat;
 mod chat_store;
+mod coding;
 mod config;
 mod hardware;
 mod hub;
@@ -58,6 +59,9 @@ pub struct AppState {
     /// Shared HTTP client, reused for the web_fetch tool (direct GET from the rig).
     pub http: reqwest::Client,
     pub hub: Arc<hub::HubState>,
+    /// The Tauri app handle, set once at GUI startup. Absent in headless service
+    /// mode. Used to mirror coding-session stream events to the local webview.
+    pub app: std::sync::OnceLock<tauri::AppHandle>,
 }
 
 impl AppState {
@@ -142,6 +146,7 @@ fn build_state() -> Arc<AppState> {
         chat_lock: Mutex::new(()),
         http,
         hub,
+        app: std::sync::OnceLock::new(),
     })
 }
 
@@ -557,6 +562,110 @@ async fn read_dropped_file(path: String) -> Result<chat_store::Attachment, Strin
     chat_store::attachment_from_path(&path).map_err(|e| e.to_string())
 }
 
+// --- Coding sessions (cloud-backed, continuable from the web) ---------------
+// These bridge the local webview to Supabase using the device JWT. Sessions are
+// chat_conversations of kind='coding'; the same agent process claims and runs
+// the pending turns (chat.rs), streaming to the webview via `coding` events.
+
+/// Validate a folder on this rig and register it as a coding workspace. Returns
+/// `{ workspaceId }`.
+#[tauri::command]
+async fn coding_register_workspace(
+    state: State<'_, Arc<AppState>>,
+    name: String,
+    path: String,
+    approval_policy: Option<String>,
+) -> Result<Value, String> {
+    // Fail fast with a clear message if the folder is missing/inaccessible here.
+    coding::Workspace::new(&path).map_err(|e| e.to_string())?;
+    let token = worker::ensure_token(state.inner()).await.map_err(|e| e.to_string())?;
+    let body = json!({
+        "action": "register_workspace",
+        "name": name,
+        "rootPath": path,
+        "approvalPolicy": approval_policy.unwrap_or_else(|| "approve_writes".into()),
+    });
+    state.supabase.coding_turn(&token, body).await.map_err(|e| e.to_string())
+}
+
+/// Registered coding workspaces on this rig.
+#[tauri::command]
+async fn coding_list_workspaces(state: State<'_, Arc<AppState>>) -> Result<Value, String> {
+    let token = worker::ensure_token(state.inner()).await.map_err(|e| e.to_string())?;
+    let rig = worker::rig_id(state.inner()).await.ok_or("not enrolled")?;
+    state.supabase.list_coding_workspaces(&token, &rig).await.map_err(|e| e.to_string())
+}
+
+/// Start a new coding session against a workspace. Returns `{ conversationId, assistantId }`.
+#[tauri::command]
+async fn coding_start_session(
+    state: State<'_, Arc<AppState>>,
+    workspace_id: String,
+    model: String,
+    prompt: String,
+) -> Result<Value, String> {
+    let token = worker::ensure_token(state.inner()).await.map_err(|e| e.to_string())?;
+    let body = json!({ "action": "start", "workspaceId": workspace_id, "model": model, "prompt": prompt });
+    state.supabase.coding_turn(&token, body).await.map_err(|e| e.to_string())
+}
+
+/// Send another turn in an existing coding session. Returns `{ assistantId }`.
+#[tauri::command]
+async fn coding_send(
+    state: State<'_, Arc<AppState>>,
+    conversation_id: String,
+    prompt: String,
+    model: Option<String>,
+) -> Result<Value, String> {
+    let token = worker::ensure_token(state.inner()).await.map_err(|e| e.to_string())?;
+    let mut body = json!({ "action": "continue", "conversationId": conversation_id, "prompt": prompt });
+    if let Some(m) = model {
+        body["model"] = json!(m);
+    }
+    state.supabase.coding_turn(&token, body).await.map_err(|e| e.to_string())
+}
+
+/// Coding sessions on this rig (for the sidebar).
+#[tauri::command]
+async fn coding_list_sessions(state: State<'_, Arc<AppState>>) -> Result<Value, String> {
+    let token = worker::ensure_token(state.inner()).await.map_err(|e| e.to_string())?;
+    let rig = worker::rig_id(state.inner()).await.ok_or("not enrolled")?;
+    state.supabase.list_coding_sessions(&token, &rig).await.map_err(|e| e.to_string())
+}
+
+/// All messages in a coding session (for rendering on open / resume).
+#[tauri::command]
+async fn coding_get_session(
+    state: State<'_, Arc<AppState>>,
+    conversation_id: String,
+) -> Result<Value, String> {
+    let token = worker::ensure_token(state.inner()).await.map_err(|e| e.to_string())?;
+    state.supabase.get_coding_messages(&token, &conversation_id).await.map_err(|e| e.to_string())
+}
+
+/// Approve or deny a paused coding tool invocation from the local app.
+#[tauri::command]
+async fn coding_approve(
+    state: State<'_, Arc<AppState>>,
+    invocation_id: String,
+    decision: String,
+) -> Result<(), String> {
+    if decision != "approved" && decision != "denied" {
+        return Err("decision must be 'approved' or 'denied'".into());
+    }
+    let token = worker::ensure_token(state.inner()).await.map_err(|e| e.to_string())?;
+    state.supabase.set_tool_decision(&token, &invocation_id, &decision).await.map_err(|e| e.to_string())
+}
+
+/// Stop an in-flight coding turn (also releases a pending approval wait).
+#[tauri::command]
+async fn coding_cancel(state: State<'_, Arc<AppState>>, message_id: String) -> Result<(), String> {
+    if let Some(flag) = state.cancels.lock().await.get(&message_id) {
+        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    Ok(())
+}
+
 /// Check GitHub Releases directly (no account) and self-update if a newer version
 /// exists. Returns the new version when it updated, `None` when already current.
 #[tauri::command]
@@ -674,6 +783,9 @@ fn run_gui() {
         ))
         .manage(state)
         .setup(move |app| {
+            // Give background loops (coding turns) a handle to mirror stream
+            // events to the local webview.
+            loop_state.app.set(app.handle().clone()).ok();
             worker::spawn_loops(loop_state.clone());
 
             // Best-effort: enable launch-on-login so the tray survives reboots
@@ -746,7 +858,15 @@ fn run_gui() {
             chat_rename_session,
             chat_delete_session,
             chat_update_settings,
-            read_dropped_file
+            read_dropped_file,
+            coding_register_workspace,
+            coding_list_workspaces,
+            coding_start_session,
+            coding_send,
+            coding_list_sessions,
+            coding_get_session,
+            coding_approve,
+            coding_cancel
         ])
         .run(tauri::generate_context!())
         .expect("error while running LocalLMOS agent");

@@ -1850,6 +1850,7 @@ dependencies = [
  "hex",
  "minisign-verify",
  "nvml-wrapper",
+ "regex",
  "reqwest 0.12.28",
  "self-replace",
  "semver",
@@ -1866,6 +1867,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "walkdir",
 ]
 
 [[package]]

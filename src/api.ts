@@ -1,8 +1,12 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   AgentStatus,
+  ApprovalPolicy,
   Attachment,
   ChatSession,
+  CodingMessage,
+  CodingSessionMeta,
+  CodingWorkspace,
   LocalStatus,
   SessionMeta,
   SessionSettings,
@@ -68,3 +72,33 @@ export const chatRenameSession = (id: string, title: string) =>
 export const chatDeleteSession = (id: string) => invoke("chat_delete_session", { id });
 export const chatUpdateSettings = (id: string, model: string, settings: SessionSettings) =>
   invoke("chat_update_settings", { id, model, settings });
+
+// --- Coding sessions --------------------------------------------------------
+
+export const codingRegisterWorkspace = (
+  name: string,
+  path: string,
+  approvalPolicy: ApprovalPolicy,
+) => invoke<{ workspaceId: string }>("coding_register_workspace", { name, path, approvalPolicy });
+
+export const codingListWorkspaces = () => invoke<CodingWorkspace[]>("coding_list_workspaces");
+
+export const codingStartSession = (workspaceId: string, model: string, prompt: string) =>
+  invoke<{ conversationId: string; assistantId: string }>("coding_start_session", {
+    workspaceId,
+    model,
+    prompt,
+  });
+
+export const codingSend = (conversationId: string, prompt: string, model?: string) =>
+  invoke<{ assistantId: string }>("coding_send", { conversationId, prompt, model });
+
+export const codingListSessions = () => invoke<CodingSessionMeta[]>("coding_list_sessions");
+
+export const codingGetSession = (conversationId: string) =>
+  invoke<CodingMessage[]>("coding_get_session", { conversationId });
+
+export const codingApprove = (invocationId: string, decision: "approved" | "denied") =>
+  invoke("coding_approve", { invocationId, decision });
+
+export const codingCancel = (messageId: string) => invoke("coding_cancel", { messageId });

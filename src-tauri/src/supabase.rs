@@ -729,6 +729,13 @@ impl Supabase {
         }))
     }
 
+    /// Remove a local session's mirrored cloud conversation (and, by cascade,
+    /// its messages) after the on-disk session is deleted. Idempotent.
+    pub async fn coding_sync_delete(&self, token: &str, local_session_id: &str) -> Result<Value> {
+        self.coding_sync_push(token, json!({ "action": "delete", "localSessionId": local_session_id }))
+            .await
+    }
+
     /// Mirror an on-disk coding session to the cloud via the `coding-sync` edge
     /// function so it can be seen/continued from the web. Returns
     /// `{ conversationId, workspaceId }`.

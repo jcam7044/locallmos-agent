@@ -721,8 +721,15 @@ async fn coding_local_get_session(
 
 #[tauri::command]
 async fn coding_local_delete_session(state: State<'_, Arc<AppState>>, id: String) -> Result<(), String> {
-    let _guard = state.chat_lock.lock().await;
-    coding_store::delete(&id).map_err(|e| e.to_string())
+    {
+        let _guard = state.chat_lock.lock().await;
+        coding_store::delete(&id).map_err(|e| e.to_string())?;
+    }
+    // Drop the cloud mirror too, or the session lingers on the web Code page.
+    // Best-effort, and outside the guard so a slow or offline round-trip does
+    // not hold the store lock; an unenrolled rig skips it entirely.
+    local_coding::delete_from_cloud(state.inner(), &id).await;
+    Ok(())
 }
 
 /// Run one local coding turn. Deltas stream as `local-coding` events (carrying

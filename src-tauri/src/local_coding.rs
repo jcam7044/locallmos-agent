@@ -106,6 +106,23 @@ pub async fn send(
     Ok(assistant)
 }
 
+/// Drop a session's cloud mirror so deleting it in the desktop app also removes
+/// it from the web. Keyed by the on-disk session id rather than `remote_id`, so
+/// it still cleans up a session that synced but never recorded its remote ids.
+/// No-op when unenrolled; best-effort otherwise.
+pub async fn delete_from_cloud(state: &Arc<AppState>, local_session_id: &str) {
+    if !state.config.lock().await.is_enrolled() {
+        return;
+    }
+    let token = match crate::worker::ensure_token(state).await {
+        Ok(t) => t,
+        Err(_) => return,
+    };
+    if let Err(e) = state.supabase.coding_sync_delete(&token, local_session_id).await {
+        tracing::debug!("coding-sync delete failed: {e}");
+    }
+}
+
 /// Mirror any session that has never reached the cloud — created while offline,
 /// before the rig was enrolled, or while sync was failing. Without this, such a
 /// session stays invisible to the web until its next turn happens to push it.

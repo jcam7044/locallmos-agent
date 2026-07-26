@@ -99,7 +99,92 @@ pub async fn send(
         coding_store::save(&session).map_err(|e| e.to_string())?;
     }
 
+    // Mirror to the cloud so the session is visible/continuable from the web.
+    // Best-effort: an offline / unenrolled rig just keeps the local record.
+    push_to_cloud(&state, &session).await;
+
     Ok(assistant)
+}
+
+/// Mirror any session that has never reached the cloud — created while offline,
+/// before the rig was enrolled, or while sync was failing. Without this, such a
+/// session stays invisible to the web until its next turn happens to push it.
+/// Runs once at startup, off the critical path.
+pub async fn backfill_unsynced(state: Arc<AppState>) {
+    if !state.config.lock().await.is_enrolled() {
+        return;
+    }
+    let ids: Vec<String> = {
+        let _guard = state.chat_lock.lock().await;
+        match coding_store::list() {
+            Ok(metas) => metas.into_iter().map(|m| m.id).collect(),
+            Err(e) => {
+                tracing::debug!("coding backfill: list failed: {e}");
+                return;
+            }
+        }
+    };
+    for id in ids {
+        // Reload per session and drop the guard before pushing — `push_to_cloud`
+        // takes `chat_lock` itself, and it is not reentrant.
+        let session = {
+            let _guard = state.chat_lock.lock().await;
+            match coding_store::load(&id) {
+                Ok(s) => s,
+                Err(_) => continue,
+            }
+        };
+        if session.remote_id.is_some() {
+            continue;
+        }
+        push_to_cloud(&state, &session).await;
+    }
+}
+
+/// Push the on-disk transcript to Supabase via `coding-sync` (no-op when not
+/// enrolled). Persists the returned remote ids on the session's first sync.
+pub async fn push_to_cloud(state: &Arc<AppState>, session: &coding_store::CodingSession) {
+    if !state.config.lock().await.is_enrolled() {
+        return;
+    }
+    let token = match crate::worker::ensure_token(state).await {
+        Ok(t) => t,
+        Err(_) => return,
+    };
+    let messages: Vec<Value> = session
+        .messages
+        .iter()
+        .filter(|m| m.role != "system")
+        .map(|m| {
+            json!({
+                "id": m.id, "role": m.role, "content": m.content,
+                "thinking": m.thinking, "toolActivity": m.tool_activity, "createdAt": m.created_at,
+            })
+        })
+        .collect();
+    let body = json!({
+        "localSessionId": session.id,
+        "title": session.title,
+        "model": session.model,
+        "workspaceRoot": session.workspace_root,
+        "approvalPolicy": session.approval_policy,
+        "messages": messages,
+    });
+    match state.supabase.coding_sync_push(&token, body).await {
+        Ok(v) => {
+            let remote_id = v.get("conversationId").and_then(Value::as_str).map(str::to_string);
+            let remote_ws = v.get("workspaceId").and_then(Value::as_str).map(str::to_string);
+            if remote_id != session.remote_id || remote_ws != session.remote_workspace_id {
+                let _guard = state.chat_lock.lock().await;
+                if let Ok(mut s) = coding_store::load(&session.id) {
+                    s.remote_id = remote_id;
+                    s.remote_workspace_id = remote_ws;
+                    coding_store::save(&s).ok();
+                }
+            }
+        }
+        Err(e) => tracing::debug!("coding-sync push failed: {e}"),
+    }
 }
 
 struct TurnOutput {

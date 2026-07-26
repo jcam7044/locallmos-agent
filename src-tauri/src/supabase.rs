@@ -689,7 +689,7 @@ impl Supabase {
         let resp = self
             .auth(
                 self.http.get(format!(
-                    "{}/chat_conversations?id=eq.{conversation_id}&select=kind,workspace_id",
+                    "{}/chat_conversations?id=eq.{conversation_id}&select=kind,workspace_id,local_session_id",
                     self.rest
                 )),
                 token,
@@ -716,8 +716,35 @@ impl Supabase {
             )
             .send()
             .await?;
-        let rows: Vec<CodingMeta> = resp.json().await?;
-        Ok(rows.into_iter().next())
+        #[derive(Deserialize)]
+        struct WorkspaceRow {
+            root_path: String,
+            approval_policy: String,
+        }
+        let rows: Vec<WorkspaceRow> = resp.json().await?;
+        Ok(rows.into_iter().next().map(|w| CodingMeta {
+            root_path: w.root_path,
+            approval_policy: w.approval_policy,
+            local_session_id: conv.local_session_id,
+        }))
+    }
+
+    /// Mirror an on-disk coding session to the cloud via the `coding-sync` edge
+    /// function so it can be seen/continued from the web. Returns
+    /// `{ conversationId, workspaceId }`.
+    pub async fn coding_sync_push(&self, token: &str, body: Value) -> Result<Value> {
+        let resp = self
+            .auth(self.http.post(format!("{}/coding-sync", self.functions)), token)
+            .json(&body)
+            .send()
+            .await?;
+        let status = resp.status();
+        let v: Value = resp.json().await.unwrap_or_else(|_| json!({}));
+        if !status.is_success() {
+            let detail = v.get("error").and_then(Value::as_str).unwrap_or("coding-sync failed");
+            return Err(anyhow!("coding-sync: {detail}"));
+        }
+        Ok(v)
     }
 
     /// Record a tool invocation. `awaiting` inserts it in `awaiting_approval`
@@ -903,13 +930,18 @@ struct ConvKindRow {
     kind: String,
     #[serde(default)]
     workspace_id: Option<String>,
+    #[serde(default)]
+    local_session_id: Option<String>,
 }
 
 /// Workspace root + approval policy for a coding conversation.
-#[derive(Deserialize, Clone)]
+#[derive(Clone)]
 pub struct CodingMeta {
     pub root_path: String,
     pub approval_policy: String,
+    /// Set when the cloud conversation mirrors an on-disk local session; the
+    /// agent streams to the local UI and writes the result back to disk.
+    pub local_session_id: Option<String>,
 }
 
 /// A single web result from the `web-search` edge function.

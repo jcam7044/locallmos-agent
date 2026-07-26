@@ -34,22 +34,18 @@ use tauri::Emitter;
 use tokio::sync::Notify;
 use uuid::Uuid;
 
-/// Mirror one stream event to the local webview during a coding turn. No-op for
-/// ordinary chat turns and in headless service mode (no app handle).
-fn emit_local(
-    state: &Arc<AppState>,
-    is_coding: bool,
-    conversation_id: &str,
-    message_id: &str,
-    event: &Value,
-) {
-    if !is_coding {
+/// Mirror one stream event to the local webview so a web-initiated turn on a
+/// mirrored (local-origin) coding session streams live in the desktop UI. Keyed
+/// by the on-disk `sessionId`; a no-op for pure cloud sessions (no local UI) and
+/// in headless service mode (no app handle).
+fn emit_local(state: &Arc<AppState>, local_session_id: Option<&str>, message_id: &str, event: &Value) {
+    let Some(session_id) = local_session_id else {
         return;
-    }
+    };
     if let Some(app) = state.app.get() {
         let _ = app.emit(
-            "coding",
-            json!({ "conversationId": conversation_id, "messageId": message_id, "event": event }),
+            "local-coding",
+            json!({ "sessionId": session_id, "messageId": message_id, "event": event }),
         );
     }
 }
@@ -167,6 +163,9 @@ pub async fn process(state: &Arc<AppState>, pending: ChatPending) -> Result<()> 
     // Coding session? Resolve the confined workspace + approval policy and
     // prepend the coding system prompt. A missing/inaccessible workspace fails
     // the turn cleanly rather than silently running unscoped.
+    // When the coding conversation mirrors an on-disk local session, the agent
+    // streams to the desktop UI and writes the result back to disk on completion.
+    let mut local_session_id: Option<String> = None;
     let coding_ctx = match state
         .supabase
         .fetch_coding_context(&token, &pending.conversation_id)
@@ -174,6 +173,7 @@ pub async fn process(state: &Arc<AppState>, pending: ChatPending) -> Result<()> 
     {
         Ok(Some(meta)) => match coding::Workspace::new(&meta.root_path) {
             Ok(workspace) => {
+                local_session_id = meta.local_session_id.clone();
                 messages.insert(
                     0,
                     json!({ "role": "system", "content": coding::system_prompt(&workspace.root_str()) }),
@@ -214,11 +214,10 @@ pub async fn process(state: &Arc<AppState>, pending: ChatPending) -> Result<()> 
     // Coding turns also mirror every stream event to the local webview (the
     // device can't receive its own Realtime broadcast, so the local UI relies on
     // these Tauri events for live streaming).
-    let is_coding = coding_ctx.is_some();
     let broadcaster = {
         let state = state.clone();
         let chan = chan.clone();
-        let conv_id = pending.conversation_id.clone();
+        let local_sid = local_session_id.clone();
         let msg_id = pending.id.clone();
         tokio::spawn(async move {
             let mut seq: u64 = 0;
@@ -236,7 +235,7 @@ pub async fn process(state: &Arc<AppState>, pending: ChatPending) -> Result<()> 
                         if ws_ready {
                             state.realtime.broadcast(&chan, CHAT_EVENT, payload.clone()).await.ok();
                         }
-                        emit_local(&state, is_coding, &conv_id, &msg_id, &payload);
+                        emit_local(&state, local_sid.as_deref(), &msg_id, &payload);
                         $buf.clear();
                     }
                 }};
@@ -254,7 +253,7 @@ pub async fn process(state: &Arc<AppState>, pending: ChatPending) -> Result<()> 
                     if ws_ready {
                         state.realtime.broadcast(&chan, CHAT_EVENT, p.clone()).await.ok();
                     }
-                    emit_local(&state, is_coding, &conv_id, &msg_id, &p);
+                    emit_local(&state, local_sid.as_deref(), &msg_id, &p);
                 }};
             }
 
@@ -575,11 +574,6 @@ pub async fn process(state: &Arc<AppState>, pending: ChatPending) -> Result<()> 
 
     let outcome = match loop_err {
         None => {
-            let done = json!({ "type": "done", "seq": last_seq });
-            if ws_ready {
-                state.realtime.broadcast(&chan, CHAT_EVENT, done.clone()).await.ok();
-            }
-            emit_local(state, is_coding, &pending.conversation_id, &pending.id, &done);
             let thinking = (!final_thinking.is_empty()).then_some(final_thinking.as_str());
             state
                 .supabase
@@ -596,6 +590,17 @@ pub async fn process(state: &Arc<AppState>, pending: ChatPending) -> Result<()> 
                     tool_activity_json.as_ref(),
                 )
                 .await?;
+            // Web-initiated turn on a mirrored session: pull the now-complete
+            // cloud transcript into the on-disk session so the desktop UI shows
+            // it, then signal done (order matters — the UI reloads on `done`).
+            if let Some(lsid) = &local_session_id {
+                write_back_to_disk(state, &token, &pending.conversation_id, lsid).await;
+            }
+            let done = json!({ "type": "done", "seq": last_seq });
+            if ws_ready {
+                state.realtime.broadcast(&chan, CHAT_EVENT, done.clone()).await.ok();
+            }
+            emit_local(state, local_session_id.as_deref(), &pending.id, &done);
             Ok(())
         }
         Some(e) => {
@@ -604,7 +609,7 @@ pub async fn process(state: &Arc<AppState>, pending: ChatPending) -> Result<()> 
             if ws_ready {
                 state.realtime.broadcast(&chan, CHAT_EVENT, error_event.clone()).await.ok();
             }
-            emit_local(state, is_coding, &pending.conversation_id, &pending.id, &error_event);
+            emit_local(state, local_session_id.as_deref(), &pending.id, &error_event);
             state
                 .supabase
                 .update_chat_message(&token, &pending.id, "error", None, None, Some(&msg), None, None, None, None)
@@ -618,6 +623,55 @@ pub async fn process(state: &Arc<AppState>, pending: ChatPending) -> Result<()> 
         state.realtime.leave(&chan).await;
     }
     outcome
+}
+
+/// Overwrite an on-disk coding session's transcript from the cloud conversation
+/// after a web-initiated turn, so the desktop app reflects it. The cloud is the
+/// merge point when enrolled (local turns push up; web turns pull down), so a
+/// full replace is safe and idempotent (shared message ids).
+async fn write_back_to_disk(state: &Arc<AppState>, token: &str, conversation_id: &str, local_session_id: &str) {
+    let value = match state.supabase.get_coding_messages(token, conversation_id).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::debug!("coding write-back fetch failed: {e}");
+            return;
+        }
+    };
+    let Some(rows) = value.as_array() else { return };
+    let messages: Vec<crate::coding_store::CodingStoredMessage> = rows
+        .iter()
+        .filter_map(|r| {
+            let role = r.get("role").and_then(Value::as_str)?;
+            if role == "system" {
+                return None; // the coding system prompt is applied at runtime
+            }
+            if r.get("status").and_then(Value::as_str) != Some("done") {
+                return None; // skip an in-flight sibling turn
+            }
+            let created_at = r
+                .get("created_at")
+                .and_then(Value::as_str)
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|d| d.with_timezone(&chrono::Utc))
+                .unwrap_or_else(chrono::Utc::now);
+            Some(crate::coding_store::CodingStoredMessage {
+                id: r.get("id").and_then(Value::as_str).unwrap_or_default().to_string(),
+                role: role.to_string(),
+                content: r.get("content").and_then(Value::as_str).unwrap_or_default().to_string(),
+                thinking: r.get("thinking").and_then(Value::as_str).map(str::to_string),
+                tool_activity: r.get("tool_activity").filter(|v| !v.is_null()).cloned(),
+                cancelled: false,
+                created_at,
+            })
+        })
+        .collect();
+
+    let _guard = state.chat_lock.lock().await;
+    if let Ok(mut session) = crate::coding_store::load(local_session_id) {
+        session.messages = messages;
+        session.updated_at = chrono::Utc::now();
+        crate::coding_store::save(&session).ok();
+    }
 }
 
 /// Execute a server-authorized hosted platform tool through the cloud gateway.

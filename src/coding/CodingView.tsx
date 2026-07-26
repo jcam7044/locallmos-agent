@@ -46,6 +46,9 @@ export function CodingView({ models }: { models: ModelOption[] }) {
 
   useEffect(() => {
     void refreshSessions();
+    // Poll so sessions updated from the web (when enrolled) surface here too.
+    const t = setInterval(() => void refreshSessions(), 5000);
+    return () => clearInterval(t);
   }, [refreshSessions]);
 
   useEffect(() => {

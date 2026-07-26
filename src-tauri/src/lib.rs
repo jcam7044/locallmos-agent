@@ -684,13 +684,21 @@ async fn coding_local_create_session(
     approval_policy: Option<String>,
 ) -> Result<coding_store::CodingSession, String> {
     let workspace = coding::Workspace::new(&workspace_path).map_err(|e| e.to_string())?;
-    let _guard = state.chat_lock.lock().await;
-    let session = coding_store::CodingSession::new(
-        model,
-        workspace.root_str(),
-        approval_policy.unwrap_or_else(|| "approve_writes".into()),
-    );
-    coding_store::save(&session).map_err(|e| e.to_string())?;
+    let session = {
+        let _guard = state.chat_lock.lock().await;
+        let session = coding_store::CodingSession::new(
+            model,
+            workspace.root_str(),
+            approval_policy.unwrap_or_else(|| "approve_writes".into()),
+        );
+        coding_store::save(&session).map_err(|e| e.to_string())?;
+        session
+    };
+    // Mirror the empty session up front so it shows on the web Code page before
+    // its first turn; `send` pushes again with the transcript. Best-effort, and
+    // only outside the guard above — `push_to_cloud` takes `chat_lock` itself to
+    // persist the remote ids, and the lock is not reentrant.
+    local_coding::push_to_cloud(state.inner(), &session).await;
     Ok(session)
 }
 
@@ -873,6 +881,13 @@ fn run_gui() {
             // events to the local webview.
             loop_state.app.set(app.handle().clone()).ok();
             worker::spawn_loops(loop_state.clone());
+
+            // Heal coding sessions that never reached the cloud (created while
+            // offline or unenrolled) so they show up on the web Code page.
+            {
+                let state = loop_state.clone();
+                tauri::async_runtime::spawn(local_coding::backfill_unsynced(state));
+            }
 
             // Best-effort: enable launch-on-login so the tray survives reboots
             // on interactive machines. (Headless rigs use the systemd service.)

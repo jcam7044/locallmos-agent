@@ -12,6 +12,10 @@ fn default_policy() -> String {
     "approve_writes".to_string()
 }
 
+fn new_msg_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodingSession {
@@ -26,11 +30,22 @@ pub struct CodingSession {
     pub approval_policy: String,
     #[serde(default)]
     pub messages: Vec<CodingStoredMessage>,
+    /// When enrolled, the mirrored cloud `chat_conversations` id (for web
+    /// pickup). Absent until the first successful sync.
+    #[serde(default)]
+    pub remote_id: Option<String>,
+    /// The mirrored `coding_workspaces` id backing web-side continuation.
+    #[serde(default)]
+    pub remote_workspace_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodingStoredMessage {
+    /// Stable id shared with the mirrored cloud `chat_messages` row, so pushes
+    /// and pull-backs stay idempotent across the local/cloud stores.
+    #[serde(default = "new_msg_id")]
+    pub id: String,
     pub role: String,
     pub content: String,
     #[serde(default)]
@@ -46,6 +61,7 @@ pub struct CodingStoredMessage {
 impl CodingStoredMessage {
     pub fn new(role: &str, content: String) -> Self {
         Self {
+            id: new_msg_id(),
             role: role.to_string(),
             content,
             thinking: None,
@@ -81,6 +97,8 @@ impl CodingSession {
             workspace_root,
             approval_policy,
             messages: Vec::new(),
+            remote_id: None,
+            remote_workspace_id: None,
         }
     }
 

@@ -42,8 +42,8 @@ export function CodingView({ models, enrolled }: { models: ModelOption[]; enroll
     if (!enrolled) return;
     try {
       const [s, w] = await Promise.all([codingListSessions(), codingListWorkspaces()]);
-      setSessions(s);
-      setWorkspaces(w);
+      setSessions(Array.isArray(s) ? s : []);
+      setWorkspaces(Array.isArray(w) ? w : []);
     } catch (e) {
       setError(String(e));
     }
@@ -63,7 +63,8 @@ export function CodingView({ models, enrolled }: { models: ModelOption[]; enroll
 
   const loadMessages = useCallback(async (id: string) => {
     try {
-      setMessages(await codingGetSession(id));
+      const msgs = await codingGetSession(id);
+      setMessages(Array.isArray(msgs) ? msgs : []);
     } catch (e) {
       setError(String(e));
     }

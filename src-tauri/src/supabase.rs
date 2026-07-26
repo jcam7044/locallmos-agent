@@ -850,7 +850,7 @@ impl Supabase {
             )
             .send()
             .await?;
-        Ok(resp.json().await?)
+        json_or_err(resp, "list_coding_sessions").await
     }
 
     /// Registered workspaces on this rig (for the attach-folder picker / reuse).
@@ -865,7 +865,7 @@ impl Supabase {
             )
             .send()
             .await?;
-        Ok(resp.json().await?)
+        json_or_err(resp, "list_coding_workspaces").await
     }
 
     /// All messages in a coding conversation, with any awaiting/complete tool
@@ -881,8 +881,20 @@ impl Supabase {
             )
             .send()
             .await?;
-        Ok(resp.json().await?)
+        json_or_err(resp, "get_coding_messages").await
     }
+}
+
+/// Parse a JSON body only on a 2xx response; otherwise return a descriptive
+/// error. Without this a PostgREST error object (e.g. a missing column before a
+/// migration is deployed) would be handed back as if it were the query result.
+async fn json_or_err<T: serde::de::DeserializeOwned>(resp: reqwest::Response, ctx: &str) -> Result<T> {
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(anyhow!("{ctx} failed: HTTP {status}: {body}"));
+    }
+    Ok(resp.json().await?)
 }
 
 /// Conversation kind + workspace binding (for `fetch_coding_context`).

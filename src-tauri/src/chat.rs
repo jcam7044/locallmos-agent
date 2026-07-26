@@ -174,14 +174,12 @@ pub async fn process(state: &Arc<AppState>, pending: ChatPending) -> Result<()> 
         Ok(Some(meta)) => match coding::Workspace::new(&meta.root_path) {
             Ok(workspace) => {
                 local_session_id = meta.local_session_id.clone();
+                let policy = coding::ApprovalPolicy::parse(&meta.approval_policy);
                 messages.insert(
                     0,
-                    json!({ "role": "system", "content": coding::system_prompt(&workspace.root_str()) }),
+                    json!({ "role": "system", "content": coding::system_prompt(&workspace.root_str(), policy) }),
                 );
-                Some(coding::CodingContext {
-                    workspace,
-                    policy: coding::ApprovalPolicy::parse(&meta.approval_policy),
-                })
+                Some(coding::CodingContext { workspace, policy })
             }
             Err(e) => {
                 let msg = format!("coding workspace unavailable: {e}");

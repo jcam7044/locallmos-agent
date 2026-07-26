@@ -2,8 +2,38 @@
 //! (and, in prompt-injection tool mode, folded into the turn alongside the tool
 //! manifest). Kept model-agnostic and concise so small local models follow it.
 
-/// Build the coding system prompt for a session rooted at `workspace_root`.
-pub fn system_prompt(workspace_root: &str) -> String {
+use super::ApprovalPolicy;
+
+/// Build the coding system prompt for a session rooted at `workspace_root`,
+/// including the mode-specific rules for `policy`.
+pub fn system_prompt(workspace_root: &str, policy: ApprovalPolicy) -> String {
+    let base = base_prompt(workspace_root);
+    let mode = match policy {
+        ApprovalPolicy::ReadOnly => {
+            "\n\nMODE: READ-ONLY. write_file, edit_file and run_command are unavailable, and \
+mutating git subcommands are refused. Investigate and answer using the read tools. If a change \
+is needed, describe it precisely (including the exact edit you would make) rather than \
+attempting it."
+        }
+        ApprovalPolicy::Plan => {
+            "\n\nMODE: PLAN. write_file, edit_file and run_command are unavailable, and mutating \
+git subcommands are refused. Research the codebase with the read tools, then present a concrete \
+implementation plan: the files to change, the specific edits, and the order to make them. Do not \
+attempt the changes — the user will switch modes to apply them."
+        }
+        ApprovalPolicy::ApproveWrites => {
+            "\n\nMODE: APPROVE EDITS. Writes, commands, and mutating git operations pause for the \
+user's approval before they run. If one is denied, adapt — do not retry the same action."
+        }
+        ApprovalPolicy::Auto => {
+            "\n\nMODE: AUTO. Tools run without prompting. Be correspondingly careful: prefer \
+targeted edits, and verify with the project's build or tests after changing code."
+        }
+    };
+    format!("{base}{mode}")
+}
+
+fn base_prompt(workspace_root: &str) -> String {
     format!(
         "You are a coding agent working inside a single project directory on the \
 user's own machine.
@@ -25,12 +55,12 @@ Working rules:
 before editing, so edits are precise and minimal.
 3. Prefer edit_file for targeted changes; old_string must match the file exactly \
 and be unique unless you set replace_all.
-4. Writes, commands, and mutating git operations may pause for the user's approval. \
-If an action is denied, adapt — do not retry the same action.
-5. After changing code, verify it: run the project's build/tests with run_command \
+4. After changing code, verify it: run the project's build/tests with run_command \
 when appropriate.
-6. Keep the user informed: briefly say what you're about to do and why before \
+5. Keep the user informed: briefly say what you're about to do and why before \
 running impactful tools, and summarize what changed at the end.
-7. Match the surrounding code's style and conventions. Do not add unrelated changes."
+6. Match the surrounding code's style and conventions. Do not add unrelated changes.
+7. Which tools are available, and whether they pause for approval, depends on the \
+session mode stated below."
     )
 }

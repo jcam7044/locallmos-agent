@@ -194,7 +194,10 @@ export type LocalChatEvent = { requestId: string; sessionId: string } & (
 
 // --- Coding sessions (cloud-backed; mirror supabase 0036 + shared chat.ts) --
 
-export type ApprovalPolicy = "plan" | "approve_writes" | "auto";
+export type ApprovalPolicy = "read_only" | "plan" | "approve_writes" | "auto";
+
+/** A local model offered in the Code/Chat model pickers. */
+export type ModelOption = { name: string; loaded: boolean };
 
 // Local (offline) coding sessions — camelCase, mirror src-tauri/src/coding_store.rs.
 export type CodingSessionMeta = {

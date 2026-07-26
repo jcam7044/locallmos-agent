@@ -81,6 +81,13 @@ export const codingCreateSession = (
   approvalPolicy: ApprovalPolicy,
 ) => invoke<CodingSession>("coding_local_create_session", { workspacePath, model, approvalPolicy });
 
+export const codingSetPolicy = (id: string, policy: ApprovalPolicy) =>
+  invoke<CodingSession>("coding_local_set_policy", { id, policy });
+
+/** Validate picked paths against the session workspace; returns them relative. */
+export const codingAttach = (id: string, paths: string[]) =>
+  invoke<string[]>("coding_local_attach", { id, paths });
+
 export const codingListSessions = () =>
   invoke<CodingSessionMeta[]>("coding_local_list_sessions");
 

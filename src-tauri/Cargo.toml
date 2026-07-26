@@ -41,6 +41,7 @@ hex = "0.4"
 dotenvy = "0.15"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tauri-plugin-dialog = "2"
 
 [features]
 # By default the agent refuses free-form shell commands; opt in per build.

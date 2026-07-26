@@ -39,6 +39,19 @@ impl Workspace {
             .unwrap_or_else(|_| path.display().to_string())
     }
 
+    /// Accept an absolute path (from a native file picker) and return it as a
+    /// workspace-relative path, rejecting anything outside the root. Symlinks
+    /// resolve first, so a link inside the workspace pointing out is refused —
+    /// same guarantee `resolve` gives for model-supplied paths.
+    pub fn relativize(&self, absolute: &str) -> Result<String> {
+        let real = std::fs::canonicalize(absolute)
+            .map_err(|e| anyhow!("'{absolute}' is not accessible: {e}"))?;
+        if !real.starts_with(&self.root) {
+            return Err(anyhow!("'{absolute}' is outside the workspace"));
+        }
+        Ok(self.display_relative(&real))
+    }
+
     /// Resolve a workspace-relative path, rejecting anything that escapes the
     /// root. An empty path resolves to the root itself.
     pub fn resolve(&self, rel: &str) -> Result<PathBuf> {

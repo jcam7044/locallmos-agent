@@ -63,7 +63,7 @@ pub async fn send(
 
     // Build the model history: coding system prompt, then prior messages.
     let mut messages: Vec<Value> = Vec::with_capacity(session.messages.len() + 1);
-    messages.push(json!({ "role": "system", "content": coding::system_prompt(&cx.workspace.root_str()) }));
+    messages.push(json!({ "role": "system", "content": coding::system_prompt(&cx.workspace.root_str(), cx.policy) }));
     for m in &session.messages {
         messages.push(json!({ "role": m.role, "content": m.content }));
     }
@@ -226,7 +226,7 @@ async fn run_turn(
     // Native tool calling only works when the model's template renders `.Tools`;
     // otherwise inject a manifest into the last user turn and parse `<tool_call>`
     // blocks ourselves (model-agnostic), exactly as the cloud path does.
-    let tool_defs = coding::tool_defs();
+    let tool_defs = coding::tool_defs_for(cx.policy);
     let native_tools = state.runtime.template_supports_tools(model).await;
     let prompt_tool_mode = !native_tools;
     if prompt_tool_mode {

@@ -7,19 +7,14 @@ import {
   codingGetSession,
   codingListSessions,
   codingSend,
+  codingSetPolicy,
 } from "../api";
-import type { ApprovalPolicy, CodingSessionMeta, CodingStoredMessage } from "../types";
+import type { ApprovalPolicy, CodingSessionMeta, CodingStoredMessage, ModelOption } from "../types";
 import { Markdown } from "../chat/Markdown";
+import { Composer, MODES } from "./Composer";
+import { C } from "./tokens";
 import { useCodingStream, type CodingLive, type CodingTrace } from "./useCodingStream";
 
-type ModelOption = { name: string; loaded: boolean };
-
-const C = {
-  border: "1px solid rgba(148,163,184,0.18)",
-  panel: "rgba(15,23,42,0.4)",
-  accent: "#38bdf8",
-  muted: "#94a3b8",
-};
 
 const uuid = () =>
   (crypto.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`);
@@ -32,6 +27,9 @@ export function CodingView({ models }: { models: ModelOption[] }) {
   const [prompt, setPrompt] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Mode + attachments belong to the active session, so both reload with it.
+  const [policy, setPolicy] = useState<ApprovalPolicy>("approve_writes");
+  const [attachments, setAttachments] = useState<string[]>([]);
   const requestIdRef = useRef<string | null>(null);
   const { live, reset } = useCodingStream(activeId);
 
@@ -62,10 +60,29 @@ export function CodingView({ models }: { models: ModelOption[] }) {
     try {
       const session = await codingGetSession(id);
       setMessages(Array.isArray(session?.messages) ? session.messages : []);
+      if (session?.approvalPolicy) setPolicy(session.approvalPolicy);
     } catch (e) {
       setError(String(e));
     }
   }, []);
+
+  // Attachments are per-message, so a session switch must not carry them over.
+  useEffect(() => {
+    setAttachments([]);
+  }, [activeId]);
+
+  async function changePolicy(next: ApprovalPolicy) {
+    if (!activeId) return;
+    const previous = policy;
+    setPolicy(next); // optimistic — the menu should feel instant
+    try {
+      await codingSetPolicy(activeId, next);
+      await refreshSessions();
+    } catch (e) {
+      setPolicy(previous);
+      setError(String(e));
+    }
+  }
 
   useEffect(() => {
     if (activeId) void loadSession(activeId);
@@ -138,8 +155,12 @@ export function CodingView({ models }: { models: ModelOption[] }) {
 
   async function onSend() {
     if (!activeId || !prompt.trim() || streaming) return;
-    const text = prompt.trim();
+    // Attachments are workspace-relative paths, so they go in as references the
+    // agent opens with its own read tools rather than inlined file contents —
+    // that keeps large files out of the transcript and out of the cloud mirror.
+    const text = withAttachments(prompt.trim(), attachments);
     setPrompt("");
+    setAttachments([]);
     setMessages((m) => [...m, optimisticUser(text)]);
     await runTurn(activeId, text);
   }
@@ -241,6 +262,12 @@ export function CodingView({ models }: { models: ModelOption[] }) {
               busy={busy}
               streaming={streaming}
               onStop={() => requestIdRef.current && codingCancel(requestIdRef.current)}
+              policy={policy}
+              onPolicyChange={(p) => void changePolicy(p)}
+              sessionId={activeId}
+              attachments={attachments}
+              setAttachments={setAttachments}
+              onError={setError}
             />
           </>
         )}
@@ -302,9 +329,11 @@ function NewSession({
         <div style={{ flex: 1 }}>
           <label style={label}>Approvals</label>
           <select value={policy} onChange={(e) => setPolicy(e.target.value as ApprovalPolicy)} style={{ ...input, width: "100%" }}>
-            <option value="approve_writes">Approve writes &amp; commands</option>
-            <option value="plan">Plan (approve everything)</option>
-            <option value="auto">Auto (no approvals)</option>
+            {MODES.map((m) => (
+              <option key={m.value} value={m.value}>
+                {m.label}
+              </option>
+            ))}
           </select>
         </div>
       </div>
@@ -339,7 +368,9 @@ function SessionHeader({ meta, onDelete }: { meta?: CodingSessionMeta; onDelete:
           {meta?.title ?? "Coding session"}
         </div>
         <div style={{ fontSize: 11, color: C.muted, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-          {meta?.workspaceRoot} · {meta?.model} · {meta?.approvalPolicy}
+          {/* Mode lives on the composer pill, which is also where it's changed —
+              showing it here too would go briefly stale after a change. */}
+          {meta?.workspaceRoot}
         </div>
       </div>
       <button onClick={onDelete} style={{ ...btn(false), color: "#f87171" }}>
@@ -422,60 +453,11 @@ function MessageBubble({ role, content }: { role: string; content: string }) {
   );
 }
 
-function Composer({
-  models,
-  model,
-  setModel,
-  prompt,
-  setPrompt,
-  onSend,
-  busy,
-  streaming,
-  onStop,
-}: {
-  models: ModelOption[];
-  model: string;
-  setModel: (m: string) => void;
-  prompt: string;
-  setPrompt: (p: string) => void;
-  onSend: () => void;
-  busy: boolean;
-  streaming: boolean;
-  onStop: () => void;
-}) {
-  return (
-    <div style={{ borderTop: C.border, paddingTop: 10, marginTop: 10, display: "flex", flexDirection: "column", gap: 8 }}>
-      <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-        <select value={model} onChange={(e) => setModel(e.target.value)} style={{ ...input, maxWidth: 260 }}>
-          {models.map((m) => (
-            <option key={m.name} value={m.name}>
-              {m.name}
-            </option>
-          ))}
-        </select>
-        {streaming && (
-          <button onClick={onStop} style={btn(false)}>
-            Stop
-          </button>
-        )}
-      </div>
-      <div style={{ display: "flex", gap: 8 }}>
-        <textarea
-          value={prompt}
-          onChange={(e) => setPrompt(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) onSend();
-          }}
-          placeholder="Message the coding agent… (Cmd/Ctrl+Enter to send)"
-          rows={2}
-          style={{ ...input, flex: 1, resize: "vertical" }}
-        />
-        <button onClick={onSend} disabled={busy || streaming || !prompt.trim()} style={primaryBtn}>
-          Send
-        </button>
-      </div>
-    </div>
-  );
+/** Prefix the prompt with the attached paths, as a plain readable reference list. */
+function withAttachments(text: string, attachments: string[]): string {
+  if (!attachments.length) return text;
+  const list = attachments.map((a) => `- ${a}`).join("\n");
+  return `Attached context (read these first):\n${list}\n\n${text}`;
 }
 
 function optimisticUser(content: string): CodingStoredMessage {

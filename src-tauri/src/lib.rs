@@ -702,6 +702,54 @@ async fn coding_local_create_session(
     Ok(session)
 }
 
+/// Change a session's approval mode mid-conversation. The next turn picks it up
+/// when `local_coding::send` rebuilds the context, so it also governs which
+/// tools the model is offered.
+#[tauri::command]
+async fn coding_local_set_policy(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+    policy: String,
+) -> Result<coding_store::CodingSession, String> {
+    // `parse` falls back to approve_writes for anything unknown, which would
+    // silently *widen* the mode on a typo — round-trip to reject that instead.
+    let parsed = coding::ApprovalPolicy::parse(&policy);
+    if parsed.as_str() != policy {
+        return Err(format!("unknown approval policy: {policy}"));
+    }
+    let session = {
+        let _guard = state.chat_lock.lock().await;
+        let mut s = coding_store::load(&id).map_err(|e| e.to_string())?;
+        s.approval_policy = parsed.as_str().to_string();
+        s.updated_at = chrono::Utc::now();
+        coding_store::save(&s).map_err(|e| e.to_string())?;
+        s
+    };
+    local_coding::push_to_cloud(state.inner(), &session).await;
+    Ok(session)
+}
+
+/// Validate paths picked from the native dialog against the session's workspace,
+/// returning them workspace-relative. Anything outside the root is rejected —
+/// the agent's tools could not read it anyway, so silently accepting it would
+/// produce attachments the model can never open.
+#[tauri::command]
+async fn coding_local_attach(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+    paths: Vec<String>,
+) -> Result<Vec<String>, String> {
+    let session = {
+        let _guard = state.chat_lock.lock().await;
+        coding_store::load(&id).map_err(|e| e.to_string())?
+    };
+    let workspace = coding::Workspace::new(&session.workspace_root).map_err(|e| e.to_string())?;
+    paths
+        .iter()
+        .map(|p| workspace.relativize(p).map_err(|e| e.to_string()))
+        .collect()
+}
+
 #[tauri::command]
 async fn coding_local_list_sessions(
     state: State<'_, Arc<AppState>>,
@@ -877,6 +925,8 @@ fn run_gui() {
     let loop_state = state.clone();
 
     tauri::Builder::default()
+        // Native file/folder pickers for attaching workspace context.
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_autostart::init(
             MacosLauncher::LaunchAgent,
             // Autostart launches minimized to tray.
@@ -976,6 +1026,8 @@ fn run_gui() {
             coding_approve,
             coding_cancel,
             coding_local_create_session,
+            coding_local_set_policy,
+            coding_local_attach,
             coding_local_list_sessions,
             coding_local_get_session,
             coding_local_delete_session,

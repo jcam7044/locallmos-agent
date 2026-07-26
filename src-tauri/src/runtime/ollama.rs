@@ -6,7 +6,7 @@ use super::{ModelInfo, RuntimeAdapter, RuntimeSnapshot};
 pub use super::{ChatDelta, ChatOutput, ToolCall};
 use anyhow::{anyhow, Result};
 use futures_util::StreamExt;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -69,6 +69,30 @@ struct PsModel {
     name: String,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PullProgress {
+    pub model: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub completed: Option<u64>,
+    #[serde(default)]
+    pub total: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct PullChunk {
+    #[serde(default)]
+    status: String,
+    #[serde(default)]
+    completed: Option<u64>,
+    #[serde(default)]
+    total: Option<u64>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
 impl OllamaAdapter {
     pub fn new(http: reqwest::Client) -> Self {
         let base = std::env::var("LOCALLMOS_OLLAMA_URL")
@@ -125,6 +149,71 @@ impl OllamaAdapter {
 
     pub fn endpoint(&self) -> &str {
         &self.base
+    }
+
+    /// Pull a model from the Ollama registry and report the daemon's streamed
+    /// layer progress. The final callback has status `success`.
+    pub async fn pull_model<F: FnMut(PullProgress)>(
+        &self,
+        model: &str,
+        mut on_progress: F,
+    ) -> Result<()> {
+        let model = model.trim();
+        if model.is_empty() {
+            return Err(anyhow!("enter an Ollama model name"));
+        }
+        let resp = self
+            .http
+            .post(format!("{}/api/pull", self.base))
+            .json(&serde_json::json!({ "model": model, "stream": true }))
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let message = resp.text().await.unwrap_or_default();
+            return Err(anyhow!("ollama pull failed: HTTP {status}: {message}"));
+        }
+
+        let mut stream = resp.bytes_stream();
+        let mut buffer = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            buffer.extend_from_slice(&chunk?);
+            while let Some(newline) = buffer.iter().position(|byte| *byte == b'\n') {
+                let line: Vec<u8> = buffer.drain(..=newline).collect();
+                if line.len() <= 1 {
+                    continue;
+                }
+                let update: PullChunk = serde_json::from_slice(&line[..line.len() - 1])?;
+                if let Some(error) = update.error {
+                    return Err(anyhow!(error));
+                }
+                on_progress(PullProgress {
+                    model: model.to_string(),
+                    status: update.status,
+                    completed: update.completed,
+                    total: update.total,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Delete a model from Ollama's managed store.
+    pub async fn delete_model(&self, model: &str) -> Result<()> {
+        let resp = self
+            .http
+            .delete(format!("{}/api/delete", self.base))
+            .json(&serde_json::json!({ "model": model }))
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let message = resp.text().await.unwrap_or_default();
+            return Err(anyhow!("ollama delete failed: HTTP {status}: {message}"));
+        }
+        self.caps_cache.lock().await.remove(model);
+        self.tool_template_cache.lock().await.remove(model);
+        Ok(())
     }
 
     /// Whether `model` advertises tool-calling support (per its `/api/show`

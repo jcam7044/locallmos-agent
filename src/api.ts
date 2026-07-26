@@ -25,6 +25,7 @@ export const saveModelLoadSettings = (
   loadNow: boolean,
 ) => invoke("save_model_load_settings", { modelId, settings, loadNow });
 export const deleteLocalModel = (modelId: string) => invoke("delete_local_model", { modelId });
+export const ollamaPullModel = (model: string) => invoke("ollama_pull_model", { model });
 export const restartRuntime = () => invoke("restart_runtime");
 export const setRuntime = (kind: string) => invoke("set_runtime", { kind });
 export const openModelsDir = () => invoke("open_models_dir");

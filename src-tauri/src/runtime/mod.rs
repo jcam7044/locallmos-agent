@@ -285,6 +285,26 @@ impl Runtime {
         }
     }
 
+    pub async fn delete_model(&self, model: &str) -> anyhow::Result<()> {
+        match self {
+            Runtime::Ollama(a) => a.delete_model(model).await,
+            Runtime::LlamaCpp(_) => {
+                anyhow::bail!("runtime-managed deletion is only available for Ollama")
+            }
+        }
+    }
+
+    pub async fn pull_ollama_model<F: FnMut(ollama::PullProgress)>(
+        &self,
+        model: &str,
+        on_progress: F,
+    ) -> anyhow::Result<()> {
+        match self {
+            Runtime::Ollama(a) => a.pull_model(model, on_progress).await,
+            Runtime::LlamaCpp(_) => anyhow::bail!("Ollama is not the active runtime"),
+        }
+    }
+
     pub async fn restart(&self) -> anyhow::Result<()> {
         match self {
             Runtime::Ollama(a) => a.restart().await,

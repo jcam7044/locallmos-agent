@@ -11,6 +11,8 @@ import {
 import { buttonStyle, card, inputStyle, label, secondaryButton } from "../styles";
 import { formatGB, type AgentStatus, type LocalStatus } from "../types";
 
+type ModelAction = "load" | "eject";
+
 export function Dashboard({
   local,
   running,
@@ -21,29 +23,30 @@ export function Dashboard({
   onChanged: () => void;
 }) {
   const [busy, setBusy] = useState<string | null>(null);
+  const [modelAction, setModelAction] = useState<{ id: string; type: ModelAction } | null>(null);
   const [updateMsg, setUpdateMsg] = useState<string | null>(null);
 
   const load = async (model: string) => {
-    setBusy(model);
+    setModelAction({ id: model, type: "load" });
     try {
       await loadModel(model);
       await onChanged();
     } catch (e) {
       setUpdateMsg(String(e));
     } finally {
-      setBusy(null);
+      setModelAction(null);
     }
   };
 
   const eject = async (model: string) => {
-    setBusy(model);
+    setModelAction({ id: model, type: "eject" });
     try {
       await unloadModel(model);
       await onChanged();
     } catch (e) {
       setUpdateMsg(String(e));
     } finally {
-      setBusy(null);
+      setModelAction(null);
     }
   };
 
@@ -202,9 +205,11 @@ export function Dashboard({
           )
         ) : (
           <div style={{ marginTop: 6 }}>
-            {(local?.models ?? []).map((m) => (
-              <div
-              key={m.id}
+            {(local?.models ?? []).map((m) => {
+              const action = modelAction?.id === m.id ? modelAction.type : null;
+              const showLoad = action === "load" || (!m.loaded && action !== "eject");
+              return <div
+                key={m.id}
                 style={{
                   display: "flex",
                   alignItems: "center",
@@ -219,25 +224,21 @@ export function Dashboard({
                   </div>
                   <div style={label}>{formatGB(m.sizeBytes)}</div>
                 </div>
-                {m.loaded ? (
-                  <button
-                    onClick={() => eject(m.id)}
-                    disabled={busy === m.id}
-                    style={{ ...secondaryButton, color: "#fca5a5", borderColor: "#7f3b3b" }}
-                  >
-                    {busy === m.id ? "Ejecting…" : "Eject"}
+                {showLoad ? (
+                  <button onClick={() => load(m.id)} disabled={action != null} style={secondaryButton}>
+                    {action === "load" ? "Loading…" : "Load"}
                   </button>
                 ) : (
                   <button
-                    onClick={() => load(m.id)}
-                    disabled={busy === m.id}
-                    style={secondaryButton}
+                    onClick={() => eject(m.id)}
+                    disabled={action != null}
+                    style={{ ...secondaryButton, color: "#fca5a5", borderColor: "#7f3b3b" }}
                   >
-                    {busy === m.id ? "Loading…" : "Load"}
+                    {action === "eject" ? "Ejecting…" : "Eject"}
                   </button>
                 )}
-              </div>
-            ))}
+              </div>;
+            })}
           </div>
         )}
       </div>

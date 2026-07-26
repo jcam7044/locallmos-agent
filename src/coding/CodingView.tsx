@@ -72,15 +72,52 @@ export function CodingView({ models }: { models: ModelOption[] }) {
     else setMessages([]);
   }, [activeId, loadSession]);
 
+  // Follow the transcript as it streams, but only while the user is already at
+  // the bottom — scrolling up to read earlier output must not yank them back.
+  // Mirrors chat/Conversation.tsx.
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const pinned = useRef(true);
+
+  const onScroll = () => {
+    const el = scrollRef.current;
+    if (!el) return;
+    pinned.current = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+  };
+
+  // Re-pin when switching sessions, so a fresh transcript opens at the bottom.
+  // Declared first so it applies before the scroll effect in the same commit.
+  useEffect(() => {
+    pinned.current = true;
+  }, [activeId]);
+
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (el && pinned.current) el.scrollTo(0, el.scrollHeight);
+    // Tool calls, diffs and approval prompts all change height mid-turn, so the
+    // trace and approvals are tracked alongside the streamed text.
+  }, [messages, live.text, live.thinking, live.trace.length, live.approvals.length, live.status]);
+
   // Fold the live overlay into the persisted transcript when a turn finishes.
   const prevStatus = useRef(live.status);
   useEffect(() => {
-    if (prevStatus.current !== "done" && (live.status === "done" || live.status === "error")) {
-      if (activeId) void loadSession(activeId);
+    const finished = live.status === "done" || live.status === "error";
+    if (prevStatus.current !== live.status && finished) {
+      const done = live.status === "done";
+      if (activeId) {
+        // Reload first, then drop the overlay, so the finished turn is never
+        // missing for a frame in between. Without the clear, the overlay stays
+        // rendered next to the message it duplicates until the session is
+        // reopened. Errors keep it — the failure text was never persisted.
+        void loadSession(activeId).then(() => {
+          if (done) reset();
+        });
+      } else if (done) {
+        reset();
+      }
       void refreshSessions();
     }
     prevStatus.current = live.status;
-  }, [live.status, activeId, loadSession, refreshSessions]);
+  }, [live.status, activeId, loadSession, refreshSessions, reset]);
 
   const streaming = live.status === "loading" || live.status === "streaming" || live.approvals.length > 0;
 
@@ -184,7 +221,11 @@ export function CodingView({ models }: { models: ModelOption[] }) {
         ) : (
           <>
             <SessionHeader meta={sessions.find((s) => s.id === activeId)} onDelete={() => onDelete(activeId)} />
-            <div style={{ flex: 1, overflowY: "auto", display: "flex", flexDirection: "column", gap: 12, paddingRight: 4 }}>
+            <div
+              ref={scrollRef}
+              onScroll={onScroll}
+              style={{ flex: 1, minHeight: 0, overflowY: "auto", display: "flex", flexDirection: "column", gap: 12, paddingRight: 4 }}
+            >
               {messages.filter((m) => m.role !== "system").map((m, i) => (
                 <MessageBubble key={i} role={m.role} content={m.content} />
               ))}

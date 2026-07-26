@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import type { CodingEvent, CodingStreamEvent } from "../types";
 
@@ -41,17 +41,29 @@ export function useCodingStream(sessionId: string | null) {
 
   useEffect(() => {
     setLive(EMPTY);
+    let cancelled = false;
     let unlisten: (() => void) | undefined;
     void listen<CodingEvent>("local-coding", ({ payload }) => {
       if (payload.sessionId !== sessionRef.current) return;
       setLive((s) => reduce(s, payload.messageId, payload.event));
     }).then((u) => {
-      unlisten = u;
+      // `listen` is async, so the effect can tear down before it resolves —
+      // StrictMode does exactly that on every mount. Detaching here is the only
+      // chance; otherwise the handler leaks, a second one registers, and every
+      // token is appended twice ("WorkingWorking!!").
+      if (cancelled) u();
+      else unlisten = u;
     });
-    return () => unlisten?.();
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
   }, [sessionId]);
 
-  return { live, reset: () => setLive(EMPTY) };
+  // Stable so effects can depend on it without re-running each render.
+  const reset = useCallback(() => setLive(EMPTY), []);
+
+  return { live, reset };
 }
 
 function reduce(s: CodingLive, messageId: string, ev: CodingStreamEvent): CodingLive {

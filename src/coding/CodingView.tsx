@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { open } from "@tauri-apps/plugin-dialog";
 import {
   codingApprove,
   codingCancel,
@@ -238,6 +239,7 @@ export function CodingView({ models }: { models: ModelOption[] }) {
             setPrompt={setPrompt}
             busy={busy}
             onStart={onStart}
+            onError={setError}
           />
         ) : (
           <>
@@ -284,6 +286,7 @@ function NewSession({
   setPrompt,
   busy,
   onStart,
+  onError,
 }: {
   models: ModelOption[];
   model: string;
@@ -292,9 +295,21 @@ function NewSession({
   setPrompt: (p: string) => void;
   busy: boolean;
   onStart: (path: string, policy: ApprovalPolicy) => void;
+  onError: (error: string | null) => void;
 }) {
   const [path, setPath] = useState("");
   const [policy, setPolicy] = useState<ApprovalPolicy>("approve_writes");
+
+  async function chooseFolder() {
+    try {
+      const picked = await open({ directory: true, multiple: false });
+      if (typeof picked !== "string") return;
+      setPath(picked);
+      onError(null);
+    } catch (e) {
+      onError(String(e));
+    }
+  }
 
   return (
     <div style={{ maxWidth: 640, display: "flex", flexDirection: "column", gap: 14 }}>
@@ -305,13 +320,19 @@ function NewSession({
       </p>
 
       <div>
-        <label style={label}>Project folder (absolute path on this machine)</label>
-        <input
-          value={path}
-          onChange={(e) => setPath(e.target.value)}
-          placeholder="/home/you/projects/my-repo"
-          style={{ ...input, width: "100%" }}
-        />
+        <label style={label}>Project folder</label>
+        <div style={{ display: "flex", gap: 8 }}>
+          <input
+            value={path}
+            readOnly
+            placeholder="Choose a folder on this machine"
+            aria-label="Selected project folder"
+            style={{ ...input, flex: 1, minWidth: 0 }}
+          />
+          <button type="button" onClick={() => void chooseFolder()} style={btn(false)}>
+            Choose folder…
+          </button>
+        </div>
       </div>
 
       <div style={{ display: "flex", gap: 8 }}>

@@ -159,16 +159,12 @@ export function Composer({
 
           <button
             onClick={() => setMenu(menu === "context" ? null : "context")}
-            style={{
-              ...contextPill,
-              color: contextInfo?.level === "red" ? "#f87171" : contextInfo?.level === "orange" ? "#fb923c" : C.muted,
-              borderColor: contextInfo?.level === "red" ? "rgba(248,113,113,0.5)" : contextInfo?.level === "orange" ? "rgba(251,146,60,0.5)" : undefined,
-            }}
+            style={contextPill}
             title={contextInfo ? `${contextInfo.percent}% filled (${formatTokens(contextInfo.usedTokens)} of ${formatTokens(contextInfo.maxTokens)}); ${contextInfo.countExact ? "exact" : "estimated"} input usage; ${formatTokens(contextInfo.reserveTokens)} safety reserve for generation and tools` : "Loading context usage"}
             aria-label={contextInfo ? `Context ${contextInfo.percent}% filled` : "Loading context usage"}
           >
             {compacting ? (
-              <span style={{ fontSize: 10 }}>…</span>
+              <span style={{ ...ringLoading, color: C.muted }}>●</span>
             ) : contextInfo ? (
               <ContextRing percent={contextInfo.percent} level={contextInfo.level} />
             ) : (
@@ -279,27 +275,26 @@ function formatTokens(value: number) {
 }
 
 export function ContextRing({ percent, level }: Pick<CodingContextInfo, "percent" | "level">) {
-  const color = level === "red" ? "#f87171" : level === "orange" ? "#fb923c" : "#64748b";
-  const radius = 14;
+  const color = level === "red" ? "#f87171" : level === "orange" ? "#fb923c" : "#3b82f6";
+  const radius = 6;
   const circumference = 2 * Math.PI * radius;
   const offset = circumference * (1 - Math.min(100, Math.max(0, percent)) / 100);
   return (
     <span style={ringWrap} aria-hidden="true">
-      <svg width="36" height="36" viewBox="0 0 36 36" style={{ transform: "rotate(-90deg)" }}>
-        <circle cx="18" cy="18" r={radius} fill="none" stroke="rgba(100,116,139,0.22)" strokeWidth="3" />
+      <svg width="16" height="16" viewBox="0 0 16 16" style={{ transform: "rotate(-90deg)" }}>
+        <circle cx="8" cy="8" r={radius} fill="none" stroke="rgba(148,163,184,0.32)" strokeWidth="2.25" />
         <circle
-          cx="18"
-          cy="18"
+          cx="8"
+          cy="8"
           r={radius}
           fill="none"
           stroke={color}
-          strokeWidth="3"
+          strokeWidth="2.25"
           strokeLinecap="round"
           strokeDasharray={circumference}
           strokeDashoffset={offset}
         />
       </svg>
-      <span style={ringText}>{percent}%</span>
     </span>
   );
 }
@@ -426,33 +421,29 @@ const modelSelect: React.CSSProperties = {
   cursor: "pointer",
 };
 const contextPill: React.CSSProperties = {
-  width: 38,
-  height: 38,
-  borderRadius: "50%",
+  width: 28,
+  height: 28,
+  borderRadius: 7,
   background: "transparent",
-  border: C.border,
+  border: "none",
   padding: 0,
   cursor: "pointer",
   whiteSpace: "nowrap",
 };
 const ringWrap: React.CSSProperties = {
-  position: "relative",
-  width: 36,
-  height: 36,
+  width: 16,
+  height: 16,
   display: "inline-flex",
   alignItems: "center",
   justifyContent: "center",
 };
-const ringText: React.CSSProperties = {
-  position: "absolute",
-  inset: 0,
-  display: "flex",
-  alignItems: "center",
-  justifyContent: "center",
-  color: "#cbd5e1",
-  fontSize: 9,
-  fontWeight: 600,
-  lineHeight: 1,
+const ringLoading: React.CSSProperties = {
+  width: 16,
+  height: 16,
+  fontSize: 8,
+  lineHeight: "16px",
+  textAlign: "center",
+  opacity: 0.7,
 };
 const contextSummary: React.CSSProperties = {
   display: "flex",

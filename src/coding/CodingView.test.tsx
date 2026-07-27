@@ -119,10 +119,16 @@ describe("coding context indicator", () => {
     expect(html).toContain("#fb923c");
   });
 
-  it("renders a circular percentage with the warning color", () => {
+  it("renders a circular arc with the warning color", () => {
     const html = renderToStaticMarkup(<ContextRing percent={72} level="orange" />);
-    expect(html).toContain("72%");
+    expect(html).not.toContain("72%");
     expect(html).toContain("#fb923c");
     expect(html).toContain("stroke-dashoffset");
+  });
+
+  it("uses a blue arc for normal context usage", () => {
+    const html = renderToStaticMarkup(<ContextRing percent={50} level="normal" />);
+    expect(html).toContain("#3b82f6");
+    expect(html).not.toContain("50%");
   });
 });

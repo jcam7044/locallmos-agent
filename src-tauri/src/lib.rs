@@ -772,6 +772,41 @@ async fn coding_local_get_session(
 }
 
 #[tauri::command]
+async fn coding_local_context(
+    app: tauri::AppHandle,
+    state: State<'_, Arc<AppState>>,
+    session_id: String,
+) -> Result<local_coding::CodingContextInfo, String> {
+    local_coding::get_context(&app, state.inner(), &session_id).await
+}
+
+#[tauri::command]
+async fn coding_local_compact(
+    app: tauri::AppHandle,
+    state: State<'_, Arc<AppState>>,
+    session_id: String,
+) -> Result<local_coding::CodingContextInfo, String> {
+    local_coding::compact(&app, state.inner(), &session_id).await
+}
+
+#[tauri::command]
+async fn coding_local_set_context_settings(
+    app: tauri::AppHandle,
+    state: State<'_, Arc<AppState>>,
+    session_id: String,
+    auto_compact: bool,
+    auto_threshold: u8,
+) -> Result<local_coding::CodingContextInfo, String> {
+    local_coding::set_context_settings(
+        &app,
+        state.inner(),
+        &session_id,
+        auto_compact,
+        auto_threshold,
+    ).await
+}
+
+#[tauri::command]
 async fn coding_local_delete_session(state: State<'_, Arc<AppState>>, id: String) -> Result<(), String> {
     {
         let _guard = state.chat_lock.lock().await;
@@ -1087,6 +1122,9 @@ fn run_gui() {
             coding_local_attach,
             coding_local_list_sessions,
             coding_local_get_session,
+            coding_local_context,
+            coding_local_compact,
+            coding_local_set_context_settings,
             coding_local_delete_session,
             coding_local_send,
             coding_local_approve,

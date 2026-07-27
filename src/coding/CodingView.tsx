@@ -4,9 +4,11 @@ import { listen } from "@tauri-apps/api/event";
 import {
   codingApprove,
   codingCancel,
+  codingCompact,
   codingCreateSession,
   codingDeleteSession,
   codingGetSession,
+  codingGetContext,
   codingListSessions,
   codingPreviewClose,
   codingPreviewFocus,
@@ -14,8 +16,9 @@ import {
   codingPreviewStatus,
   codingSend,
   codingSetPolicy,
+  codingSetContextSettings,
 } from "../api";
-import type { ApprovalPolicy, CodingPreviewStatus, CodingSessionMeta, CodingStoredMessage, ModelOption } from "../types";
+import type { ApprovalPolicy, CodingContextInfo, CodingEvent, CodingPreviewStatus, CodingSessionMeta, CodingStoredMessage, ModelOption } from "../types";
 import { Markdown } from "../chat/Markdown";
 import { Composer, MODES } from "./Composer";
 import { C } from "./tokens";
@@ -37,6 +40,8 @@ export function CodingView({ models }: { models: ModelOption[] }) {
   const [policy, setPolicy] = useState<ApprovalPolicy>("approve_writes");
   const [attachments, setAttachments] = useState<string[]>([]);
   const [preview, setPreview] = useState<CodingPreviewStatus | null>(null);
+  const [contextInfo, setContextInfo] = useState<CodingContextInfo | null>(null);
+  const [compacting, setCompacting] = useState(false);
   const requestIdRef = useRef<string | null>(null);
   const { live, reset } = useCodingStream(activeId);
 
@@ -76,6 +81,30 @@ export function CodingView({ models }: { models: ModelOption[] }) {
   // Attachments are per-message, so a session switch must not carry them over.
   useEffect(() => {
     setAttachments([]);
+  }, [activeId]);
+
+  useEffect(() => {
+    let disposed = false;
+    if (activeId) {
+      void codingGetContext(activeId)
+        .then((info) => { if (!disposed) setContextInfo(info); })
+        .catch((e) => { if (!disposed) setError(String(e)); });
+    } else {
+      setContextInfo(null);
+      setCompacting(false);
+    }
+    let unlisten: (() => void) | undefined;
+    void listen<CodingEvent>("local-coding", ({ payload }) => {
+      if (disposed || payload.sessionId !== activeId) return;
+      if (payload.event.type === "context_updated") setContextInfo(payload.event.context);
+      if (payload.event.type === "compaction_started") setCompacting(true);
+      if (payload.event.type === "compaction_completed") setCompacting(false);
+      if (payload.event.type === "compaction_failed") {
+        setCompacting(false);
+        setError(payload.event.message);
+      }
+    }).then((stop) => { unlisten = stop; });
+    return () => { disposed = true; unlisten?.(); };
   }, [activeId]);
 
   async function changePolicy(next: ApprovalPolicy) {
@@ -178,6 +207,12 @@ export function CodingView({ models }: { models: ModelOption[] }) {
 
   async function onSend() {
     if (!activeId || !prompt.trim() || streaming) return;
+    if (prompt.trim().toLowerCase() === "/compact") {
+      setPrompt("");
+      setAttachments([]);
+      await onCompact();
+      return;
+    }
     // Attachments are workspace-relative paths, so they go in as references the
     // agent opens with its own read tools rather than inlined file contents —
     // that keeps large files out of the transcript and out of the cloud mirror.
@@ -186,6 +221,28 @@ export function CodingView({ models }: { models: ModelOption[] }) {
     setAttachments([]);
     setMessages((m) => [...m, optimisticUser(text)]);
     await runTurn(activeId, text);
+  }
+
+  async function onCompact() {
+    if (!activeId || streaming || compacting) return;
+    setCompacting(true);
+    setError(null);
+    try {
+      setContextInfo(await codingCompact(activeId));
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setCompacting(false);
+    }
+  }
+
+  async function changeContextSettings(autoCompact: boolean, autoThreshold: number) {
+    if (!activeId) return;
+    try {
+      setContextInfo(await codingSetContextSettings(activeId, autoCompact, autoThreshold));
+    } catch (e) {
+      setError(String(e));
+    }
   }
 
   async function onStart(workspacePath: string, policy: ApprovalPolicy) {
@@ -291,7 +348,7 @@ export function CodingView({ models }: { models: ModelOption[] }) {
               prompt={prompt}
               setPrompt={setPrompt}
               onSend={onSend}
-              busy={busy}
+              busy={busy || compacting}
               streaming={streaming}
               onStop={() => requestIdRef.current && codingCancel(requestIdRef.current)}
               policy={policy}
@@ -300,6 +357,10 @@ export function CodingView({ models }: { models: ModelOption[] }) {
               attachments={attachments}
               setAttachments={setAttachments}
               onError={setError}
+              contextInfo={contextInfo}
+              compacting={compacting}
+              onCompact={() => void onCompact()}
+              onContextSettings={(auto, threshold) => void changeContextSettings(auto, threshold)}
             />
           </>
         )}

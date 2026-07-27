@@ -1,6 +1,7 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import { LiveTurn, PreviewStrip, visibleCodingMessages } from "./CodingView";
+import { Composer } from "./Composer";
 
 describe("PreviewStrip", () => {
   it("shows the live URL and window controls for a ready preview", () => {
@@ -74,5 +75,47 @@ describe("coding turn rendering", () => {
       { ...base, role: "assistant", content: "Done" },
     ]);
     expect(visible.map((message) => message.content)).toEqual(["Continue", "Done"]);
+  });
+});
+
+describe("coding context indicator", () => {
+  it("shows usage, estimate accuracy, and warning color", () => {
+    const html = renderToStaticMarkup(
+      <Composer
+        models={[{ name: "coder", loaded: true }]}
+        model="coder"
+        setModel={() => undefined}
+        prompt=""
+        setPrompt={() => undefined}
+        onSend={() => undefined}
+        busy={false}
+        streaming={false}
+        onStop={() => undefined}
+        policy="read_only"
+        onPolicyChange={() => undefined}
+        sessionId="session-1"
+        attachments={[]}
+        setAttachments={() => undefined}
+        onError={() => undefined}
+        contextInfo={{
+          usedTokens: 8_000,
+          maxTokens: 32_000,
+          reserveTokens: 6_400,
+          percent: 75,
+          level: "orange",
+          countExact: false,
+          autoCompact: true,
+          autoThreshold: 80,
+          compacted: false,
+          status: "idle",
+        }}
+        compacting={false}
+        onCompact={() => undefined}
+        onContextSettings={() => undefined}
+      />,
+    );
+    expect(html).toContain("8.0k / 32k");
+    expect(html).toContain("Estimated input usage");
+    expect(html).toContain("#fb923c");
   });
 });

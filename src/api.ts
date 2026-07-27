@@ -5,6 +5,7 @@ import type {
   Attachment,
   ChatSession,
   CodingSession,
+  CodingContextInfo,
   CodingSessionMeta,
   CodingStoredMessage,
   CodingPreviewStatus,
@@ -94,6 +95,22 @@ export const codingListSessions = () =>
 
 export const codingGetSession = (id: string) =>
   invoke<CodingSession>("coding_local_get_session", { id });
+
+export const codingGetContext = (sessionId: string) =>
+  invoke<CodingContextInfo>("coding_local_context", { sessionId });
+
+export const codingCompact = (sessionId: string) =>
+  invoke<CodingContextInfo>("coding_local_compact", { sessionId });
+
+export const codingSetContextSettings = (
+  sessionId: string,
+  autoCompact: boolean,
+  autoThreshold: number,
+) => invoke<CodingContextInfo>("coding_local_set_context_settings", {
+  sessionId,
+  autoCompact,
+  autoThreshold,
+});
 
 export const codingDeleteSession = (id: string) =>
   invoke("coding_local_delete_session", { id });

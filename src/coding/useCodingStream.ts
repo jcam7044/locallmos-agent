@@ -67,6 +67,7 @@ export function useCodingStream(sessionId: string | null) {
 }
 
 function reduce(s: CodingLive, messageId: string, ev: CodingStreamEvent): CodingLive {
+  if (ev.type === "context_updated" || ev.type.startsWith("compaction_")) return s;
   // A new assistant message id means a fresh turn — start accumulation over.
   const base = s.messageId && s.messageId !== messageId ? EMPTY : s;
   const cur: CodingLive = { ...base, messageId };

@@ -12,6 +12,14 @@ fn default_policy() -> String {
     "approve_writes".to_string()
 }
 
+fn default_auto_compact() -> bool {
+    true
+}
+
+fn default_auto_threshold() -> u8 {
+    80
+}
+
 fn new_msg_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
@@ -30,6 +38,10 @@ pub struct CodingSession {
     pub approval_policy: String,
     #[serde(default)]
     pub messages: Vec<CodingStoredMessage>,
+    /// Full transcript storage is independent from the active model context.
+    /// The checkpoint summarizes messages through `summarized_through_message_id`.
+    #[serde(default)]
+    pub context_state: CodingContextState,
     /// When enrolled, the mirrored cloud `chat_conversations` id (for web
     /// pickup). Absent until the first successful sync.
     #[serde(default)]
@@ -37,6 +49,50 @@ pub struct CodingSession {
     /// The mirrored `coding_workspaces` id backing web-side continuation.
     #[serde(default)]
     pub remote_workspace_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodingContextState {
+    #[serde(default)]
+    pub checkpoint: Option<String>,
+    #[serde(default)]
+    pub summarized_through_message_id: Option<String>,
+    #[serde(default)]
+    pub latest_used_tokens: Option<u32>,
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
+    #[serde(default)]
+    pub count_exact: bool,
+    #[serde(default)]
+    pub reserve_tokens: Option<u32>,
+    /// Multiplier learned by comparing an estimated preflight with the
+    /// runtime-reported prompt count after generation (primarily Ollama).
+    #[serde(default)]
+    pub token_estimate_scale: Option<f32>,
+    #[serde(default = "default_auto_compact")]
+    pub auto_compact: bool,
+    #[serde(default = "default_auto_threshold")]
+    pub auto_threshold: u8,
+    #[serde(default)]
+    pub last_compacted_at: Option<DateTime<Utc>>,
+}
+
+impl Default for CodingContextState {
+    fn default() -> Self {
+        Self {
+            checkpoint: None,
+            summarized_through_message_id: None,
+            latest_used_tokens: None,
+            max_tokens: None,
+            count_exact: false,
+            reserve_tokens: None,
+            token_estimate_scale: None,
+            auto_compact: default_auto_compact(),
+            auto_threshold: default_auto_threshold(),
+            last_compacted_at: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -97,6 +153,7 @@ impl CodingSession {
             workspace_root,
             approval_policy,
             messages: Vec::new(),
+            context_state: CodingContextState::default(),
             remote_id: None,
             remote_workspace_id: None,
         }
@@ -180,6 +237,8 @@ mod tests {
         let loaded = load(&s.id).unwrap();
         assert_eq!(loaded.workspace_root, "/tmp/repo");
         assert_eq!(loaded.messages.len(), 1);
+        assert!(loaded.context_state.auto_compact);
+        assert_eq!(loaded.context_state.auto_threshold, 80);
 
         let metas = list().unwrap();
         assert_eq!(metas.len(), 1);

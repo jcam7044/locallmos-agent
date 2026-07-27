@@ -189,6 +189,16 @@ pub struct ChatOutput {
     pub tool_calls: Vec<ToolCall>,
 }
 
+/// Input-token usage for a request before generation. llama.cpp can count the
+/// fully rendered chat template exactly; runtimes without that endpoint return
+/// a conservative estimate so callers can still enforce a safety budget.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InputTokenCount {
+    pub tokens: u32,
+    pub exact: bool,
+}
+
 /// A managed local LLM runtime. Methods are best-effort and should degrade to a
 /// sensible snapshot rather than panicking when the runtime is down.
 pub trait RuntimeAdapter {
@@ -358,8 +368,43 @@ impl Runtime {
 
     pub async fn context_size(&self) -> Option<u64> {
         match self {
-            Runtime::Ollama(_) => Some(8192),
+            Runtime::Ollama(a) => a.effective_context_size(None).await.map(u64::from),
             Runtime::LlamaCpp(a) => a.effective_context_size().await,
+        }
+    }
+
+    /// Effective allocated context for the selected model. A configured value
+    /// wins because it is also sent to the runtime for the request.
+    pub async fn context_size_for_model(
+        &self,
+        model: &str,
+        settings: &ModelLoadSettings,
+    ) -> u32 {
+        if let Some(size) = settings.context_size {
+            return size;
+        }
+        match self {
+            Runtime::Ollama(a) => a.effective_context_size(Some(model)).await.unwrap_or(4096),
+            Runtime::LlamaCpp(a) => a.effective_context_size().await.unwrap_or(4096) as u32,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn count_input_tokens(
+        &self,
+        model: &str,
+        messages: &Value,
+        think: bool,
+        tools: Option<&Value>,
+        options: Option<&Value>,
+        load_settings: &ModelLoadSettings,
+    ) -> InputTokenCount {
+        match self {
+            Runtime::LlamaCpp(a) => a
+                .count_input_tokens(model, messages, think, tools, options, load_settings)
+                .await
+                .unwrap_or_else(|| estimate_input_tokens(messages, tools)),
+            Runtime::Ollama(_) => estimate_input_tokens(messages, tools),
         }
     }
 
@@ -387,6 +432,21 @@ impl Runtime {
                     .await
             }
         }
+    }
+}
+
+fn estimate_input_tokens(messages: &Value, tools: Option<&Value>) -> InputTokenCount {
+    // Code and JSON commonly tokenize more densely than prose. Three UTF-8
+    // bytes/token plus fixed template overhead is intentionally conservative.
+    let message_bytes = serde_json::to_vec(messages).map(|v| v.len()).unwrap_or(0);
+    let tool_bytes = tools
+        .and_then(|v| serde_json::to_vec(v).ok())
+        .map(|v| v.len())
+        .unwrap_or(0);
+    InputTokenCount {
+        tokens: (((message_bytes + tool_bytes) as u64).div_ceil(3) + 256)
+            .min(u32::MAX as u64) as u32,
+        exact: false,
     }
 }
 
@@ -424,5 +484,15 @@ mod model_settings_tests {
         }
         .validate()
         .is_err());
+    }
+
+    #[test]
+    fn fallback_token_count_is_conservative_and_marked_estimated() {
+        let count = estimate_input_tokens(
+            &serde_json::json!([{ "role": "user", "content": "fn main() {}" }]),
+            Some(&serde_json::json!([{ "type": "function", "function": { "name": "read_file" } }])),
+        );
+        assert!(!count.exact);
+        assert!(count.tokens >= 256);
     }
 }

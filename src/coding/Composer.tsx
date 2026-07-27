@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { codingAttach } from "../api";
-import type { ApprovalPolicy, ModelOption } from "../types";
+import type { ApprovalPolicy, CodingContextInfo, ModelOption } from "../types";
 import { C } from "./tokens";
 
 /**
@@ -39,6 +39,10 @@ export function Composer({
   attachments,
   setAttachments,
   onError,
+  contextInfo,
+  compacting,
+  onCompact,
+  onContextSettings,
 }: {
   models: ModelOption[];
   model: string;
@@ -55,8 +59,12 @@ export function Composer({
   attachments: string[];
   setAttachments: (a: string[]) => void;
   onError: (e: string | null) => void;
+  contextInfo: CodingContextInfo | null;
+  compacting: boolean;
+  onCompact: () => void;
+  onContextSettings: (autoCompact: boolean, autoThreshold: number) => void;
 }) {
-  const [menu, setMenu] = useState<null | "mode" | "add">(null);
+  const [menu, setMenu] = useState<null | "mode" | "add" | "context">(null);
   const boxRef = useRef<HTMLDivElement>(null);
   const taRef = useRef<HTMLTextAreaElement>(null);
 
@@ -149,6 +157,18 @@ export function Composer({
 
           <div style={{ flex: 1 }} />
 
+          <button
+            onClick={() => setMenu(menu === "context" ? null : "context")}
+            style={{
+              ...contextPill,
+              color: contextInfo?.level === "red" ? "#f87171" : contextInfo?.level === "orange" ? "#fb923c" : C.muted,
+              borderColor: contextInfo?.level === "red" ? "rgba(248,113,113,0.5)" : contextInfo?.level === "orange" ? "rgba(251,146,60,0.5)" : undefined,
+            }}
+            title={contextInfo ? `${contextInfo.countExact ? "Exact" : "Estimated"} input usage; ${formatTokens(contextInfo.reserveTokens)} reserved for generation and tools` : "Loading context usage"}
+          >
+            {compacting ? "Compacting…" : contextInfo ? `${formatTokens(contextInfo.usedTokens)} / ${formatTokens(contextInfo.maxTokens)}` : "Context…"}
+          </button>
+
           <select
             value={model}
             onChange={(e) => setModel(e.target.value)}
@@ -206,8 +226,49 @@ export function Composer({
           ))}
         </Popup>
       )}
+
+      {menu === "context" && contextInfo && (
+        <Popup style={{ right: 36 }}>
+          <div style={menuHead}>Context window</div>
+          <div style={contextSummary}>
+            <strong>{formatTokens(contextInfo.usedTokens)} / {formatTokens(contextInfo.maxTokens)}</strong>
+            <span>{contextInfo.countExact ? "Exact count" : "Estimated count"} · {formatTokens(contextInfo.reserveTokens)} reserved</span>
+            {contextInfo.compacted && <span>Older turns are represented by a checkpoint.</span>}
+          </div>
+          <MenuItem
+            label={compacting ? "Compacting…" : "Compact now"}
+            hint="Preserves the transcript and replaces older model context with a structured checkpoint. You can also type /compact."
+            onClick={() => { setMenu(null); if (!compacting) onCompact(); }}
+          />
+          <label style={contextSetting}>
+            <span>Auto compact</span>
+            <input
+              type="checkbox"
+              checked={contextInfo.autoCompact}
+              onChange={(event) => onContextSettings(event.target.checked, contextInfo.autoThreshold)}
+            />
+          </label>
+          <label style={contextSetting}>
+            <span>Threshold</span>
+            <select
+              value={contextInfo.autoThreshold}
+              disabled={!contextInfo.autoCompact}
+              onChange={(event) => onContextSettings(contextInfo.autoCompact, Number(event.target.value))}
+              style={thresholdSelect}
+            >
+              {[70, 75, 80, 85, 90].map((value) => <option key={value} value={value}>{value}%</option>)}
+            </select>
+          </label>
+        </Popup>
+      )}
     </div>
   );
+}
+
+function formatTokens(value: number) {
+  if (value < 1000) return String(value);
+  const scaled = value / 1000;
+  return `${scaled >= 10 ? scaled.toFixed(0) : scaled.toFixed(1)}k`;
 }
 
 function Popup({ children, style }: { children: React.ReactNode; style?: React.CSSProperties }) {
@@ -330,6 +391,42 @@ const modelSelect: React.CSSProperties = {
   fontSize: 12,
   padding: "0 6px",
   cursor: "pointer",
+};
+const contextPill: React.CSSProperties = {
+  height: 26,
+  borderRadius: 8,
+  background: "transparent",
+  border: C.border,
+  fontSize: 11,
+  padding: "0 7px",
+  cursor: "pointer",
+  whiteSpace: "nowrap",
+};
+const contextSummary: React.CSSProperties = {
+  display: "flex",
+  flexDirection: "column",
+  gap: 3,
+  color: C.muted,
+  fontSize: 11,
+  padding: "5px 9px 8px",
+  borderBottom: C.border,
+};
+const contextSetting: React.CSSProperties = {
+  display: "flex",
+  alignItems: "center",
+  justifyContent: "space-between",
+  gap: 12,
+  color: "#cbd5e1",
+  fontSize: 12,
+  padding: "7px 9px",
+};
+const thresholdSelect: React.CSSProperties = {
+  background: "#111827",
+  border: C.border,
+  borderRadius: 6,
+  color: "#cbd5e1",
+  fontSize: 11,
+  padding: "2px 5px",
 };
 const sendBtn: React.CSSProperties = {
   width: 28,

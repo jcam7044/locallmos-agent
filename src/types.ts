@@ -229,6 +229,33 @@ export type CodingSession = {
   workspaceRoot: string;
   approvalPolicy: ApprovalPolicy;
   messages: CodingStoredMessage[];
+  contextState: CodingContextState;
+};
+
+export type CodingContextState = {
+  checkpoint: string | null;
+  summarizedThroughMessageId: string | null;
+  latestUsedTokens: number | null;
+  maxTokens: number | null;
+  countExact: boolean;
+  reserveTokens: number | null;
+  tokenEstimateScale: number | null;
+  autoCompact: boolean;
+  autoThreshold: number;
+  lastCompactedAt: string | null;
+};
+
+export type CodingContextInfo = {
+  usedTokens: number;
+  maxTokens: number;
+  reserveTokens: number;
+  percent: number;
+  level: "normal" | "orange" | "red";
+  countExact: boolean;
+  autoCompact: boolean;
+  autoThreshold: number;
+  compacted: boolean;
+  status: "idle" | "compacting";
 };
 
 export type CodingPreviewStatus = {
@@ -253,6 +280,10 @@ export type CodingStreamEvent =
   | { type: "command"; command: string; chunk: string; exitCode?: number | null; invocationId?: string }
   | { type: "approval_needed"; invocationId: string; name: string; preview: string }
   | { type: "approval_resolved"; invocationId: string; decision: "approved" | "denied" }
+  | { type: "context_updated"; context: CodingContextInfo }
+  | { type: "compaction_started"; reason: "manual" | "auto" }
+  | { type: "compaction_completed"; reason: "manual" | "auto" }
+  | { type: "compaction_failed"; message: string }
   | { type: "done" }
   | { type: "error"; message: string };
 

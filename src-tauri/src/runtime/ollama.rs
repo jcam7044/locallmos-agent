@@ -67,6 +67,10 @@ struct PsResp {
 #[derive(Deserialize)]
 struct PsModel {
     name: String,
+    #[serde(default)]
+    model: String,
+    #[serde(default)]
+    context_length: Option<u32>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -149,6 +153,22 @@ impl OllamaAdapter {
 
     pub fn endpoint(&self) -> &str {
         &self.base
+    }
+
+    /// Allocated context reported by `/api/ps`. This is deliberately not the
+    /// training-time maximum from `/api/show`.
+    pub async fn effective_context_size(&self, model: Option<&str>) -> Option<u32> {
+        let models = self
+            .http
+            .get(format!("{}/api/ps", self.base))
+            .send()
+            .await
+            .ok()?
+            .json::<PsResp>()
+            .await
+            .ok()?
+            .models;
+        select_context_size(models, model)
     }
 
     /// Pull a model from the Ollama registry and report the daemon's streamed
@@ -439,6 +459,30 @@ impl OllamaAdapter {
             generation_metrics: None,
             tool_calls,
         })
+    }
+}
+
+fn select_context_size(models: Vec<PsModel>, model: Option<&str>) -> Option<u32> {
+    let picked = match model {
+        Some(want) => models.into_iter().find(|m| m.name == want || m.model == want),
+        None => models.into_iter().next(),
+    }?;
+    picked.context_length
+}
+
+#[cfg(test)]
+mod context_tests {
+    use super::*;
+
+    #[test]
+    fn selects_allocated_context_for_requested_model() {
+        let response: PsResp = serde_json::from_value(serde_json::json!({
+            "models": [
+                { "name": "small:latest", "model": "small:latest", "context_length": 4096 },
+                { "name": "coder:latest", "model": "coder:latest", "context_length": 32768 }
+            ]
+        })).unwrap();
+        assert_eq!(select_context_size(response.models, Some("coder:latest")), Some(32768));
     }
 }
 

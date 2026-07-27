@@ -1,7 +1,7 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import { LiveTurn, PreviewStrip, visibleCodingMessages } from "./CodingView";
-import { Composer } from "./Composer";
+import { Composer, ContextRing } from "./Composer";
 
 describe("PreviewStrip", () => {
   it("shows the live URL and window controls for a ready preview", () => {
@@ -98,7 +98,7 @@ describe("coding context indicator", () => {
         setAttachments={() => undefined}
         onError={() => undefined}
         contextInfo={{
-          usedTokens: 8_000,
+          usedTokens: 24_000,
           maxTokens: 32_000,
           reserveTokens: 6_400,
           percent: 75,
@@ -114,8 +114,15 @@ describe("coding context indicator", () => {
         onContextSettings={() => undefined}
       />,
     );
-    expect(html).toContain("8.0k / 32k");
-    expect(html).toContain("Estimated input usage");
+    expect(html).toContain("Context 75% filled");
+    expect(html).toContain("75% filled (24k of 32k)");
     expect(html).toContain("#fb923c");
+  });
+
+  it("renders a circular percentage with the warning color", () => {
+    const html = renderToStaticMarkup(<ContextRing percent={72} level="orange" />);
+    expect(html).toContain("72%");
+    expect(html).toContain("#fb923c");
+    expect(html).toContain("stroke-dashoffset");
   });
 });

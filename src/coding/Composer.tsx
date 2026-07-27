@@ -164,9 +164,16 @@ export function Composer({
               color: contextInfo?.level === "red" ? "#f87171" : contextInfo?.level === "orange" ? "#fb923c" : C.muted,
               borderColor: contextInfo?.level === "red" ? "rgba(248,113,113,0.5)" : contextInfo?.level === "orange" ? "rgba(251,146,60,0.5)" : undefined,
             }}
-            title={contextInfo ? `${contextInfo.countExact ? "Exact" : "Estimated"} input usage; ${formatTokens(contextInfo.reserveTokens)} reserved for generation and tools` : "Loading context usage"}
+            title={contextInfo ? `${contextInfo.percent}% filled (${formatTokens(contextInfo.usedTokens)} of ${formatTokens(contextInfo.maxTokens)}); ${contextInfo.countExact ? "exact" : "estimated"} input usage; ${formatTokens(contextInfo.reserveTokens)} safety reserve for generation and tools` : "Loading context usage"}
+            aria-label={contextInfo ? `Context ${contextInfo.percent}% filled` : "Loading context usage"}
           >
-            {compacting ? "Compacting…" : contextInfo ? `${formatTokens(contextInfo.usedTokens)} / ${formatTokens(contextInfo.maxTokens)}` : "Context…"}
+            {compacting ? (
+              <span style={{ fontSize: 10 }}>…</span>
+            ) : contextInfo ? (
+              <ContextRing percent={contextInfo.percent} level={contextInfo.level} />
+            ) : (
+              <span style={{ fontSize: 10 }}>…</span>
+            )}
           </button>
 
           <select
@@ -269,6 +276,32 @@ function formatTokens(value: number) {
   if (value < 1000) return String(value);
   const scaled = value / 1000;
   return `${scaled >= 10 ? scaled.toFixed(0) : scaled.toFixed(1)}k`;
+}
+
+export function ContextRing({ percent, level }: Pick<CodingContextInfo, "percent" | "level">) {
+  const color = level === "red" ? "#f87171" : level === "orange" ? "#fb923c" : "#64748b";
+  const radius = 14;
+  const circumference = 2 * Math.PI * radius;
+  const offset = circumference * (1 - Math.min(100, Math.max(0, percent)) / 100);
+  return (
+    <span style={ringWrap} aria-hidden="true">
+      <svg width="36" height="36" viewBox="0 0 36 36" style={{ transform: "rotate(-90deg)" }}>
+        <circle cx="18" cy="18" r={radius} fill="none" stroke="rgba(100,116,139,0.22)" strokeWidth="3" />
+        <circle
+          cx="18"
+          cy="18"
+          r={radius}
+          fill="none"
+          stroke={color}
+          strokeWidth="3"
+          strokeLinecap="round"
+          strokeDasharray={circumference}
+          strokeDashoffset={offset}
+        />
+      </svg>
+      <span style={ringText}>{percent}%</span>
+    </span>
+  );
 }
 
 function Popup({ children, style }: { children: React.ReactNode; style?: React.CSSProperties }) {
@@ -393,14 +426,33 @@ const modelSelect: React.CSSProperties = {
   cursor: "pointer",
 };
 const contextPill: React.CSSProperties = {
-  height: 26,
-  borderRadius: 8,
+  width: 38,
+  height: 38,
+  borderRadius: "50%",
   background: "transparent",
   border: C.border,
-  fontSize: 11,
-  padding: "0 7px",
+  padding: 0,
   cursor: "pointer",
   whiteSpace: "nowrap",
+};
+const ringWrap: React.CSSProperties = {
+  position: "relative",
+  width: 36,
+  height: 36,
+  display: "inline-flex",
+  alignItems: "center",
+  justifyContent: "center",
+};
+const ringText: React.CSSProperties = {
+  position: "absolute",
+  inset: 0,
+  display: "flex",
+  alignItems: "center",
+  justifyContent: "center",
+  color: "#cbd5e1",
+  fontSize: 9,
+  fontWeight: 600,
+  lineHeight: 1,
 };
 const contextSummary: React.CSSProperties = {
   display: "flex",

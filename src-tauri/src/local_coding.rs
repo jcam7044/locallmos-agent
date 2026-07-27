@@ -88,7 +88,11 @@ pub async fn send(
     // Count the exact request shape before any tool activity. Auto-compaction
     // happens here so a turn visibly pauses before the model starts working.
     let mut info = refresh_context(&app, &state, &session).await?;
-    if session.context_state.auto_compact && info.percent >= session.context_state.auto_threshold {
+    let projected_percent = ((u64::from(info.used_tokens) + u64::from(info.reserve_tokens)) * 100)
+        / u64::from(info.max_tokens.max(1));
+    if session.context_state.auto_compact
+        && projected_percent >= u64::from(session.context_state.auto_threshold)
+    {
         match compact_internal(&app, &state, &session_id, "auto").await {
             Ok(next) => info = next,
             Err(error) => {
@@ -323,13 +327,15 @@ async fn build_context(
 }
 
 fn reserve_tokens(max_tokens: u32) -> u32 {
-    1024.max(max_tokens / 5).min(max_tokens.saturating_sub(1))
+    (max_tokens / 10)
+        .clamp(2_048, 8_192)
+        .min(max_tokens.saturating_sub(1))
 }
 
 fn context_info(session: &CodingSession, used: u32, max: u32, exact: bool) -> CodingContextInfo {
     let reserve = reserve_tokens(max);
-    let percent = (((u64::from(used) + u64::from(reserve)) * 100) / u64::from(max.max(1)))
-        .min(100) as u8;
+    let denominator = u64::from(max.max(1));
+    let percent = ((u64::from(used) * 100 + denominator / 2) / denominator).min(100) as u8;
     CodingContextInfo {
         used_tokens: used,
         max_tokens: max,
@@ -841,16 +847,23 @@ mod tests {
     }
 
     #[test]
-    fn context_budget_levels_include_generation_reserve() {
+    fn context_budget_levels_track_actual_fill() {
         let session = CodingSession::new("model".into(), "/tmp".into(), "read_only".into());
         let normal = context_info(&session, 10_000, 32_000, true);
-        assert_eq!(normal.reserve_tokens, 6_400);
+        assert_eq!(normal.reserve_tokens, 3_200);
         assert_eq!(normal.level, "normal");
 
-        let orange = context_info(&session, 17_000, 32_000, true);
+        let orange = context_info(&session, 23_000, 32_000, true);
         assert_eq!(orange.level, "orange");
-        let red = context_info(&session, 23_000, 32_000, true);
+        let red = context_info(&session, 29_000, 32_000, true);
         assert_eq!(red.level, "red");
+    }
+
+    #[test]
+    fn reserve_is_bounded_for_small_and_large_contexts() {
+        assert_eq!(reserve_tokens(4_096), 2_048);
+        assert_eq!(reserve_tokens(32_000), 3_200);
+        assert_eq!(reserve_tokens(230_000), 8_192);
     }
 
     #[test]

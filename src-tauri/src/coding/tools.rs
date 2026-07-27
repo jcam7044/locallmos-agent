@@ -3,7 +3,7 @@
 //! workspace root. Errors bubble up to `super::execute`, which turns them into
 //! model-visible tool content rather than failing the turn.
 
-use super::{CodingContext, ToolRun};
+use super::{CodingContext, CodingHost, ToolRun};
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -21,7 +21,7 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(180);
 const SKIP_DIRS: &[&str] = &[".git", "node_modules", "target", "dist", "build", ".venv", "__pycache__", ".next"];
 
 /// Dispatch a validated coding tool call.
-pub async fn run(cx: &CodingContext, name: &str, args: &Value) -> Result<ToolRun> {
+pub async fn run(cx: &CodingContext, host: Option<&CodingHost>, name: &str, args: &Value) -> Result<ToolRun> {
     match name {
         "read_file" => read_file(cx, args),
         "list_dir" => list_dir(cx, args),
@@ -35,7 +35,73 @@ pub async fn run(cx: &CodingContext, name: &str, args: &Value) -> Result<ToolRun
             let a = str_arg(args, "args")?;
             run_shell(cx, &format!("git {a}")).await
         }
+        name if name.starts_with("dev_server_") || name.starts_with("web_preview_") => {
+            let host = host.ok_or_else(|| anyhow!("web preview tools are available only in local desktop coding sessions"))?;
+            run_preview(cx, host, name, args).await
+        }
         other => Err(anyhow!("unknown coding tool: {other}")),
+    }
+}
+
+async fn run_preview(cx: &CodingContext, host: &CodingHost, name: &str, args: &Value) -> Result<ToolRun> {
+    let result = match name {
+        "dev_server_start" => {
+            let command = str_arg(args, "command")?;
+            let url = str_arg(args, "url")?;
+            let timeout = args.get("timeout_seconds").and_then(Value::as_u64).unwrap_or(30).clamp(1, 120);
+            host.preview
+                .start_server(&host.app, &host.session_id, cx.workspace.root(), &command, &url, Duration::from_secs(timeout))
+                .await?
+        }
+        "dev_server_logs" => host.preview.server_logs(&host.session_id, args.get("clear").and_then(Value::as_bool).unwrap_or(false)).await?,
+        "dev_server_stop" => host.preview.stop_server(&host.app, &host.session_id).await?,
+        "web_preview_open" => {
+            let url = str_arg(args, "url")?;
+            let width = args.get("width").and_then(Value::as_u64).unwrap_or(1280).clamp(320, 3840) as u32;
+            let height = args.get("height").and_then(Value::as_u64).unwrap_or(800).clamp(240, 2160) as u32;
+            host.preview.open(&host.app, &host.session_id, &url, width, height).await?
+        }
+        "web_preview_snapshot" => host.preview.snapshot(&host.app, &host.session_id, args.get("selector").and_then(Value::as_str)).await?,
+        "web_preview_click" => host.preview.click(&host.app, &host.session_id, &str_arg(args, "ref")?).await?,
+        "web_preview_fill" => host.preview.fill(
+            &host.app,
+            &host.session_id,
+            &str_arg(args, "ref")?,
+            &str_arg_allow_empty(args, "text")?,
+            args.get("submit").and_then(Value::as_bool).unwrap_or(false),
+        ).await?,
+        "web_preview_press" => host.preview.press(&host.app, &host.session_id, &str_arg(args, "ref")?, &str_arg(args, "key")?).await?,
+        "web_preview_reload" => host.preview.reload(&host.app, &host.session_id).await?,
+        "web_preview_resize" => {
+            let width = args.get("width").and_then(Value::as_u64).ok_or_else(|| anyhow!("missing required argument 'width'"))? as u32;
+            let height = args.get("height").and_then(Value::as_u64).ok_or_else(|| anyhow!("missing required argument 'height'"))? as u32;
+            host.preview.resize(&host.app, &host.session_id, width, height).await?
+        }
+        "web_preview_console" => host.preview.console(&host.app, &host.session_id, args.get("clear").and_then(Value::as_bool).unwrap_or(false)).await?,
+        "web_preview_close" => {
+            host.preview.close_session(&host.app, &host.session_id, true).await?;
+            "Closed preview and stopped its development server.".into()
+        }
+        _ => return Err(anyhow!("unknown preview tool: {name}")),
+    };
+    let content = truncate(&result, MAX_OUTPUT_CHARS);
+    Ok(ToolRun {
+        summary: preview_summary(name, &content),
+        content,
+        event: None,
+        activity: Some(json!({
+            "name": name, "provider": "coding", "status": "succeeded",
+            "summary": preview_summary(name, &result), "citations": [],
+        })),
+    })
+}
+
+fn preview_summary(name: &str, result: &str) -> String {
+    match name {
+        "web_preview_snapshot" => "inspected preview".into(),
+        "web_preview_console" => "read browser console".into(),
+        "dev_server_logs" => "read server logs".into(),
+        _ => result.lines().next().unwrap_or(name).chars().take(120).collect(),
     }
 }
 
@@ -283,6 +349,13 @@ fn str_arg(args: &Value, key: &str) -> Result<String> {
         .and_then(Value::as_str)
         .map(str::to_string)
         .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow!("missing required argument '{key}'"))
+}
+
+fn str_arg_allow_empty(args: &Value, key: &str) -> Result<String> {
+    args.get(key)
+        .and_then(Value::as_str)
+        .map(str::to_string)
         .ok_or_else(|| anyhow!("missing required argument '{key}'"))
 }
 

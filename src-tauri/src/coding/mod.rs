@@ -6,6 +6,7 @@
 //! calls here, gating mutating ones through the cross-device approval flow.
 
 mod prompt;
+pub mod preview;
 mod tools;
 mod workspace;
 
@@ -66,7 +67,7 @@ impl ApprovalPolicy {
 /// Whether a call would change the workspace. `git` depends on the subcommand.
 fn is_mutating(name: &str, args: &Value) -> bool {
     match name {
-        "write_file" | "edit_file" | "run_command" => true,
+        "write_file" | "edit_file" | "run_command" | "dev_server_start" => true,
         "git" => !tools::git_is_readonly(args.get("args").and_then(Value::as_str).unwrap_or("")),
         _ => false,
     }
@@ -77,6 +78,16 @@ fn is_mutating(name: &str, args: &Value) -> bool {
 pub struct CodingContext {
     pub workspace: Workspace,
     pub policy: ApprovalPolicy,
+}
+
+/// GUI-only services available to local desktop coding turns. Keeping this
+/// explicit prevents preview tools from silently appearing in headless/cloud
+/// execution paths.
+#[derive(Clone)]
+pub struct CodingHost {
+    pub app: tauri::AppHandle,
+    pub preview: std::sync::Arc<preview::PreviewManager>,
+    pub session_id: String,
 }
 
 /// The result of running one coding tool.
@@ -97,6 +108,10 @@ pub fn is_known_tool(name: &str) -> bool {
     matches!(
         name,
         "read_file" | "list_dir" | "search" | "write_file" | "edit_file" | "run_command" | "git"
+            | "dev_server_start" | "dev_server_logs" | "dev_server_stop"
+            | "web_preview_open" | "web_preview_snapshot" | "web_preview_click"
+            | "web_preview_fill" | "web_preview_press" | "web_preview_reload"
+            | "web_preview_resize" | "web_preview_console" | "web_preview_close"
     )
 }
 
@@ -104,17 +119,46 @@ pub fn is_known_tool(name: &str) -> bool {
 /// the mutating tools so the model doesn't plan around capabilities it lacks;
 /// `execute` refuses them regardless. `git` stays available in every mode — its
 /// read-only subcommands are useful, and mutating ones are refused per call.
-pub fn tool_defs_for(policy: ApprovalPolicy) -> Vec<Value> {
-    let all = tool_defs();
+pub fn tool_defs_for(policy: ApprovalPolicy, include_preview: bool) -> Vec<Value> {
+    let mut all = tool_defs();
+    if include_preview {
+        all.extend(preview_tool_defs());
+    }
     if policy.allows_mutations() {
         return all;
     }
     all.into_iter()
         .filter(|d| {
             let name = d.pointer("/function/name").and_then(Value::as_str).unwrap_or("");
-            !matches!(name, "write_file" | "edit_file" | "run_command")
+            !matches!(name, "write_file" | "edit_file" | "run_command" | "dev_server_start")
         })
         .collect()
+}
+
+/// Desktop-only preview tools. These are appended only by the local GUI coding
+/// path; cloud/headless turns never receive the schemas.
+pub fn preview_tool_defs() -> Vec<Value> {
+    fn def(name: &str, description: &str, params: Value) -> Value {
+        serde_json::json!({
+            "type": "function",
+            "function": { "name": name, "description": description, "parameters": params },
+        })
+    }
+    let s = |t: &str| serde_json::json!({ "type": t });
+    vec![
+        def("dev_server_start", "Start one persistent workspace development server and wait for its loopback URL to respond. Requires edit approval unless Auto mode is active.", serde_json::json!({"type":"object","properties":{"command":s("string"),"url":s("string"),"timeout_seconds":s("integer")},"required":["command","url"]})),
+        def("dev_server_logs", "Read bounded stdout/stderr from the managed development server.", serde_json::json!({"type":"object","properties":{"clear":s("boolean")}})),
+        def("dev_server_stop", "Stop the managed development server and its child process tree.", serde_json::json!({"type":"object","properties":{}})),
+        def("web_preview_open", "Open or focus a visible desktop preview at an approved loopback URL. The first origin in a session requires one user approval.", serde_json::json!({"type":"object","properties":{"url":s("string"),"width":s("integer"),"height":s("integer")},"required":["url"]})),
+        def("web_preview_snapshot", "Inspect the rendered page. Returns URL, title, visible text, and interactive elements with short refs such as e1. Take a new snapshot after navigation or major UI changes.", serde_json::json!({"type":"object","properties":{"selector":s("string")}})),
+        def("web_preview_click", "Click an element ref from the latest preview snapshot.", serde_json::json!({"type":"object","properties":{"ref":s("string")},"required":["ref"]})),
+        def("web_preview_fill", "Replace the value of an input/textarea/select ref and dispatch input/change events; optionally submit its form.", serde_json::json!({"type":"object","properties":{"ref":s("string"),"text":s("string"),"submit":s("boolean")},"required":["ref","text"]})),
+        def("web_preview_press", "Dispatch a keyboard key at an element ref from the latest snapshot.", serde_json::json!({"type":"object","properties":{"ref":s("string"),"key":s("string")},"required":["ref","key"]})),
+        def("web_preview_reload", "Reload the current preview page.", serde_json::json!({"type":"object","properties":{}})),
+        def("web_preview_resize", "Resize the preview viewport in logical pixels.", serde_json::json!({"type":"object","properties":{"width":s("integer"),"height":s("integer")},"required":["width","height"]})),
+        def("web_preview_console", "Read captured console messages, page errors, and unhandled promise rejections.", serde_json::json!({"type":"object","properties":{"clear":s("boolean")}})),
+        def("web_preview_close", "Close the preview and stop its managed development server.", serde_json::json!({"type":"object","properties":{}})),
+    ]
 }
 
 /// Ollama-style tool schemas for all coding tools, for the local (offline)
@@ -181,6 +225,11 @@ pub fn approval_preview(cx: &CodingContext, name: &str, args: &Value) -> Option<
         "run_command" => {
             Some(format!("$ {}", args.get("command").and_then(Value::as_str).unwrap_or("")))
         }
+        "dev_server_start" => Some(format!(
+            "$ {}\nPreview URL: {}",
+            args.get("command").and_then(Value::as_str).unwrap_or(""),
+            args.get("url").and_then(Value::as_str).unwrap_or("")
+        )),
         "git" => Some(format!("$ git {}", args.get("args").and_then(Value::as_str).unwrap_or(""))),
         _ => None,
     }
@@ -188,7 +237,7 @@ pub fn approval_preview(cx: &CodingContext, name: &str, args: &Value) -> Option<
 
 /// Execute a coding tool by name. Errors are returned as tool content so a
 /// single failure does not abort the turn (mirrors the built-in tool path).
-pub async fn execute(cx: &CodingContext, name: &str, args: &Value) -> ToolRun {
+pub async fn execute(cx: &CodingContext, host: Option<&CodingHost>, name: &str, args: &Value) -> ToolRun {
     // Withholding the schemas is not enforcement — a model can still emit a call
     // for a tool it was never offered, and in prompt-injection tool mode it only
     // ever sees a text manifest. Refuse here, the single choke point.
@@ -207,7 +256,7 @@ workspace. Describe the change instead — the user can switch modes to apply it
             })),
         };
     }
-    match tools::run(cx, name, args).await {
+    match tools::run(cx, host, name, args).await {
         Ok(run) => run,
         Err(e) => ToolRun {
             content: format!("{name} failed: {e}"),
@@ -264,8 +313,8 @@ mod tests {
     #[test]
     fn inspection_modes_withhold_mutating_tools() {
         for p in [ApprovalPolicy::ReadOnly, ApprovalPolicy::Plan] {
-            let offered = names(&tool_defs_for(p));
-            for withheld in ["write_file", "edit_file", "run_command"] {
+            let offered = names(&tool_defs_for(p, true));
+            for withheld in ["write_file", "edit_file", "run_command", "dev_server_start"] {
                 assert!(!offered.contains(&withheld.to_string()), "{p:?} offered {withheld}");
             }
             // Reads and git stay available — git's mutating subcommands are
@@ -274,7 +323,7 @@ mod tests {
                 assert!(offered.contains(&kept.to_string()), "{p:?} withheld {kept}");
             }
         }
-        assert_eq!(names(&tool_defs_for(ApprovalPolicy::Auto)).len(), tool_defs().len());
+        assert_eq!(names(&tool_defs_for(ApprovalPolicy::Auto, false)).len(), tool_defs().len());
     }
 
     #[test]
@@ -283,5 +332,7 @@ mod tests {
         assert!(is_mutating("git", &json!({ "args": "commit -m x" })));
         assert!(is_mutating("write_file", &json!({})));
         assert!(!is_mutating("read_file", &json!({})));
+        assert!(is_mutating("dev_server_start", &json!({})));
+        assert!(!is_mutating("web_preview_click", &json!({})));
     }
 }

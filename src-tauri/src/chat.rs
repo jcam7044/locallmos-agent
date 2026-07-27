@@ -786,7 +786,7 @@ async fn run_local_tool(
             .ok();
     }
 
-    let run = coding::execute(cx, &call.name, &call.arguments).await;
+    let run = coding::execute(cx, None, &call.name, &call.arguments).await;
     if let Some(mut event) = run.event {
         event["invocationId"] = json!(invocation_id);
         let _ = tx.send(StreamDelta::Event(event));

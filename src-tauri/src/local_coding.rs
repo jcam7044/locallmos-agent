@@ -16,7 +16,7 @@ use std::time::Duration;
 use tauri::Emitter;
 
 const EVENT: &str = "local-coding";
-const MAX_TOOL_ROUNDS: usize = 12;
+const MAX_TOOL_ROUNDS: usize = 24;
 
 fn emit(app: &tauri::AppHandle, session_id: &str, message_id: &str, event: Value) {
     let _ = app.emit(
@@ -226,7 +226,7 @@ async fn run_turn(
     // Native tool calling only works when the model's template renders `.Tools`;
     // otherwise inject a manifest into the last user turn and parse `<tool_call>`
     // blocks ourselves (model-agnostic), exactly as the cloud path does.
-    let tool_defs = coding::tool_defs_for(cx.policy);
+    let tool_defs = coding::tool_defs_for(cx.policy, true);
     let native_tools = state.runtime.template_supports_tools(model).await;
     let prompt_tool_mode = !native_tools;
     if prompt_tool_mode {
@@ -345,6 +345,47 @@ async fn run_one(
         return (msg, None);
     }
 
+    // Preview control has a security boundary independent of workspace edit
+    // mode: approve each loopback origin once per in-memory coding session.
+    if call.name == "web_preview_open" {
+        let url = call.arguments.get("url").and_then(Value::as_str).unwrap_or("");
+        match state.preview.needs_authorization(session_id, url).await {
+            Ok(Some(origin)) => {
+                let invocation_id = uuid::Uuid::new_v4().to_string();
+                let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
+                state.coding_approvals.lock().await.insert(invocation_id.clone(), tx);
+                emit(
+                    app,
+                    session_id,
+                    request_id,
+                    json!({
+                        "type": "approval_needed", "invocationId": invocation_id,
+                        "name": call.name,
+                        "preview": format!("Allow the model to inspect and interact with {origin} for this coding session?")
+                    }),
+                );
+                let approved = await_decision(rx, cancel).await;
+                state.coding_approvals.lock().await.remove(&invocation_id);
+                emit(
+                    app,
+                    session_id,
+                    request_id,
+                    json!({ "type": "approval_resolved", "invocationId": invocation_id, "decision": if approved { "approved" } else { "denied" } }),
+                );
+                if !approved {
+                    emit(app, session_id, request_id, json!({ "type": "tool_result", "name": call.name, "summary": "denied" }));
+                    return ("The user denied preview access to that origin. Do not retry it without a different user request.".into(), None);
+                }
+                state.preview.authorize(session_id, origin).await;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                emit(app, session_id, request_id, json!({ "type": "tool_result", "name": call.name, "summary": "invalid URL" }));
+                return (format!("web_preview_open failed: {e}"), None);
+            }
+        }
+    }
+
     // Approval gate for mutating calls.
     if let Some(preview) = coding::approval_preview(cx, &call.name, &call.arguments) {
         let invocation_id = uuid::Uuid::new_v4().to_string();
@@ -376,7 +417,12 @@ async fn run_one(
         }
     }
 
-    let run = coding::execute(cx, &call.name, &call.arguments).await;
+    let host = coding::CodingHost {
+        app: app.clone(),
+        preview: state.preview.clone(),
+        session_id: session_id.to_string(),
+    };
+    let run = coding::execute(cx, Some(&host), &call.name, &call.arguments).await;
     if let Some(mut event) = run.event {
         // file_edit / command event for the live trace.
         let _ = event.as_object_mut();

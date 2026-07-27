@@ -1848,6 +1848,7 @@ dependencies = [
  "dotenvy",
  "futures-util",
  "hex",
+ "libc",
  "minisign-verify",
  "nvml-wrapper",
  "regex",
@@ -1867,8 +1868,10 @@ dependencies = [
  "tokio-tungstenite",
  "tracing",
  "tracing-subscriber",
+ "url",
  "uuid",
  "walkdir",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
+import { listen } from "@tauri-apps/api/event";
 import {
   codingApprove,
   codingCancel,
@@ -7,10 +8,14 @@ import {
   codingDeleteSession,
   codingGetSession,
   codingListSessions,
+  codingPreviewClose,
+  codingPreviewFocus,
+  codingPreviewReload,
+  codingPreviewStatus,
   codingSend,
   codingSetPolicy,
 } from "../api";
-import type { ApprovalPolicy, CodingSessionMeta, CodingStoredMessage, ModelOption } from "../types";
+import type { ApprovalPolicy, CodingPreviewStatus, CodingSessionMeta, CodingStoredMessage, ModelOption } from "../types";
 import { Markdown } from "../chat/Markdown";
 import { Composer, MODES } from "./Composer";
 import { C } from "./tokens";
@@ -31,6 +36,7 @@ export function CodingView({ models }: { models: ModelOption[] }) {
   // Mode + attachments belong to the active session, so both reload with it.
   const [policy, setPolicy] = useState<ApprovalPolicy>("approve_writes");
   const [attachments, setAttachments] = useState<string[]>([]);
+  const [preview, setPreview] = useState<CodingPreviewStatus | null>(null);
   const requestIdRef = useRef<string | null>(null);
   const { live, reset } = useCodingStream(activeId);
 
@@ -89,6 +95,22 @@ export function CodingView({ models }: { models: ModelOption[] }) {
     if (activeId) void loadSession(activeId);
     else setMessages([]);
   }, [activeId, loadSession]);
+
+  useEffect(() => {
+    let disposed = false;
+    if (activeId) {
+      void codingPreviewStatus(activeId)
+        .then((status) => { if (!disposed) setPreview(status); })
+        .catch(() => { if (!disposed) setPreview(null); });
+    } else {
+      setPreview(null);
+    }
+    let unlisten: (() => void) | undefined;
+    void listen<CodingPreviewStatus>("coding-preview", ({ payload }) => {
+      if (!disposed && payload.sessionId === activeId) setPreview(payload);
+    }).then((stop) => { unlisten = stop; });
+    return () => { disposed = true; unlisten?.(); };
+  }, [activeId]);
 
   // Follow the transcript as it streams, but only while the user is already at
   // the bottom — scrolling up to read earlier output must not yank them back.
@@ -244,6 +266,14 @@ export function CodingView({ models }: { models: ModelOption[] }) {
         ) : (
           <>
             <SessionHeader meta={sessions.find((s) => s.id === activeId)} onDelete={() => onDelete(activeId)} />
+            {preview && (preview.windowOpen || preview.serverState !== "stopped") && (
+              <PreviewStrip
+                status={preview}
+                onFocus={() => void codingPreviewFocus(activeId).catch((e) => setError(String(e)))}
+                onReload={() => void codingPreviewReload(activeId).catch((e) => setError(String(e)))}
+                onClose={() => void codingPreviewClose(activeId).catch((e) => setError(String(e)))}
+              />
+            )}
             <div
               ref={scrollRef}
               onScroll={onScroll}
@@ -274,6 +304,33 @@ export function CodingView({ models }: { models: ModelOption[] }) {
           </>
         )}
       </main>
+    </div>
+  );
+}
+
+export function PreviewStrip({
+  status,
+  onFocus,
+  onReload,
+  onClose,
+}: {
+  status: CodingPreviewStatus;
+  onFocus: () => void;
+  onReload: () => void;
+  onClose: () => void;
+}) {
+  const ready = status.serverState === "ready";
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 8, border: C.border, borderRadius: 8, padding: "7px 9px", marginBottom: 8, background: "rgba(15,23,42,0.55)" }}>
+      <span style={{ color: ready ? "#34d399" : C.accent, fontSize: 11 }}>
+        {status.serverState === "starting" ? "● starting" : ready ? "● preview ready" : "● preview"}
+      </span>
+      <span title={status.url ?? undefined} style={{ color: C.muted, fontSize: 11, flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+        {status.url ?? status.serverCommand ?? "Local preview"}
+      </span>
+      {status.windowOpen && <button onClick={onFocus} style={compactBtn}>Focus</button>}
+      {status.windowOpen && <button onClick={onReload} style={compactBtn}>Reload</button>}
+      <button onClick={onClose} style={{ ...compactBtn, color: "#f87171" }}>Close</button>
     </div>
   );
 }
@@ -518,6 +575,15 @@ const primaryBtn: React.CSSProperties = {
   padding: "8px 14px",
   fontSize: 13,
   fontWeight: 600,
+  cursor: "pointer",
+};
+const compactBtn: React.CSSProperties = {
+  background: "transparent",
+  border: C.border,
+  borderRadius: 6,
+  color: "#cbd5e1",
+  padding: "4px 7px",
+  fontSize: 11,
   cursor: "pointer",
 };
 function btn(active: boolean): React.CSSProperties {

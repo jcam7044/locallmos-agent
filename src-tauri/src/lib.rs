@@ -63,6 +63,8 @@ pub struct AppState {
     pub chat_lock: Mutex<()>,
     /// Shared HTTP client, reused for the web_fetch tool (direct GET from the rig).
     pub http: reqwest::Client,
+    /// Desktop-only localhost preview windows and managed workspace dev servers.
+    pub preview: Arc<coding::preview::PreviewManager>,
     pub hub: Arc<hub::HubState>,
     /// The Tauri app handle, set once at GUI startup. Absent in headless service
     /// mode. Used to mirror coding-session stream events to the local webview.
@@ -139,6 +141,7 @@ fn build_state() -> Arc<AppState> {
         runtime::llamacpp_models_dir(),
     ));
 
+    let preview = coding::preview::PreviewManager::new(http.clone());
     Arc::new(AppState {
         settings,
         supabase,
@@ -151,6 +154,7 @@ fn build_state() -> Arc<AppState> {
         coding_approvals: Mutex::new(HashMap::new()),
         chat_lock: Mutex::new(()),
         http,
+        preview,
         hub,
         app: std::sync::OnceLock::new(),
     })
@@ -773,11 +777,50 @@ async fn coding_local_delete_session(state: State<'_, Arc<AppState>>, id: String
         let _guard = state.chat_lock.lock().await;
         coding_store::delete(&id).map_err(|e| e.to_string())?;
     }
+    if let Some(app) = state.app.get() {
+        state.preview.close_session(app, &id, true).await.map_err(|e| e.to_string())?;
+    }
     // Drop the cloud mirror too, or the session lingers on the web Code page.
     // Best-effort, and outside the guard so a slow or offline round-trip does
     // not hold the store lock; an unenrolled rig skips it entirely.
     local_coding::delete_from_cloud(state.inner(), &id).await;
     Ok(())
+}
+
+#[tauri::command]
+async fn coding_preview_status(
+    app: tauri::AppHandle,
+    state: State<'_, Arc<AppState>>,
+    session_id: String,
+) -> Result<coding::preview::PreviewStatus, String> {
+    Ok(state.preview.status(&app, &session_id).await)
+}
+
+#[tauri::command]
+async fn coding_preview_focus(
+    app: tauri::AppHandle,
+    state: State<'_, Arc<AppState>>,
+    session_id: String,
+) -> Result<(), String> {
+    state.preview.focus(&app, &session_id).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn coding_preview_reload(
+    app: tauri::AppHandle,
+    state: State<'_, Arc<AppState>>,
+    session_id: String,
+) -> Result<(), String> {
+    state.preview.reload(&app, &session_id).await.map(|_| ()).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn coding_preview_close(
+    app: tauri::AppHandle,
+    state: State<'_, Arc<AppState>>,
+    session_id: String,
+) -> Result<(), String> {
+    state.preview.close_session(&app, &session_id, true).await.map_err(|e| e.to_string())
 }
 
 /// Run one local coding turn. Deltas stream as `local-coding` events (carrying
@@ -923,8 +966,10 @@ fn run_gui() {
     let start_hidden = std::env::args().any(|a| a == "--minimized");
     let state = build_state();
     let loop_state = state.clone();
+    let window_state = state.clone();
+    let exit_state = state.clone();
 
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         // Native file/folder pickers for attaching workspace context.
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_autostart::init(
@@ -932,7 +977,7 @@ fn run_gui() {
             // Autostart launches minimized to tray.
             Some(vec!["--minimized"]),
         ))
-        .manage(state)
+        .manage(state.clone())
         .setup(move |app| {
             // Give background loops (coding turns) a handle to mirror stream
             // events to the local webview.
@@ -981,11 +1026,23 @@ fn run_gui() {
             }
             Ok(())
         })
-        // Closing the window hides to tray instead of quitting the agent.
-        .on_window_event(|window, event| {
+        // The main control window hides to tray. Preview windows really close,
+        // which also tears down their managed development server.
+        .on_window_event(move |window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
-                let _ = window.hide();
-                api.prevent_close();
+                if window.label() == "main" {
+                    let _ = window.hide();
+                    api.prevent_close();
+                } else {
+                    let state = window_state.clone();
+                    let app = window.app_handle().clone();
+                    let label = window.label().to_string();
+                    tauri::async_runtime::spawn(async move {
+                        if let Some(session_id) = state.preview.session_for_window(&label).await {
+                            state.preview.close_session(&app, &session_id, false).await.ok();
+                        }
+                    });
+                }
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -1033,8 +1090,17 @@ fn run_gui() {
             coding_local_delete_session,
             coding_local_send,
             coding_local_approve,
-            coding_local_cancel
+            coding_local_cancel,
+            coding_preview_status,
+            coding_preview_focus,
+            coding_preview_reload,
+            coding_preview_close
         ])
-        .run(tauri::generate_context!())
+        .build(tauri::generate_context!())
         .expect("error while running LocalLMOS agent");
+    app.run(move |handle, event| {
+        if matches!(event, tauri::RunEvent::ExitRequested { .. }) {
+            tauri::async_runtime::block_on(exit_state.preview.stop_all(handle));
+        }
+    });
 }

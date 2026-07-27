@@ -231,6 +231,14 @@ export type CodingSession = {
   messages: CodingStoredMessage[];
 };
 
+export type CodingPreviewStatus = {
+  sessionId: string;
+  windowOpen: boolean;
+  url: string | null;
+  serverState: "stopped" | "starting" | "ready";
+  serverCommand: string | null;
+};
+
 /**
  * The `event` payload inside a Tauri "local-coding" event. Mirrors the coding
  * subset of the shared ChatStreamEvent union (packages/shared/src/chat.ts).

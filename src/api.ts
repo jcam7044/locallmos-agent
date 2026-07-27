@@ -7,6 +7,7 @@ import type {
   CodingSession,
   CodingSessionMeta,
   CodingStoredMessage,
+  CodingPreviewStatus,
   LocalStatus,
   SessionMeta,
   SessionSettings,
@@ -105,3 +106,15 @@ export const codingApprove = (invocationId: string, approved: boolean) =>
 
 export const codingCancel = (requestId: string) =>
   invoke("coding_local_cancel", { requestId });
+
+export const codingPreviewStatus = (sessionId: string) =>
+  invoke<CodingPreviewStatus>("coding_preview_status", { sessionId });
+
+export const codingPreviewFocus = (sessionId: string) =>
+  invoke("coding_preview_focus", { sessionId });
+
+export const codingPreviewReload = (sessionId: string) =>
+  invoke("coding_preview_reload", { sessionId });
+
+export const codingPreviewClose = (sessionId: string) =>
+  invoke("coding_preview_close", { sessionId });

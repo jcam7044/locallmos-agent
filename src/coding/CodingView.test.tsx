@@ -1,6 +1,6 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
-import { PreviewStrip } from "./CodingView";
+import { LiveTurn, PreviewStrip, visibleCodingMessages } from "./CodingView";
 
 describe("PreviewStrip", () => {
   it("shows the live URL and window controls for a ready preview", () => {
@@ -44,5 +44,35 @@ describe("PreviewStrip", () => {
     expect(html).toContain("npm run dev");
     expect(html).not.toContain("Focus");
     expect(html).not.toContain("Reload");
+  });
+});
+
+describe("coding turn rendering", () => {
+  it("places a pending approval below the response that introduced it", () => {
+    const html = renderToStaticMarkup(
+      <LiveTurn
+        live={{
+          messageId: "message-1",
+          text: "I inspected the app and need to apply this change.",
+          thinking: "",
+          status: "streaming",
+          trace: [{ kind: "tool", name: "write_file" }],
+          approvals: [{ invocationId: "approval-1", name: "write_file", preview: "+ new file" }],
+        }}
+        onDecide={() => undefined}
+      />,
+    );
+    expect(html.indexOf("I inspected the app")).toBeLessThan(html.indexOf("Approval needed"));
+  });
+
+  it("hides legacy empty assistant records while preserving user messages", () => {
+    const base = { thinking: null, toolActivity: null, cancelled: false, createdAt: "2026-01-01T00:00:00Z" };
+    const visible = visibleCodingMessages([
+      { ...base, role: "assistant", content: "" },
+      { ...base, role: "assistant", content: "   " },
+      { ...base, role: "user", content: "Continue" },
+      { ...base, role: "assistant", content: "Done" },
+    ]);
+    expect(visible.map((message) => message.content)).toEqual(["Continue", "Done"]);
   });
 });

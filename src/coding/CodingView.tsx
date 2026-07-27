@@ -279,7 +279,7 @@ export function CodingView({ models }: { models: ModelOption[] }) {
               onScroll={onScroll}
               style={{ flex: 1, minHeight: 0, overflowY: "auto", display: "flex", flexDirection: "column", gap: 12, paddingRight: 4 }}
             >
-              {messages.filter((m) => m.role !== "system").map((m, i) => (
+              {visibleCodingMessages(messages).map((m, i) => (
                 <MessageBubble key={i} role={m.role} content={m.content} />
               ))}
               {live.status !== "idle" && <LiveTurn live={live} onDecide={decide} />}
@@ -458,7 +458,7 @@ function SessionHeader({ meta, onDelete }: { meta?: CodingSessionMeta; onDelete:
   );
 }
 
-function LiveTurn({ live, onDecide }: { live: CodingLive; onDecide: (id: string, approved: boolean) => void }) {
+export function LiveTurn({ live, onDecide }: { live: CodingLive; onDecide: (id: string, approved: boolean) => void }) {
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
       {live.status === "loading" && (
@@ -467,6 +467,11 @@ function LiveTurn({ live, onDecide }: { live: CodingLive; onDecide: (id: string,
       {live.trace.map((t, i) => (
         <TraceItem key={i} trace={t} />
       ))}
+      {live.text && (
+        <div style={bubble("assistant")}>
+          <Markdown>{live.text}</Markdown>
+        </div>
+      )}
       {live.approvals.map((a) => (
         <div key={a.invocationId} style={{ border: "1px solid rgba(56,189,248,0.5)", borderRadius: 8, padding: 10, background: "rgba(56,189,248,0.08)" }}>
           <div style={{ fontSize: 12, color: C.accent, marginBottom: 6 }}>Approval needed — {a.name}</div>
@@ -481,13 +486,16 @@ function LiveTurn({ live, onDecide }: { live: CodingLive; onDecide: (id: string,
           </div>
         </div>
       ))}
-      {live.text && (
-        <div style={bubble("assistant")}>
-          <Markdown>{live.text}</Markdown>
-        </div>
-      )}
       {live.status === "error" && <div style={{ color: "#f87171", fontSize: 12 }}>{live.error}</div>}
     </div>
+  );
+}
+
+/** Hide system records and legacy tool-only assistant records that have no
+ * visible response. Older builds persisted these as tiny empty bubbles. */
+export function visibleCodingMessages(messages: CodingStoredMessage[]): CodingStoredMessage[] {
+  return messages.filter((message) =>
+    message.role !== "system" && (message.role !== "assistant" || message.content.trim().length > 0),
   );
 }
 

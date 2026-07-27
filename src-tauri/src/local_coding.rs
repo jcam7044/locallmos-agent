@@ -251,7 +251,7 @@ async fn run_turn(
 
     let mut out = TurnOutput { content: String::new(), thinking: String::new(), tool_activity: Vec::new() };
 
-    for round in 0..MAX_TOOL_ROUNDS {
+    for _round in 0..MAX_TOOL_ROUNDS {
         let round_out = {
             let app = app.clone();
             let session_id = session_id.to_string();
@@ -287,14 +287,21 @@ async fn run_turn(
             calls = tool_protocol::parse_text_tool_calls(&round_out.content, &tool_names);
         }
 
+        // The model may explain what it is doing and then call a tool. That
+        // prose has already streamed to the UI and belongs in the persisted
+        // assistant message even if a later tool round returns no text. The old
+        // behavior replaced it with only the final round, producing empty
+        // bubbles after the live overlay was folded into the transcript.
+        let visible_round = if prompt_tool_mode {
+            tool_protocol::strip_tool_calls(&round_out.content)
+        } else {
+            round_out.content.clone()
+        };
+        append_round_text(&mut out.content, &visible_round);
+        append_round_text(&mut out.thinking, &round_out.thinking);
+
         // No tool calls (or cancelled) → this round's text is the final answer.
         if calls.is_empty() || cancel.load(Ordering::Relaxed) {
-            out.content = if prompt_tool_mode {
-                tool_protocol::strip_tool_calls(&round_out.content)
-            } else {
-                round_out.content
-            };
-            out.thinking = round_out.thinking;
             return Ok(out);
         }
 
@@ -315,16 +322,21 @@ async fn run_turn(
             push_tool_result(&mut messages, prompt_tool_mode, &call.name, &result_text);
         }
 
-        if round == MAX_TOOL_ROUNDS - 1 {
-            out.content = if prompt_tool_mode {
-                tool_protocol::strip_tool_calls(&round_out.content)
-            } else {
-                round_out.content
-            };
-            out.thinking = round_out.thinking;
-        }
+        // At the round cap `out` already contains all prose streamed so far.
     }
     Ok(out)
+}
+
+fn append_round_text(target: &mut String, text: &str) {
+    if text.trim().is_empty() {
+        return;
+    }
+    let target_has_space = target.chars().last().map(char::is_whitespace).unwrap_or(false);
+    let text_has_space = text.chars().next().map(char::is_whitespace).unwrap_or(false);
+    if !target.is_empty() && !target_has_space && !text_has_space {
+        target.push_str("\n\n");
+    }
+    target.push_str(text);
 }
 
 /// Execute one coding tool call with the approval gate, streaming its events.
@@ -457,5 +469,26 @@ fn push_tool_result(messages: &mut Vec<Value>, prompt_tool_mode: bool, name: &st
         }));
     } else {
         messages.push(json!({ "role": "tool", "tool_name": name, "content": content }));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::append_round_text;
+
+    #[test]
+    fn preserves_prose_from_tool_rounds_when_the_final_round_is_empty() {
+        let mut content = String::new();
+        append_round_text(&mut content, "I checked the app and will update it.");
+        append_round_text(&mut content, "");
+        assert_eq!(content, "I checked the app and will update it.");
+    }
+
+    #[test]
+    fn separates_visible_text_from_multiple_tool_rounds() {
+        let mut content = String::new();
+        append_round_text(&mut content, "First step.");
+        append_round_text(&mut content, "Second step.");
+        assert_eq!(content, "First step.\n\nSecond step.");
     }
 }

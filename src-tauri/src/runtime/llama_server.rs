@@ -13,7 +13,7 @@
 
 use super::{
     ChatDelta, ChatOutput, FlashAttention, GenerationMetrics, GpuOffload, KvCacheType, ModelInfo,
-    ModelLoadSettings, RuntimeAdapter, RuntimeSnapshot, SpeculativeDecoding, ToolCall,
+    InputTokenCount, ModelLoadSettings, RuntimeAdapter, RuntimeSnapshot, SpeculativeDecoding, ToolCall,
 };
 use anyhow::{anyhow, Result};
 use futures_util::StreamExt;
@@ -208,6 +208,38 @@ impl LlamaServerAdapter {
             .ok()?
             .pointer("/default_generation_settings/n_ctx")
             .and_then(Value::as_u64)
+    }
+
+    /// Count the same rendered request used for inference. Failure is a soft
+    /// fallback because older externally managed llama-server builds may not
+    /// expose the input-token endpoint.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn count_input_tokens(
+        &self,
+        model: &str,
+        messages: &Value,
+        think: bool,
+        tools: Option<&Value>,
+        options: Option<&Value>,
+        load_settings: &ModelLoadSettings,
+    ) -> Option<InputTokenCount> {
+        self.ensure_running(model, load_settings).await.ok()?;
+        let mut body = chat_request_body(model, messages, think, tools, options);
+        body.as_object_mut()?.remove("stream");
+        body.as_object_mut()?.remove("stream_options");
+        let response = self
+            .http
+            .post(format!("{}/v1/chat/completions/input_tokens", self.base))
+            .json(&body)
+            .send()
+            .await
+            .ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        let value = response.json::<Value>().await.ok()?;
+        let tokens = value.get("input_tokens")?.as_u64()? as u32;
+        Some(InputTokenCount { tokens, exact: true })
     }
 
     // llama-server serves whatever model process it was launched with, and its
@@ -484,28 +516,7 @@ impl LlamaServerAdapter {
         // Measure from the chat request, not from an optional model start/reload.
         let request_started = Instant::now();
 
-        let mut body = json!({
-            "model": model,
-            "messages": to_openai_messages(&messages),
-            "stream": true,
-            "stream_options": { "include_usage": true },
-            // Qwen-style templates honor this under --jinja to toggle reasoning.
-            "chat_template_kwargs": { "enable_thinking": think },
-        });
-        // Map sampling options (temperature, top_p, …); num_ctx is a launch flag.
-        if let Some(map) = options.and_then(Value::as_object) {
-            for (k, v) in map {
-                if k != "num_ctx" {
-                    body[k] = v.clone();
-                }
-            }
-        }
-        if let Some(t) = tools {
-            if t.as_array().map(|a| !a.is_empty()).unwrap_or(false) {
-                body["tools"] = t.clone();
-                body["tool_choice"] = json!("auto");
-            }
-        }
+        let body = chat_request_body(model, &messages, think, tools, options);
 
         let resp = self
             .http
@@ -554,6 +565,34 @@ impl LlamaServerAdapter {
         }
         Ok(finalize(state))
     }
+}
+
+fn chat_request_body(
+    model: &str,
+    messages: &Value,
+    think: bool,
+    tools: Option<&Value>,
+    options: Option<&Value>,
+) -> Value {
+    let mut body = json!({
+        "model": model,
+        "messages": to_openai_messages(messages),
+        "stream": true,
+        "stream_options": { "include_usage": true },
+        "chat_template_kwargs": { "enable_thinking": think },
+    });
+    if let Some(map) = options.and_then(Value::as_object) {
+        for (key, value) in map {
+            if key != "num_ctx" {
+                body[key] = value.clone();
+            }
+        }
+    }
+    if let Some(value) = tools.filter(|t| t.as_array().map(|a| !a.is_empty()).unwrap_or(false)) {
+        body["tools"] = value.clone();
+        body["tool_choice"] = json!("auto");
+    }
+    body
 }
 
 impl RuntimeAdapter for LlamaServerAdapter {

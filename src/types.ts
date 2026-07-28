@@ -192,6 +192,108 @@ export type LocalChatEvent = { requestId: string; sessionId: string } & (
   | { type: "tool_result"; name: string; summary: string }
 );
 
+// --- Coding sessions (cloud-backed; mirror supabase 0036 + shared chat.ts) --
+
+export type ApprovalPolicy = "read_only" | "plan" | "approve_writes" | "auto";
+
+/** A local model offered in the Code/Chat model pickers. */
+export type ModelOption = { name: string; loaded: boolean };
+
+// Local (offline) coding sessions — camelCase, mirror src-tauri/src/coding_store.rs.
+export type CodingSessionMeta = {
+  id: string;
+  title: string;
+  createdAt: string;
+  updatedAt: string;
+  model: string;
+  workspaceRoot: string;
+  approvalPolicy: ApprovalPolicy;
+  messageCount: number;
+};
+
+export type CodingStoredMessage = {
+  role: "system" | "user" | "assistant";
+  content: string;
+  thinking: string | null;
+  toolActivity: unknown;
+  cancelled: boolean;
+  createdAt: string;
+};
+
+export type CodingSession = {
+  id: string;
+  title: string;
+  createdAt: string;
+  updatedAt: string;
+  model: string;
+  workspaceRoot: string;
+  approvalPolicy: ApprovalPolicy;
+  messages: CodingStoredMessage[];
+  contextState: CodingContextState;
+};
+
+export type CodingContextState = {
+  checkpoint: string | null;
+  summarizedThroughMessageId: string | null;
+  latestUsedTokens: number | null;
+  maxTokens: number | null;
+  countExact: boolean;
+  reserveTokens: number | null;
+  tokenEstimateScale: number | null;
+  autoCompact: boolean;
+  autoThreshold: number;
+  lastCompactedAt: string | null;
+};
+
+export type CodingContextInfo = {
+  usedTokens: number;
+  maxTokens: number;
+  reserveTokens: number;
+  percent: number;
+  level: "normal" | "orange" | "red";
+  countExact: boolean;
+  autoCompact: boolean;
+  autoThreshold: number;
+  compacted: boolean;
+  status: "idle" | "compacting";
+};
+
+export type CodingPreviewStatus = {
+  sessionId: string;
+  windowOpen: boolean;
+  url: string | null;
+  serverState: "stopped" | "starting" | "ready";
+  serverCommand: string | null;
+};
+
+/**
+ * The `event` payload inside a Tauri "local-coding" event. Mirrors the coding
+ * subset of the shared ChatStreamEvent union (packages/shared/src/chat.ts).
+ */
+export type CodingStreamEvent =
+  | { type: "loading"; model: string }
+  | { type: "token"; delta: string }
+  | { type: "thinking"; delta: string }
+  | { type: "tool"; name: string; arguments: string }
+  | { type: "tool_result"; name: string; summary: string }
+  | { type: "file_edit"; path: string; diff: string; summary: string; invocationId?: string }
+  | { type: "command"; command: string; chunk: string; exitCode?: number | null; invocationId?: string }
+  | { type: "approval_needed"; invocationId: string; name: string; preview: string }
+  | { type: "approval_resolved"; invocationId: string; decision: "approved" | "denied" }
+  | { type: "context_updated"; context: CodingContextInfo }
+  | { type: "compaction_started"; reason: "manual" | "auto" }
+  | { type: "compaction_completed"; reason: "manual" | "auto" }
+  | { type: "compaction_failed"; message: string }
+  | { type: "done" }
+  | { type: "error"; message: string };
+
+/** Envelope the agent emits on the Tauri "local-coding" event. */
+export type CodingEvent = {
+  sessionId: string;
+  messageId: string;
+  event: CodingStreamEvent;
+};
+
 export function newUserMessage(content: string, attachments: Attachment[] = []): StoredMessage {
   return {
     role: "user",

@@ -675,6 +675,280 @@ impl Supabase {
             .to_string();
         Ok(ToolExecOutcome { content, activity, summary })
     }
+
+    // ---- coding sessions ------------------------------------------------
+
+    /// Resolve the workspace + approval policy for a coding conversation, or
+    /// `None` when the conversation is ordinary chat / has no workspace. Two flat
+    /// queries (both device-readable under RLS) avoid fragile nested embeds.
+    pub async fn fetch_coding_context(
+        &self,
+        token: &str,
+        conversation_id: &str,
+    ) -> Result<Option<CodingMeta>> {
+        let resp = self
+            .auth(
+                self.http.get(format!(
+                    "{}/chat_conversations?id=eq.{conversation_id}&select=kind,workspace_id,local_session_id",
+                    self.rest
+                )),
+                token,
+            )
+            .send()
+            .await?;
+        let rows: Vec<ConvKindRow> = resp.json().await?;
+        let Some(conv) = rows.into_iter().next() else {
+            return Ok(None);
+        };
+        if conv.kind != "coding" {
+            return Ok(None);
+        }
+        let Some(workspace_id) = conv.workspace_id else {
+            return Ok(None);
+        };
+        let resp = self
+            .auth(
+                self.http.get(format!(
+                    "{}/coding_workspaces?id=eq.{workspace_id}&select=root_path,approval_policy",
+                    self.rest
+                )),
+                token,
+            )
+            .send()
+            .await?;
+        #[derive(Deserialize)]
+        struct WorkspaceRow {
+            root_path: String,
+            approval_policy: String,
+        }
+        let rows: Vec<WorkspaceRow> = resp.json().await?;
+        Ok(rows.into_iter().next().map(|w| CodingMeta {
+            root_path: w.root_path,
+            approval_policy: w.approval_policy,
+            local_session_id: conv.local_session_id,
+        }))
+    }
+
+    /// Remove a local session's mirrored cloud conversation (and, by cascade,
+    /// its messages) after the on-disk session is deleted. Idempotent.
+    pub async fn coding_sync_delete(&self, token: &str, local_session_id: &str) -> Result<Value> {
+        self.coding_sync_push(token, json!({ "action": "delete", "localSessionId": local_session_id }))
+            .await
+    }
+
+    /// Mirror an on-disk coding session to the cloud via the `coding-sync` edge
+    /// function so it can be seen/continued from the web. Returns
+    /// `{ conversationId, workspaceId }`.
+    pub async fn coding_sync_push(&self, token: &str, body: Value) -> Result<Value> {
+        let resp = self
+            .auth(self.http.post(format!("{}/coding-sync", self.functions)), token)
+            .json(&body)
+            .send()
+            .await?;
+        let status = resp.status();
+        let v: Value = resp.json().await.unwrap_or_else(|_| json!({}));
+        if !status.is_success() {
+            let detail = v.get("error").and_then(Value::as_str).unwrap_or("coding-sync failed");
+            return Err(anyhow!("coding-sync: {detail}"));
+        }
+        Ok(v)
+    }
+
+    /// Record a tool invocation. `awaiting` inserts it in `awaiting_approval`
+    /// (paused for the approver); otherwise `running`. The row `id` is set to the
+    /// agent-chosen `invocation_id` so every surface references the same id.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_tool_invocation(
+        &self,
+        token: &str,
+        message_id: &str,
+        invocation_id: &str,
+        tool_id: &str,
+        provider: &str,
+        arguments_hash: &str,
+        preview: Option<&str>,
+        summary: &str,
+        awaiting: bool,
+    ) -> Result<()> {
+        let body = json!({
+            "id": invocation_id,
+            "message_id": message_id,
+            "tool_call_id": invocation_id,
+            "tool_id": tool_id,
+            "provider": provider,
+            "arguments_hash": arguments_hash,
+            "status": if awaiting { "awaiting_approval" } else { "running" },
+            "preview": preview,
+            "safe_summary": summary,
+        });
+        let resp = self
+            .auth(self.http.post(format!("{}/tool_invocations", self.rest)), token)
+            .header("Prefer", "return=minimal")
+            .json(&body)
+            .send()
+            .await?;
+        ensure_ok(resp, "create_tool_invocation").await
+    }
+
+    /// Read an invocation's approval decision (`approved`/`denied`), if set. Both
+    /// the web (set_tool_decision RPC) and the local app (device PATCH) write it.
+    pub async fn poll_tool_decision(&self, token: &str, invocation_id: &str) -> Result<Option<String>> {
+        let resp = self
+            .auth(
+                self.http.get(format!(
+                    "{}/tool_invocations?id=eq.{invocation_id}&select=decision",
+                    self.rest
+                )),
+                token,
+            )
+            .send()
+            .await?;
+        let rows: Vec<Value> = resp.json().await?;
+        Ok(rows
+            .into_iter()
+            .next()
+            .and_then(|r| r.get("decision").and_then(Value::as_str).map(str::to_string)))
+    }
+
+    /// Set an invocation's decision from the local app (device). `decided_by` is
+    /// left null for a device-side approval (no end-user id in the device token).
+    pub async fn set_tool_decision(&self, token: &str, invocation_id: &str, decision: &str) -> Result<()> {
+        let body = json!({ "decision": decision, "decided_at": chrono::Utc::now().to_rfc3339() });
+        let resp = self
+            .auth(
+                self.http.patch(format!(
+                    "{}/tool_invocations?id=eq.{invocation_id}&status=eq.awaiting_approval",
+                    self.rest
+                )),
+                token,
+            )
+            .header("Prefer", "return=minimal")
+            .json(&body)
+            .send()
+            .await?;
+        ensure_ok(resp, "set_tool_decision").await
+    }
+
+    /// Move an invocation to a terminal state after it runs (or is denied).
+    pub async fn finalize_tool_invocation(
+        &self,
+        token: &str,
+        invocation_id: &str,
+        status: &str,
+        summary: &str,
+    ) -> Result<()> {
+        let body = json!({
+            "status": status,
+            "safe_summary": summary,
+            "completed_at": chrono::Utc::now().to_rfc3339(),
+        });
+        let resp = self
+            .auth(
+                self.http
+                    .patch(format!("{}/tool_invocations?id=eq.{invocation_id}", self.rest)),
+                token,
+            )
+            .header("Prefer", "return=minimal")
+            .json(&body)
+            .send()
+            .await?;
+        ensure_ok(resp, "finalize_tool_invocation").await
+    }
+
+    /// Call the `coding-turn` edge function (register a workspace, start or
+    /// continue a session). The device JWT authorizes as the rig's owner.
+    pub async fn coding_turn(&self, token: &str, body: Value) -> Result<Value> {
+        let resp = self
+            .auth(self.http.post(format!("{}/coding-turn", self.functions)), token)
+            .json(&body)
+            .send()
+            .await?;
+        let status = resp.status();
+        let v: Value = resp.json().await.unwrap_or_else(|_| json!({}));
+        if !status.is_success() {
+            let detail = v.get("error").and_then(Value::as_str).unwrap_or("coding-turn failed");
+            return Err(anyhow!("coding-turn: {detail}"));
+        }
+        Ok(v)
+    }
+
+    /// Coding conversations on this rig, newest first (for the local session list).
+    pub async fn list_coding_sessions(&self, token: &str, rig_id: &str) -> Result<Value> {
+        let resp = self
+            .auth(
+                self.http.get(format!(
+                    "{}/chat_conversations?rig_id=eq.{rig_id}&kind=eq.coding&select=id,title,model,workspace_id,updated_at&order=updated_at.desc",
+                    self.rest
+                )),
+                token,
+            )
+            .send()
+            .await?;
+        json_or_err(resp, "list_coding_sessions").await
+    }
+
+    /// Registered workspaces on this rig (for the attach-folder picker / reuse).
+    pub async fn list_coding_workspaces(&self, token: &str, rig_id: &str) -> Result<Value> {
+        let resp = self
+            .auth(
+                self.http.get(format!(
+                    "{}/coding_workspaces?rig_id=eq.{rig_id}&select=id,name,root_path,approval_policy&order=created_at.desc",
+                    self.rest
+                )),
+                token,
+            )
+            .send()
+            .await?;
+        json_or_err(resp, "list_coding_workspaces").await
+    }
+
+    /// All messages in a coding conversation, with any awaiting/complete tool
+    /// invocations, for rendering the session (oldest first).
+    pub async fn get_coding_messages(&self, token: &str, conversation_id: &str) -> Result<Value> {
+        let resp = self
+            .auth(
+                self.http.get(format!(
+                    "{}/chat_messages?conversation_id=eq.{conversation_id}&select=id,role,content,status,thinking,tool_activity,created_at&order=created_at.asc",
+                    self.rest
+                )),
+                token,
+            )
+            .send()
+            .await?;
+        json_or_err(resp, "get_coding_messages").await
+    }
+}
+
+/// Parse a JSON body only on a 2xx response; otherwise return a descriptive
+/// error. Without this a PostgREST error object (e.g. a missing column before a
+/// migration is deployed) would be handed back as if it were the query result.
+async fn json_or_err<T: serde::de::DeserializeOwned>(resp: reqwest::Response, ctx: &str) -> Result<T> {
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(anyhow!("{ctx} failed: HTTP {status}: {body}"));
+    }
+    Ok(resp.json().await?)
+}
+
+/// Conversation kind + workspace binding (for `fetch_coding_context`).
+#[derive(Deserialize)]
+struct ConvKindRow {
+    kind: String,
+    #[serde(default)]
+    workspace_id: Option<String>,
+    #[serde(default)]
+    local_session_id: Option<String>,
+}
+
+/// Workspace root + approval policy for a coding conversation.
+#[derive(Clone)]
+pub struct CodingMeta {
+    pub root_path: String,
+    pub approval_policy: String,
+    /// Set when the cloud conversation mirrors an on-disk local session; the
+    /// agent streams to the local UI and writes the result back to disk.
+    pub local_session_id: Option<String>,
 }
 
 /// A single web result from the `web-search` edge function.

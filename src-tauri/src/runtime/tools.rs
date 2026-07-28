@@ -39,7 +39,9 @@ pub fn platform_tools(value: Option<&Value>) -> Vec<PlatformTool> {
                 .filter(|tool| {
                     !tool.id.is_empty()
                         && !tool.name.is_empty()
-                        && tool.execution == "hosted"
+                        // Hosted tools relay to the cloud gateway; local tools
+                        // (the coding harness) the agent executes itself.
+                        && (tool.execution == "hosted" || tool.execution == "local")
                         && tool.parameters.is_object()
                 })
                 .collect()
@@ -247,7 +249,7 @@ mod tests {
     }
 
     #[test]
-    fn accepts_only_well_formed_hosted_platform_tools() {
+    fn accepts_well_formed_hosted_and_local_platform_tools() {
         let payload = json!([
             {
                 "id": "brave.web_search", "provider": "brave", "name": "web_search",
@@ -258,15 +260,17 @@ mod tests {
                 "description": "read", "parameters": {"type": "object"}, "execution": "hosted"
             },
             {
-                "id": "local.shell", "provider": "local", "name": "shell",
+                // Local coding tools are accepted now; the agent runs them itself.
+                "id": "coding.read_file", "provider": "coding", "name": "read_file",
                 "parameters": {"type": "object"}, "execution": "local"
             },
             {"id": "bad", "provider": "x", "name": "bad", "parameters": [], "execution": "hosted"}
         ]);
         let tools = platform_tools(Some(&payload));
-        assert_eq!(tools.len(), 2);
+        assert_eq!(tools.len(), 3);
         assert_eq!(tools[0].id, "brave.web_search");
-        assert_eq!(tools[1].id, "web.fetch_page");
+        assert_eq!(tools[2].id, "coding.read_file");
+        assert_eq!(tools[2].execution, "local");
         assert_eq!(platform_defs(&tools)[1]["function"]["name"], "web_fetch_page");
     }
 }

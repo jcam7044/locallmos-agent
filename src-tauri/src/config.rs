@@ -34,6 +34,12 @@ pub struct AgentConfig {
     pub model_load_settings: BTreeMap<String, ModelLoadSettings>,
 }
 
+/// Serializes tests that mutate the process-global `LOCALLMOS_CONFIG_DIR` env
+/// var (chat_store / coding_store round-trips), which otherwise race under the
+/// parallel test runner.
+#[cfg(test)]
+pub(crate) static TEST_CONFIG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Resolved agent config dir (credentials, chat sessions, …), created on demand.
 pub fn config_dir() -> Result<PathBuf> {
     // Allow an explicit override so a system service and CLI enrollment

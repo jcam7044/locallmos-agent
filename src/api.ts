@@ -1,8 +1,14 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   AgentStatus,
+  ApprovalPolicy,
   Attachment,
   ChatSession,
+  CodingSession,
+  CodingContextInfo,
+  CodingSessionMeta,
+  CodingStoredMessage,
+  CodingPreviewStatus,
   LocalStatus,
   SessionMeta,
   SessionSettings,
@@ -68,3 +74,64 @@ export const chatRenameSession = (id: string, title: string) =>
 export const chatDeleteSession = (id: string) => invoke("chat_delete_session", { id });
 export const chatUpdateSettings = (id: string, model: string, settings: SessionSettings) =>
   invoke("chat_update_settings", { id, model, settings });
+
+// --- Local coding sessions (offline, on-disk; no cloud required) ------------
+
+export const codingCreateSession = (
+  workspacePath: string,
+  model: string,
+  approvalPolicy: ApprovalPolicy,
+) => invoke<CodingSession>("coding_local_create_session", { workspacePath, model, approvalPolicy });
+
+export const codingSetPolicy = (id: string, policy: ApprovalPolicy) =>
+  invoke<CodingSession>("coding_local_set_policy", { id, policy });
+
+/** Validate picked paths against the session workspace; returns them relative. */
+export const codingAttach = (id: string, paths: string[]) =>
+  invoke<string[]>("coding_local_attach", { id, paths });
+
+export const codingListSessions = () =>
+  invoke<CodingSessionMeta[]>("coding_local_list_sessions");
+
+export const codingGetSession = (id: string) =>
+  invoke<CodingSession>("coding_local_get_session", { id });
+
+export const codingGetContext = (sessionId: string) =>
+  invoke<CodingContextInfo>("coding_local_context", { sessionId });
+
+export const codingCompact = (sessionId: string) =>
+  invoke<CodingContextInfo>("coding_local_compact", { sessionId });
+
+export const codingSetContextSettings = (
+  sessionId: string,
+  autoCompact: boolean,
+  autoThreshold: number,
+) => invoke<CodingContextInfo>("coding_local_set_context_settings", {
+  sessionId,
+  autoCompact,
+  autoThreshold,
+});
+
+export const codingDeleteSession = (id: string) =>
+  invoke("coding_local_delete_session", { id });
+
+export const codingSend = (sessionId: string, requestId: string, content: string) =>
+  invoke<CodingStoredMessage>("coding_local_send", { sessionId, requestId, content });
+
+export const codingApprove = (invocationId: string, approved: boolean) =>
+  invoke("coding_local_approve", { invocationId, approved });
+
+export const codingCancel = (requestId: string) =>
+  invoke("coding_local_cancel", { requestId });
+
+export const codingPreviewStatus = (sessionId: string) =>
+  invoke<CodingPreviewStatus>("coding_preview_status", { sessionId });
+
+export const codingPreviewFocus = (sessionId: string) =>
+  invoke("coding_preview_focus", { sessionId });
+
+export const codingPreviewReload = (sessionId: string) =>
+  invoke("coding_preview_reload", { sessionId });
+
+export const codingPreviewClose = (sessionId: string) =>
+  invoke("coding_preview_close", { sessionId });

@@ -10,7 +10,10 @@
 
 mod chat;
 mod chat_store;
+mod coding;
+mod coding_store;
 mod config;
+mod local_coding;
 mod hardware;
 mod hub;
 mod local_chat;
@@ -53,11 +56,19 @@ pub struct AppState {
     pub realtime: Arc<realtime::RealtimeHandle>,
     /// In-flight chat turns → cancel flag, for stop-generation.
     pub cancels: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    /// Pending local coding-tool approvals → decision sender. Resolved by the
+    /// `coding_local_approve` command (in-process; no cloud round-trip).
+    pub coding_approvals: Mutex<HashMap<String, tokio::sync::oneshot::Sender<bool>>>,
     /// Serializes chat-session file writes (save vs rename vs delete).
     pub chat_lock: Mutex<()>,
     /// Shared HTTP client, reused for the web_fetch tool (direct GET from the rig).
     pub http: reqwest::Client,
+    /// Desktop-only localhost preview windows and managed workspace dev servers.
+    pub preview: Arc<coding::preview::PreviewManager>,
     pub hub: Arc<hub::HubState>,
+    /// The Tauri app handle, set once at GUI startup. Absent in headless service
+    /// mode. Used to mirror coding-session stream events to the local webview.
+    pub app: std::sync::OnceLock<tauri::AppHandle>,
 }
 
 impl AppState {
@@ -130,6 +141,7 @@ fn build_state() -> Arc<AppState> {
         runtime::llamacpp_models_dir(),
     ));
 
+    let preview = coding::preview::PreviewManager::new(http.clone());
     Arc::new(AppState {
         settings,
         supabase,
@@ -139,9 +151,12 @@ fn build_state() -> Arc<AppState> {
         monitor: Mutex::new(Monitor::new()),
         realtime: Arc::new(realtime::RealtimeHandle::new()),
         cancels: Mutex::new(HashMap::new()),
+        coding_approvals: Mutex::new(HashMap::new()),
         chat_lock: Mutex::new(()),
         http,
+        preview,
         hub,
+        app: std::sync::OnceLock::new(),
     })
 }
 
@@ -557,6 +572,327 @@ async fn read_dropped_file(path: String) -> Result<chat_store::Attachment, Strin
     chat_store::attachment_from_path(&path).map_err(|e| e.to_string())
 }
 
+// --- Coding sessions (cloud-backed, continuable from the web) ---------------
+// These bridge the local webview to Supabase using the device JWT. Sessions are
+// chat_conversations of kind='coding'; the same agent process claims and runs
+// the pending turns (chat.rs), streaming to the webview via `coding` events.
+
+/// Validate a folder on this rig and register it as a coding workspace. Returns
+/// `{ workspaceId }`.
+#[tauri::command]
+async fn coding_register_workspace(
+    state: State<'_, Arc<AppState>>,
+    name: String,
+    path: String,
+    approval_policy: Option<String>,
+) -> Result<Value, String> {
+    // Fail fast with a clear message if the folder is missing/inaccessible here.
+    coding::Workspace::new(&path).map_err(|e| e.to_string())?;
+    let token = worker::ensure_token(state.inner()).await.map_err(|e| e.to_string())?;
+    let body = json!({
+        "action": "register_workspace",
+        "name": name,
+        "rootPath": path,
+        "approvalPolicy": approval_policy.unwrap_or_else(|| "approve_writes".into()),
+    });
+    state.supabase.coding_turn(&token, body).await.map_err(|e| e.to_string())
+}
+
+/// Registered coding workspaces on this rig.
+#[tauri::command]
+async fn coding_list_workspaces(state: State<'_, Arc<AppState>>) -> Result<Value, String> {
+    let token = worker::ensure_token(state.inner()).await.map_err(|e| e.to_string())?;
+    let rig = worker::rig_id(state.inner()).await.ok_or("not enrolled")?;
+    state.supabase.list_coding_workspaces(&token, &rig).await.map_err(|e| e.to_string())
+}
+
+/// Start a new coding session against a workspace. Returns `{ conversationId, assistantId }`.
+#[tauri::command]
+async fn coding_start_session(
+    state: State<'_, Arc<AppState>>,
+    workspace_id: String,
+    model: String,
+    prompt: String,
+) -> Result<Value, String> {
+    let token = worker::ensure_token(state.inner()).await.map_err(|e| e.to_string())?;
+    let body = json!({ "action": "start", "workspaceId": workspace_id, "model": model, "prompt": prompt });
+    state.supabase.coding_turn(&token, body).await.map_err(|e| e.to_string())
+}
+
+/// Send another turn in an existing coding session. Returns `{ assistantId }`.
+#[tauri::command]
+async fn coding_send(
+    state: State<'_, Arc<AppState>>,
+    conversation_id: String,
+    prompt: String,
+    model: Option<String>,
+) -> Result<Value, String> {
+    let token = worker::ensure_token(state.inner()).await.map_err(|e| e.to_string())?;
+    let mut body = json!({ "action": "continue", "conversationId": conversation_id, "prompt": prompt });
+    if let Some(m) = model {
+        body["model"] = json!(m);
+    }
+    state.supabase.coding_turn(&token, body).await.map_err(|e| e.to_string())
+}
+
+/// Coding sessions on this rig (for the sidebar).
+#[tauri::command]
+async fn coding_list_sessions(state: State<'_, Arc<AppState>>) -> Result<Value, String> {
+    let token = worker::ensure_token(state.inner()).await.map_err(|e| e.to_string())?;
+    let rig = worker::rig_id(state.inner()).await.ok_or("not enrolled")?;
+    state.supabase.list_coding_sessions(&token, &rig).await.map_err(|e| e.to_string())
+}
+
+/// All messages in a coding session (for rendering on open / resume).
+#[tauri::command]
+async fn coding_get_session(
+    state: State<'_, Arc<AppState>>,
+    conversation_id: String,
+) -> Result<Value, String> {
+    let token = worker::ensure_token(state.inner()).await.map_err(|e| e.to_string())?;
+    state.supabase.get_coding_messages(&token, &conversation_id).await.map_err(|e| e.to_string())
+}
+
+/// Approve or deny a paused coding tool invocation from the local app.
+#[tauri::command]
+async fn coding_approve(
+    state: State<'_, Arc<AppState>>,
+    invocation_id: String,
+    decision: String,
+) -> Result<(), String> {
+    if decision != "approved" && decision != "denied" {
+        return Err("decision must be 'approved' or 'denied'".into());
+    }
+    let token = worker::ensure_token(state.inner()).await.map_err(|e| e.to_string())?;
+    state.supabase.set_tool_decision(&token, &invocation_id, &decision).await.map_err(|e| e.to_string())
+}
+
+/// Stop an in-flight coding turn (also releases a pending approval wait).
+#[tauri::command]
+async fn coding_cancel(state: State<'_, Arc<AppState>>, message_id: String) -> Result<(), String> {
+    if let Some(flag) = state.cancels.lock().await.get(&message_id) {
+        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    Ok(())
+}
+
+// --- Local coding sessions (offline, on-disk; no cloud required) ------------
+
+/// Create an on-disk coding session bound to a workspace folder on this machine.
+/// The path is validated + canonicalized here (rejects a missing folder).
+#[tauri::command]
+async fn coding_local_create_session(
+    state: State<'_, Arc<AppState>>,
+    workspace_path: String,
+    model: String,
+    approval_policy: Option<String>,
+) -> Result<coding_store::CodingSession, String> {
+    let workspace = coding::Workspace::new(&workspace_path).map_err(|e| e.to_string())?;
+    let session = {
+        let _guard = state.chat_lock.lock().await;
+        let session = coding_store::CodingSession::new(
+            model,
+            workspace.root_str(),
+            approval_policy.unwrap_or_else(|| "approve_writes".into()),
+        );
+        coding_store::save(&session).map_err(|e| e.to_string())?;
+        session
+    };
+    // Mirror the empty session up front so it shows on the web Code page before
+    // its first turn; `send` pushes again with the transcript. Best-effort, and
+    // only outside the guard above — `push_to_cloud` takes `chat_lock` itself to
+    // persist the remote ids, and the lock is not reentrant.
+    local_coding::push_to_cloud(state.inner(), &session).await;
+    Ok(session)
+}
+
+/// Change a session's approval mode mid-conversation. The next turn picks it up
+/// when `local_coding::send` rebuilds the context, so it also governs which
+/// tools the model is offered.
+#[tauri::command]
+async fn coding_local_set_policy(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+    policy: String,
+) -> Result<coding_store::CodingSession, String> {
+    // `parse` falls back to approve_writes for anything unknown, which would
+    // silently *widen* the mode on a typo — round-trip to reject that instead.
+    let parsed = coding::ApprovalPolicy::parse(&policy);
+    if parsed.as_str() != policy {
+        return Err(format!("unknown approval policy: {policy}"));
+    }
+    let session = {
+        let _guard = state.chat_lock.lock().await;
+        let mut s = coding_store::load(&id).map_err(|e| e.to_string())?;
+        s.approval_policy = parsed.as_str().to_string();
+        s.updated_at = chrono::Utc::now();
+        coding_store::save(&s).map_err(|e| e.to_string())?;
+        s
+    };
+    local_coding::push_to_cloud(state.inner(), &session).await;
+    Ok(session)
+}
+
+/// Validate paths picked from the native dialog against the session's workspace,
+/// returning them workspace-relative. Anything outside the root is rejected —
+/// the agent's tools could not read it anyway, so silently accepting it would
+/// produce attachments the model can never open.
+#[tauri::command]
+async fn coding_local_attach(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+    paths: Vec<String>,
+) -> Result<Vec<String>, String> {
+    let session = {
+        let _guard = state.chat_lock.lock().await;
+        coding_store::load(&id).map_err(|e| e.to_string())?
+    };
+    let workspace = coding::Workspace::new(&session.workspace_root).map_err(|e| e.to_string())?;
+    paths
+        .iter()
+        .map(|p| workspace.relativize(p).map_err(|e| e.to_string()))
+        .collect()
+}
+
+#[tauri::command]
+async fn coding_local_list_sessions(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<coding_store::CodingSessionMeta>, String> {
+    let _guard = state.chat_lock.lock().await;
+    coding_store::list().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn coding_local_get_session(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+) -> Result<coding_store::CodingSession, String> {
+    let _guard = state.chat_lock.lock().await;
+    coding_store::load(&id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn coding_local_context(
+    app: tauri::AppHandle,
+    state: State<'_, Arc<AppState>>,
+    session_id: String,
+) -> Result<local_coding::CodingContextInfo, String> {
+    local_coding::get_context(&app, state.inner(), &session_id).await
+}
+
+#[tauri::command]
+async fn coding_local_compact(
+    app: tauri::AppHandle,
+    state: State<'_, Arc<AppState>>,
+    session_id: String,
+) -> Result<local_coding::CodingContextInfo, String> {
+    local_coding::compact(&app, state.inner(), &session_id).await
+}
+
+#[tauri::command]
+async fn coding_local_set_context_settings(
+    app: tauri::AppHandle,
+    state: State<'_, Arc<AppState>>,
+    session_id: String,
+    auto_compact: bool,
+    auto_threshold: u8,
+) -> Result<local_coding::CodingContextInfo, String> {
+    local_coding::set_context_settings(
+        &app,
+        state.inner(),
+        &session_id,
+        auto_compact,
+        auto_threshold,
+    ).await
+}
+
+#[tauri::command]
+async fn coding_local_delete_session(state: State<'_, Arc<AppState>>, id: String) -> Result<(), String> {
+    {
+        let _guard = state.chat_lock.lock().await;
+        coding_store::delete(&id).map_err(|e| e.to_string())?;
+    }
+    if let Some(app) = state.app.get() {
+        state.preview.close_session(app, &id, true).await.map_err(|e| e.to_string())?;
+    }
+    // Drop the cloud mirror too, or the session lingers on the web Code page.
+    // Best-effort, and outside the guard so a slow or offline round-trip does
+    // not hold the store lock; an unenrolled rig skips it entirely.
+    local_coding::delete_from_cloud(state.inner(), &id).await;
+    Ok(())
+}
+
+#[tauri::command]
+async fn coding_preview_status(
+    app: tauri::AppHandle,
+    state: State<'_, Arc<AppState>>,
+    session_id: String,
+) -> Result<coding::preview::PreviewStatus, String> {
+    Ok(state.preview.status(&app, &session_id).await)
+}
+
+#[tauri::command]
+async fn coding_preview_focus(
+    app: tauri::AppHandle,
+    state: State<'_, Arc<AppState>>,
+    session_id: String,
+) -> Result<(), String> {
+    state.preview.focus(&app, &session_id).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn coding_preview_reload(
+    app: tauri::AppHandle,
+    state: State<'_, Arc<AppState>>,
+    session_id: String,
+) -> Result<(), String> {
+    state.preview.reload(&app, &session_id).await.map(|_| ()).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn coding_preview_close(
+    app: tauri::AppHandle,
+    state: State<'_, Arc<AppState>>,
+    session_id: String,
+) -> Result<(), String> {
+    state.preview.close_session(&app, &session_id, true).await.map_err(|e| e.to_string())
+}
+
+/// Run one local coding turn. Deltas stream as `local-coding` events (carrying
+/// `sessionId`/`messageId`); the assistant message is returned once persisted.
+#[tauri::command]
+async fn coding_local_send(
+    app: tauri::AppHandle,
+    state: State<'_, Arc<AppState>>,
+    session_id: String,
+    request_id: String,
+    content: String,
+) -> Result<coding_store::CodingStoredMessage, String> {
+    local_coding::send(app, state.inner().clone(), session_id, request_id, content).await
+}
+
+/// Approve or deny a paused local coding tool call.
+#[tauri::command]
+async fn coding_local_approve(
+    state: State<'_, Arc<AppState>>,
+    invocation_id: String,
+    approved: bool,
+) -> Result<(), String> {
+    if let Some(tx) = state.coding_approvals.lock().await.remove(&invocation_id) {
+        let _ = tx.send(approved);
+    }
+    Ok(())
+}
+
+/// Stop an in-flight local coding turn (also releases a pending approval wait).
+#[tauri::command]
+async fn coding_local_cancel(state: State<'_, Arc<AppState>>, request_id: String) -> Result<(), String> {
+    if let Some(flag) = state.cancels.lock().await.get(&request_id) {
+        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    Ok(())
+}
+
 /// Check GitHub Releases directly (no account) and self-update if a newer version
 /// exists. Returns the new version when it updated, `None` when already current.
 #[tauri::command]
@@ -665,16 +1001,30 @@ fn run_gui() {
     let start_hidden = std::env::args().any(|a| a == "--minimized");
     let state = build_state();
     let loop_state = state.clone();
+    let window_state = state.clone();
+    let exit_state = state.clone();
 
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
+        // Native file/folder pickers for attaching workspace context.
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_autostart::init(
             MacosLauncher::LaunchAgent,
             // Autostart launches minimized to tray.
             Some(vec!["--minimized"]),
         ))
-        .manage(state)
+        .manage(state.clone())
         .setup(move |app| {
+            // Give background loops (coding turns) a handle to mirror stream
+            // events to the local webview.
+            loop_state.app.set(app.handle().clone()).ok();
             worker::spawn_loops(loop_state.clone());
+
+            // Heal coding sessions that never reached the cloud (created while
+            // offline or unenrolled) so they show up on the web Code page.
+            {
+                let state = loop_state.clone();
+                tauri::async_runtime::spawn(local_coding::backfill_unsynced(state));
+            }
 
             // Best-effort: enable launch-on-login so the tray survives reboots
             // on interactive machines. (Headless rigs use the systemd service.)
@@ -711,11 +1061,23 @@ fn run_gui() {
             }
             Ok(())
         })
-        // Closing the window hides to tray instead of quitting the agent.
-        .on_window_event(|window, event| {
+        // The main control window hides to tray. Preview windows really close,
+        // which also tears down their managed development server.
+        .on_window_event(move |window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
-                let _ = window.hide();
-                api.prevent_close();
+                if window.label() == "main" {
+                    let _ = window.hide();
+                    api.prevent_close();
+                } else {
+                    let state = window_state.clone();
+                    let app = window.app_handle().clone();
+                    let label = window.label().to_string();
+                    tauri::async_runtime::spawn(async move {
+                        if let Some(session_id) = state.preview.session_for_window(&label).await {
+                            state.preview.close_session(&app, &session_id, false).await.ok();
+                        }
+                    });
+                }
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -746,8 +1108,37 @@ fn run_gui() {
             chat_rename_session,
             chat_delete_session,
             chat_update_settings,
-            read_dropped_file
+            read_dropped_file,
+            coding_register_workspace,
+            coding_list_workspaces,
+            coding_start_session,
+            coding_send,
+            coding_list_sessions,
+            coding_get_session,
+            coding_approve,
+            coding_cancel,
+            coding_local_create_session,
+            coding_local_set_policy,
+            coding_local_attach,
+            coding_local_list_sessions,
+            coding_local_get_session,
+            coding_local_context,
+            coding_local_compact,
+            coding_local_set_context_settings,
+            coding_local_delete_session,
+            coding_local_send,
+            coding_local_approve,
+            coding_local_cancel,
+            coding_preview_status,
+            coding_preview_focus,
+            coding_preview_reload,
+            coding_preview_close
         ])
-        .run(tauri::generate_context!())
+        .build(tauri::generate_context!())
         .expect("error while running LocalLMOS agent");
+    app.run(move |handle, event| {
+        if matches!(event, tauri::RunEvent::ExitRequested { .. }) {
+            tauri::async_runtime::block_on(exit_state.preview.stop_all(handle));
+        }
+    });
 }

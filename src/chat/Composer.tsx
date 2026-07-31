@@ -16,6 +16,9 @@ export function Composer({
   canWebTools,
   webToolsHint,
   onToggleWebTools,
+  mcp,
+  canMcp,
+  onToggleMcp,
   attachments,
   onAddFiles,
   onRemoveAttachment,
@@ -31,6 +34,9 @@ export function Composer({
   canWebTools: boolean;
   webToolsHint?: string;
   onToggleWebTools: () => void;
+  mcp: boolean;
+  canMcp: boolean;
+  onToggleMcp: () => void;
   attachments: Attachment[];
   onAddFiles: (files: FileList) => void;
   onRemoveAttachment: (index: number) => void;
@@ -70,6 +76,15 @@ export function Composer({
             onClick={onToggleWebTools}
           >
             🌐 Web
+          </TogglePill>
+        )}
+        {canMcp && (
+          <TogglePill
+            on={mcp}
+            title="Offer read-only tools from your trusted MCP servers (Tools tab). Mutating tools stay in the coding harness."
+            onClick={onToggleMcp}
+          >
+            🔌 MCP
           </TogglePill>
         )}
       </div>

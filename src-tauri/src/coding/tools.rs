@@ -39,8 +39,37 @@ pub async fn run(cx: &CodingContext, host: Option<&CodingHost>, name: &str, args
             let host = host.ok_or_else(|| anyhow!("web preview tools are available only in local desktop coding sessions"))?;
             run_preview(cx, host, name, args).await
         }
+        name if name.starts_with(crate::mcp::MCP_PREFIX) => run_mcp(cx, name, args).await,
         other => Err(anyhow!("unknown coding tool: {other}")),
     }
+}
+
+/// Execute an MCP tool via the manager on `CodingContext`. Result text is
+/// truncated to the same budget as command output; a server-reported error
+/// becomes a failed (but non-aborting) tool result.
+async fn run_mcp(cx: &CodingContext, name: &str, args: &Value) -> Result<ToolRun> {
+    let manager = cx
+        .mcp
+        .manager
+        .as_ref()
+        .ok_or_else(|| anyhow!("MCP tools are not available in this session"))?;
+    let outcome = manager.call_tool(name, args).await?;
+    let provider = format!("mcp:{}", outcome.server_id);
+    let content = truncate(&outcome.text, MAX_OUTPUT_CHARS);
+    let (status, summary) = if outcome.is_error {
+        ("failed", format!("{} error", outcome.tool_name))
+    } else {
+        ("succeeded", outcome.tool_name.clone())
+    };
+    Ok(ToolRun {
+        content,
+        summary: summary.clone(),
+        event: None,
+        activity: Some(json!({
+            "name": name, "provider": provider, "status": status,
+            "summary": summary, "citations": [],
+        })),
+    })
 }
 
 async fn run_preview(cx: &CodingContext, host: &CodingHost, name: &str, args: &Value) -> Result<ToolRun> {

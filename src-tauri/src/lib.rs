@@ -17,6 +17,7 @@ mod local_coding;
 mod hardware;
 mod hub;
 mod local_chat;
+mod mcp;
 mod monitor;
 mod realtime;
 pub mod runtime;
@@ -65,6 +66,9 @@ pub struct AppState {
     pub http: reqwest::Client,
     /// Desktop-only localhost preview windows and managed workspace dev servers.
     pub preview: Arc<coding::preview::PreviewManager>,
+    /// Configured MCP servers and their live tool snapshot. Empty until the user
+    /// configures servers (phase 3); inert for turns that don't enable MCP.
+    pub mcp: Arc<mcp::McpManager>,
     pub hub: Arc<hub::HubState>,
     /// The Tauri app handle, set once at GUI startup. Absent in headless service
     /// mode. Used to mirror coding-session stream events to the local webview.
@@ -142,6 +146,7 @@ fn build_state() -> Arc<AppState> {
     ));
 
     let preview = coding::preview::PreviewManager::new(http.clone());
+    let mcp = mcp::McpManager::new(env!("CARGO_PKG_VERSION"));
     Arc::new(AppState {
         settings,
         supabase,
@@ -155,6 +160,7 @@ fn build_state() -> Arc<AppState> {
         chat_lock: Mutex::new(()),
         http,
         preview,
+        mcp,
         hub,
         app: std::sync::OnceLock::new(),
     })
@@ -371,6 +377,260 @@ async fn ollama_pull_model(
         })
         .await
         .map_err(|error| error.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// MCP server management
+// ---------------------------------------------------------------------------
+
+/// One server plus the secret env var names it has set (values never leave the
+/// backend). Combines runtime status with the persisted config for the UI.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct McpServerView {
+    #[serde(flatten)]
+    status: mcp::McpServerStatus,
+    transport: mcp::McpTransport,
+    disabled_tools: Vec<String>,
+    catalog_id: Option<String>,
+    secret_keys: Vec<String>,
+    tools: Vec<McpToolView>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct McpToolView {
+    name: String,
+    qualified: String,
+    description: String,
+    enabled: bool,
+    mutating: bool,
+}
+
+/// A catalog entry plus the exact base command (with `{placeholder}` tokens
+/// intact) so the install dialog can show what will run before it runs.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CatalogEntryView {
+    #[serde(flatten)]
+    entry: &'static mcp::catalog::CatalogEntry,
+    command: String,
+}
+
+/// Full picture for the Tools tab: configured servers with live status + tools,
+/// the snapshot's truncation count, and the catalog with runtime detection.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct McpOverview {
+    servers: Vec<McpServerView>,
+    truncated: usize,
+    runtimes: mcp::catalog::RuntimeAvailability,
+    catalog: Vec<CatalogEntryView>,
+}
+
+async fn build_overview(state: &Arc<AppState>) -> McpOverview {
+    let configs = state.config.lock().await.mcp_servers.clone();
+    let statuses = state.mcp.statuses().await;
+    let snapshot = state.mcp.snapshot();
+
+    let servers = configs
+        .into_iter()
+        .map(|c| {
+            let status = statuses
+                .iter()
+                .find(|s| s.id == c.id)
+                .cloned()
+                .unwrap_or_else(|| mcp::McpServerStatus {
+                    id: c.id.clone(),
+                    label: c.label.clone(),
+                    enabled: c.enabled,
+                    trust: c.trust,
+                    status: mcp::McpStatus::Stopped,
+                    tool_count: 0,
+                    last_error: None,
+                });
+            let tools = snapshot
+                .tools
+                .iter()
+                .filter(|t| t.server_id == c.id)
+                .map(|t| McpToolView {
+                    name: t.tool_name.clone(),
+                    qualified: t.qualified.clone(),
+                    description: t.description.clone(),
+                    enabled: c.is_tool_enabled(&t.tool_name),
+                    mutating: t.mutating,
+                })
+                .collect();
+            McpServerView {
+                status,
+                transport: c.transport.clone(),
+                disabled_tools: c.disabled_tools.clone(),
+                catalog_id: c.catalog_id.clone(),
+                secret_keys: mcp::secret_keys_for(&c.id),
+                tools,
+            }
+        })
+        .collect();
+
+    let empty = std::collections::BTreeMap::new();
+    let catalog = mcp::catalog::CATALOG
+        .iter()
+        .map(|entry| CatalogEntryView { entry, command: entry.preview_command(&empty) })
+        .collect();
+
+    McpOverview {
+        servers,
+        truncated: snapshot.truncated,
+        runtimes: mcp::catalog::detect_runtimes(),
+        catalog,
+    }
+}
+
+/// Persist the server list, then re-register it with the manager. Callers save
+/// under the config lock and reconcile the manager after.
+async fn persist_and_reconcile(
+    state: &Arc<AppState>,
+    servers: Vec<mcp::McpServerConfig>,
+) -> Result<(), String> {
+    {
+        let mut config = state.config.lock().await;
+        config.mcp_servers = servers.clone();
+        config.save().map_err(|e| e.to_string())?;
+    }
+    state.mcp.set_configs(servers).await;
+    Ok(())
+}
+
+#[tauri::command]
+async fn mcp_overview(state: State<'_, Arc<AppState>>) -> Result<McpOverview, String> {
+    Ok(build_overview(&state).await)
+}
+
+#[tauri::command]
+async fn mcp_add_server(
+    state: State<'_, Arc<AppState>>,
+    config: mcp::McpServerConfig,
+) -> Result<McpOverview, String> {
+    config.validate()?;
+    let mut servers = state.config.lock().await.mcp_servers.clone();
+    if servers.iter().any(|s| s.id == config.id) {
+        return Err(format!("a server with id '{}' already exists", config.id));
+    }
+    servers.push(config);
+    persist_and_reconcile(&state, servers).await?;
+    Ok(build_overview(&state).await)
+}
+
+#[tauri::command]
+async fn mcp_install_catalog_entry(
+    state: State<'_, Arc<AppState>>,
+    catalog_id: String,
+    server_id: String,
+    inputs: std::collections::BTreeMap<String, String>,
+) -> Result<McpOverview, String> {
+    let entry = mcp::catalog::find(&catalog_id).ok_or_else(|| format!("unknown catalog entry: {catalog_id}"))?;
+    let (config, secrets) = entry.to_config(&server_id, &inputs).map_err(|e| e.to_string())?;
+    config.validate()?;
+    {
+        let servers = state.config.lock().await.mcp_servers.clone();
+        if servers.iter().any(|s| s.id == config.id) {
+            return Err(format!("a server with id '{}' already exists", config.id));
+        }
+    }
+    // Write secrets before persisting the config so a crash never leaves a
+    // running server referencing a missing token.
+    for (key, value) in &secrets {
+        mcp::set_secret(&server_id, key, value).map_err(|e| e.to_string())?;
+    }
+    let mut servers = state.config.lock().await.mcp_servers.clone();
+    servers.push(config);
+    persist_and_reconcile(&state, servers).await?;
+    Ok(build_overview(&state).await)
+}
+
+#[tauri::command]
+async fn mcp_update_server(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+    enabled: Option<bool>,
+    trust: Option<mcp::McpTrust>,
+    disabled_tools: Option<Vec<String>>,
+    label: Option<String>,
+) -> Result<McpOverview, String> {
+    let mut servers = state.config.lock().await.mcp_servers.clone();
+    let server = servers.iter_mut().find(|s| s.id == id).ok_or_else(|| format!("no such server: {id}"))?;
+    if let Some(v) = enabled {
+        server.enabled = v;
+    }
+    if let Some(v) = trust {
+        server.trust = v;
+    }
+    if let Some(v) = disabled_tools {
+        server.disabled_tools = v;
+    }
+    if let Some(v) = label {
+        server.label = v;
+    }
+    server.validate()?;
+    persist_and_reconcile(&state, servers).await?;
+    // Rebuild the snapshot so a trust/enablement change takes effect immediately
+    // for running servers.
+    if state.mcp.statuses().await.iter().any(|s| s.id == id && s.status == mcp::McpStatus::Running) {
+        state.mcp.start(&id).await.ok();
+    }
+    Ok(build_overview(&state).await)
+}
+
+#[tauri::command]
+async fn mcp_set_secret(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+    key: String,
+    value: String,
+) -> Result<(), String> {
+    // Only accept a secret for a configured server.
+    let known = state.config.lock().await.mcp_servers.iter().any(|s| s.id == id);
+    if !known {
+        return Err(format!("no such server: {id}"));
+    }
+    mcp::set_secret(&id, &key, &value).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn mcp_delete_server(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+) -> Result<McpOverview, String> {
+    let servers: Vec<mcp::McpServerConfig> = state
+        .config
+        .lock()
+        .await
+        .mcp_servers
+        .iter()
+        .filter(|s| s.id != id)
+        .cloned()
+        .collect();
+    state.mcp.stop(&id).await.ok();
+    mcp::remove_secrets(&id).map_err(|e| e.to_string())?;
+    persist_and_reconcile(&state, servers).await?;
+    Ok(build_overview(&state).await)
+}
+
+#[tauri::command]
+async fn mcp_start_server(state: State<'_, Arc<AppState>>, id: String) -> Result<McpOverview, String> {
+    state.mcp.start(&id).await.map_err(|e| e.to_string())?;
+    Ok(build_overview(&state).await)
+}
+
+#[tauri::command]
+async fn mcp_stop_server(state: State<'_, Arc<AppState>>, id: String) -> Result<McpOverview, String> {
+    state.mcp.stop(&id).await.map_err(|e| e.to_string())?;
+    Ok(build_overview(&state).await)
+}
+
+#[tauri::command]
+async fn mcp_server_logs(state: State<'_, Arc<AppState>>, id: String) -> Result<String, String> {
+    state.mcp.server_logs(&id).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -733,6 +993,24 @@ async fn coding_local_set_policy(
     Ok(session)
 }
 
+/// Toggle whether a coding session offers the configured MCP servers' tools.
+#[tauri::command]
+async fn coding_local_set_mcp_enabled(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+    enabled: bool,
+) -> Result<coding_store::CodingSession, String> {
+    let session = {
+        let _guard = state.chat_lock.lock().await;
+        let mut s = coding_store::load(&id).map_err(|e| e.to_string())?;
+        s.mcp_enabled = enabled;
+        s.updated_at = chrono::Utc::now();
+        coding_store::save(&s).map_err(|e| e.to_string())?;
+        s
+    };
+    Ok(session)
+}
+
 /// Validate paths picked from the native dialog against the session's workspace,
 /// returning them workspace-relative. Anything outside the root is rejected —
 /// the agent's tools could not read it anyway, so silently accepting it would
@@ -1026,6 +1304,16 @@ fn run_gui() {
                 tauri::async_runtime::spawn(local_coding::backfill_unsynced(state));
             }
 
+            // Register configured MCP servers with the manager (lazy-started on
+            // first turn that enables them; nothing is spawned here).
+            {
+                let state = loop_state.clone();
+                tauri::async_runtime::spawn(async move {
+                    let configs = state.config.lock().await.mcp_servers.clone();
+                    state.mcp.set_configs(configs).await;
+                });
+            }
+
             // Best-effort: enable launch-on-login so the tray survives reboots
             // on interactive machines. (Headless rigs use the systemd service.)
             #[cfg(desktop)]
@@ -1087,6 +1375,15 @@ fn run_gui() {
             load_model,
             get_model_load_settings,
             save_model_load_settings,
+            mcp_overview,
+            mcp_add_server,
+            mcp_install_catalog_entry,
+            mcp_update_server,
+            mcp_set_secret,
+            mcp_delete_server,
+            mcp_start_server,
+            mcp_stop_server,
+            mcp_server_logs,
             unload_model,
             delete_local_model,
             ollama_pull_model,
@@ -1119,6 +1416,7 @@ fn run_gui() {
             coding_cancel,
             coding_local_create_session,
             coding_local_set_policy,
+            coding_local_set_mcp_enabled,
             coding_local_attach,
             coding_local_list_sessions,
             coding_local_get_session,
@@ -1138,7 +1436,11 @@ fn run_gui() {
         .expect("error while running LocalLMOS agent");
     app.run(move |handle, event| {
         if matches!(event, tauri::RunEvent::ExitRequested { .. }) {
-            tauri::async_runtime::block_on(exit_state.preview.stop_all(handle));
+            tauri::async_runtime::block_on(async {
+                exit_state.preview.stop_all(handle).await;
+                // Terminate every MCP server process tree so none are orphaned.
+                exit_state.mcp.stop_all().await;
+            });
         }
     });
 }

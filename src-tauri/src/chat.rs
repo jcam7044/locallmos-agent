@@ -175,11 +175,14 @@ pub async fn process(state: &Arc<AppState>, pending: ChatPending) -> Result<()> 
             Ok(workspace) => {
                 local_session_id = meta.local_session_id.clone();
                 let policy = coding::ApprovalPolicy::parse(&meta.approval_policy);
+                // Freeze the MCP snapshot so cloud-driven coding turns can resolve
+                // and execute `mcp__…` tools too (they arrive via platform_tools).
+                let mcp = coding::McpAccess::frozen(state.mcp.clone());
                 messages.insert(
                     0,
-                    json!({ "role": "system", "content": coding::system_prompt(&workspace.root_str(), policy) }),
+                    json!({ "role": "system", "content": coding::system_prompt(&workspace.root_str(), policy, &mcp) }),
                 );
-                Some(coding::CodingContext { workspace, policy })
+                Some(coding::CodingContext { workspace, policy, mcp })
             }
             Err(e) => {
                 let msg = format!("coding workspace unavailable: {e}");

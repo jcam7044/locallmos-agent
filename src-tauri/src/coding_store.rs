@@ -36,6 +36,10 @@ pub struct CodingSession {
     pub workspace_root: String,
     #[serde(default = "default_policy")]
     pub approval_policy: String,
+    /// Whether this session offers the configured MCP servers' tools to the model.
+    /// Off by default so a session opts in explicitly.
+    #[serde(default)]
+    pub mcp_enabled: bool,
     #[serde(default)]
     pub messages: Vec<CodingStoredMessage>,
     /// Full transcript storage is independent from the active model context.
@@ -152,6 +156,7 @@ impl CodingSession {
             model,
             workspace_root,
             approval_policy,
+            mcp_enabled: false,
             messages: Vec::new(),
             context_state: CodingContextState::default(),
             remote_id: None,

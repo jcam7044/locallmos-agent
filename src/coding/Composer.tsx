@@ -35,6 +35,8 @@ export function Composer({
   onStop,
   policy,
   onPolicyChange,
+  mcpEnabled,
+  onMcpToggle,
   sessionId,
   attachments,
   setAttachments,
@@ -55,6 +57,8 @@ export function Composer({
   onStop: () => void;
   policy: ApprovalPolicy;
   onPolicyChange: (p: ApprovalPolicy) => void;
+  mcpEnabled: boolean;
+  onMcpToggle: (enabled: boolean) => void;
   sessionId: string;
   attachments: string[];
   setAttachments: (a: string[]) => void;
@@ -153,6 +157,18 @@ export function Composer({
           <button onClick={() => setMenu(menu === "mode" ? null : "mode")} style={pill}>
             {modeLabel(policy)}
             <span style={{ opacity: 0.5, fontSize: 10 }}>▾</span>
+          </button>
+
+          <button
+            onClick={() => onMcpToggle(!mcpEnabled)}
+            style={{ ...pill, opacity: mcpEnabled ? 1 : 0.5 }}
+            title={
+              mcpEnabled
+                ? "MCP tools are available to this session. Manage servers in the Tools tab."
+                : "Enable the configured MCP servers' tools for this session."
+            }
+          >
+            MCP {mcpEnabled ? "on" : "off"}
           </button>
 
           <div style={{ flex: 1 }} />

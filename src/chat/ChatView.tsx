@@ -325,6 +325,9 @@ export function ChatView({
               : "Page fetch works offline; web search needs a cloud connection"
           }
           onToggleWebTools={() => patchSettings({ webTools: !(active?.settings.webTools ?? false) })}
+          mcp={active?.settings.mcp ?? false}
+          canMcp={canWebTools}
+          onToggleMcp={() => patchSettings({ mcp: !(active?.settings.mcp ?? false) })}
           attachments={pending}
           onAddFiles={addFiles}
           onRemoveAttachment={(i) => setPending((p) => p.filter((_, idx) => idx !== i))}

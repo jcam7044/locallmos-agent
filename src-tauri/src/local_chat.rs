@@ -104,15 +104,33 @@ pub async fn send(
 
     let think = session.settings.think && state.runtime.model_supports_thinking(&model).await;
 
-    // Built-in web tools when enabled and the model can call tools. Unenrolled
-    // rigs get web_fetch only — web_search relays through the cloud.
-    let tools_value = if session.settings.web_tools && state.runtime.model_supports_tools(&model).await
-    {
+    // Tools are only offered when the model supports native tool calling.
+    let native_tools = state.runtime.model_supports_tools(&model).await;
+    let mut tool_defs: Vec<Value> = Vec::new();
+
+    // Built-in web tools when enabled. Unenrolled rigs get web_fetch only —
+    // web_search relays through the cloud.
+    if session.settings.web_tools && native_tools {
         let enrolled = state.config.lock().await.is_enrolled();
-        Some(if enrolled { tools::builtin_defs() } else { tools::fetch_only_defs() })
-    } else {
-        None
-    };
+        let web = if enrolled { tools::builtin_defs() } else { tools::fetch_only_defs() };
+        if let Some(arr) = web.as_array() {
+            tool_defs.extend(arr.iter().cloned());
+        }
+    }
+
+    // Read-only MCP tools from trusted servers. Chat has no approval gate, so
+    // only non-mutating tools are ever offered here; mutating work belongs in the
+    // coding harness. Start the servers first so the snapshot reflects them.
+    if session.settings.mcp && native_tools {
+        state.mcp.ensure_enabled_started().await;
+        for tool in &state.mcp.snapshot().tools {
+            if !tool.mutating {
+                tool_defs.push(tool.to_ollama_def());
+            }
+        }
+    }
+
+    let tools_value = (!tool_defs.is_empty()).then(|| Value::Array(tool_defs));
 
     // Register the cancel flag so `local_chat_cancel` can stop this turn.
     let cancel = Arc::new(AtomicBool::new(false));
@@ -250,13 +268,12 @@ async fn run_turn(
             return Ok(out);
         }
 
-        // Execute built-in tools: echo an assistant tool_calls message, then one
-        // tool result per call, and loop so the model can use them.
-        let calls: Vec<ToolCall> =
-            round_out.tool_calls.into_iter().filter(|c| tools::is_builtin(&c.name)).collect();
-        if calls.is_empty() {
-            return Err(anyhow::anyhow!("model requested an unsupported tool"));
-        }
+        // Execute tools: echo an assistant tool_calls message, then one tool
+        // result per call, and loop so the model can use them. Unknown tools get
+        // a per-call error result (matching the coding harness) rather than
+        // aborting the whole turn — with more than a couple of tools available, a
+        // single near-miss name should not discard a good answer in progress.
+        let calls: Vec<ToolCall> = round_out.tool_calls;
         let assistant_calls: Vec<Value> = calls.iter().map(|c| c.to_request_value()).collect();
         messages.push(json!({ "role": "assistant", "content": "", "tool_calls": assistant_calls }));
         let remaining = tool_call_limit.saturating_sub(executed_tool_calls);
@@ -267,15 +284,33 @@ async fn run_turn(
                 session_id,
                 json!({ "type": "tool", "name": call.name, "arguments": call.arguments.to_string() }),
             );
-            let (result_text, activity, summary) = if index < remaining {
-                executed_tool_calls += 1;
-                run_builtin(state, call).await
-            } else {
+            // Both known and unknown calls consume the budget: an unknown name
+            // used to abort the turn, which also bounded a model that kept
+            // emitting bad calls. Now that unknowns are handled per-call, they
+            // must still count toward the limit so a misbehaving model can't loop
+            // indefinitely without ever driving `remaining` to zero.
+            let (result_text, activity, summary) = if index >= remaining {
                 (
                     "Tool call was not run because the maximum tool count for this message was reached. Use the completed tool results to answer the user.".into(),
                     None,
                     "not run: maximum tool count reached".into(),
                 )
+            } else if call.name.starts_with(crate::mcp::MCP_PREFIX) {
+                executed_tool_calls += 1;
+                run_mcp(state, call).await
+            } else if !tools::is_builtin(&call.name) {
+                executed_tool_calls += 1;
+                (
+                    format!(
+                        "unknown tool: {}. It is not available in this chat; use the tools you were given, or answer without it.",
+                        call.name
+                    ),
+                    None,
+                    "unknown tool".into(),
+                )
+            } else {
+                executed_tool_calls += 1;
+                run_builtin(state, call).await
             };
             emit(
                 app,
@@ -299,6 +334,66 @@ async fn run_turn(
                 "content": "The maximum tool call count for this message has been reached. Use the completed results above to provide the final answer now. Do not request more tools."
             }));
         }
+    }
+}
+
+/// Cap on MCP tool output fed back into a chat turn.
+const MCP_CHAT_OUTPUT_CHARS: usize = 20_000;
+
+/// Execute an MCP tool for a chat turn. Chat has no approval gate, so a mutating
+/// tool is refused here even if the model conjures its name — only read-only
+/// tools from trusted servers are ever offered. Result text is capped.
+async fn run_mcp(state: &Arc<AppState>, call: &ToolCall) -> (String, Option<Value>, String) {
+    let snapshot = state.mcp.snapshot();
+    match snapshot.find(&call.name) {
+        None => (
+            format!(
+                "{} is not an available tool in this chat. Answer without it, or enable the server in the Tools tab.",
+                call.name
+            ),
+            None,
+            "unavailable".into(),
+        ),
+        Some(tool) if tool.mutating => (
+            format!(
+                "{} changes state and is not available in chat (no approval step). Use a coding session for actions that modify data.",
+                call.name
+            ),
+            None,
+            "blocked (mutating)".into(),
+        ),
+        Some(_) => match state.mcp.call_tool(&call.name, &call.arguments).await {
+            Ok(outcome) => {
+                let mut text = outcome.text;
+                if text.chars().count() > MCP_CHAT_OUTPUT_CHARS {
+                    let end = text
+                        .char_indices()
+                        .nth(MCP_CHAT_OUTPUT_CHARS)
+                        .map(|(i, _)| i)
+                        .unwrap_or(text.len());
+                    text.truncate(end);
+                    text.push_str("\n…[truncated]");
+                }
+                let (status, summary) = if outcome.is_error {
+                    ("failed", format!("{} error", outcome.tool_name))
+                } else {
+                    ("succeeded", outcome.tool_name.clone())
+                };
+                let activity = json!({
+                    "name": call.name, "provider": format!("mcp:{}", outcome.server_id),
+                    "status": status, "summary": summary, "citations": [],
+                });
+                (text, Some(activity), summary)
+            }
+            Err(e) => (
+                format!("{} failed: {e}", call.name),
+                Some(json!({
+                    "name": call.name, "provider": "mcp", "status": "failed",
+                    "summary": "error", "citations": [],
+                })),
+                "error".into(),
+            ),
+        },
     }
 }
 

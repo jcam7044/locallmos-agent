@@ -93,6 +93,8 @@ describe("coding context indicator", () => {
         onStop={() => undefined}
         policy="read_only"
         onPolicyChange={() => undefined}
+        mcpEnabled={false}
+        onMcpToggle={() => undefined}
         sessionId="session-1"
         attachments={[]}
         setAttachments={() => undefined}

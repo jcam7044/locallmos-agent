@@ -128,6 +128,7 @@ export type SessionSettings = {
   numCtx: number | null;
   think: boolean;
   webTools: boolean;
+  mcp: boolean;
 };
 
 export type Attachment = {
@@ -228,8 +229,80 @@ export type CodingSession = {
   model: string;
   workspaceRoot: string;
   approvalPolicy: ApprovalPolicy;
+  mcpEnabled: boolean;
   messages: CodingStoredMessage[];
   contextState: CodingContextState;
+};
+
+// ---- MCP servers (mirrors src-tauri/src/mcp + the mcp_* Tauri commands) ----
+
+export type McpTrust = "untrusted" | "trusted";
+export type McpStatus = "stopped" | "starting" | "running" | "failed";
+
+export type McpTransport =
+  | { kind: "stdio"; command: string; args: string[]; env: Record<string, string>; cwd?: string | null }
+  | { kind: "streamableHttp"; url: string };
+
+export type McpToolView = {
+  name: string;
+  qualified: string;
+  description: string;
+  enabled: boolean;
+  mutating: boolean;
+};
+
+export type McpServerView = {
+  id: string;
+  label: string;
+  enabled: boolean;
+  trust: McpTrust;
+  status: McpStatus;
+  toolCount: number;
+  lastError: string | null;
+  transport: McpTransport;
+  disabledTools: string[];
+  catalogId: string | null;
+  secretKeys: string[];
+  tools: McpToolView[];
+};
+
+export type McpInputSpec = {
+  key: string;
+  label: string;
+  required: boolean;
+  secret: boolean;
+  placeholder: string;
+};
+
+export type McpCatalogEntry = {
+  id: string;
+  label: string;
+  description: string;
+  runtime: "npx" | "uvx";
+  inputs: McpInputSpec[];
+  defaultTrust: McpTrust;
+  caveat: string | null;
+  command: string;
+};
+
+export type McpRuntimeAvailability = { node: boolean; uv: boolean };
+
+export type McpOverview = {
+  servers: McpServerView[];
+  truncated: number;
+  runtimes: McpRuntimeAvailability;
+  catalog: McpCatalogEntry[];
+};
+
+/** A configured server as sent to mcp_add_server (BYO stdio). */
+export type McpServerConfig = {
+  id: string;
+  label: string;
+  transport: McpTransport;
+  enabled: boolean;
+  trust: McpTrust;
+  disabledTools: string[];
+  catalogId?: string | null;
 };
 
 export type CodingContextState = {

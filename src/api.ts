@@ -17,6 +17,9 @@ import type {
   HubModelDetail,
   HubModelPage,
   ModelLoadSettings,
+  McpOverview,
+  McpServerConfig,
+  McpTrust,
 } from "./types";
 
 export const getLocalStatus = () => invoke<LocalStatus>("local_status");
@@ -135,3 +138,42 @@ export const codingPreviewReload = (sessionId: string) =>
 
 export const codingPreviewClose = (sessionId: string) =>
   invoke("coding_preview_close", { sessionId });
+
+export const codingSetMcpEnabled = (id: string, enabled: boolean) =>
+  invoke<CodingSession>("coding_local_set_mcp_enabled", { id, enabled });
+
+// ---- MCP server management ----
+
+export const mcpOverview = () => invoke<McpOverview>("mcp_overview");
+
+export const mcpAddServer = (config: McpServerConfig) =>
+  invoke<McpOverview>("mcp_add_server", { config });
+
+export const mcpInstallCatalogEntry = (
+  catalogId: string,
+  serverId: string,
+  inputs: Record<string, string>,
+) => invoke<McpOverview>("mcp_install_catalog_entry", { catalogId, serverId, inputs });
+
+export const mcpUpdateServer = (args: {
+  id: string;
+  enabled?: boolean;
+  trust?: McpTrust;
+  disabledTools?: string[];
+  label?: string;
+}) => invoke<McpOverview>("mcp_update_server", args);
+
+export const mcpSetSecret = (id: string, key: string, value: string) =>
+  invoke("mcp_set_secret", { id, key, value });
+
+export const mcpDeleteServer = (id: string) =>
+  invoke<McpOverview>("mcp_delete_server", { id });
+
+export const mcpStartServer = (id: string) =>
+  invoke<McpOverview>("mcp_start_server", { id });
+
+export const mcpStopServer = (id: string) =>
+  invoke<McpOverview>("mcp_stop_server", { id });
+
+export const mcpServerLogs = (id: string) =>
+  invoke<string>("mcp_server_logs", { id });

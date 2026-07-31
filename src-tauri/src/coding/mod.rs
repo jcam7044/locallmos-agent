@@ -13,7 +13,37 @@ mod workspace;
 pub use prompt::system_prompt;
 pub use workspace::Workspace;
 
+use crate::mcp;
 use serde_json::Value;
+use std::sync::Arc;
+
+/// A coding turn's access to MCP tools: the frozen tool snapshot the model was
+/// shown (for defs, the prompt, and token accounting) plus a handle to execute
+/// one. Both are resolved from the same `McpManager` at context-construction
+/// time, so the preflight token count and the turn itself see the same tools.
+///
+/// Kept on `CodingContext` — not `CodingHost` — because cloud-driven turns pass
+/// `host: None`, and MCP must be reachable there too.
+#[derive(Clone)]
+pub struct McpAccess {
+    pub snapshot: Arc<mcp::McpSnapshot>,
+    pub manager: Option<Arc<mcp::McpManager>>,
+}
+
+impl McpAccess {
+    /// No MCP tools (the default for sessions that haven't enabled it).
+    // Used by the per-session gate added in phase 3.
+    #[allow(dead_code)]
+    pub fn disabled() -> Self {
+        Self { snapshot: mcp::McpSnapshot::empty(), manager: None }
+    }
+
+    /// Freeze the manager's current snapshot for a turn.
+    pub fn frozen(manager: Arc<mcp::McpManager>) -> Self {
+        let snapshot = manager.snapshot();
+        Self { snapshot, manager: Some(manager) }
+    }
+}
 
 /// How mutating tools are handled. Mirrors `coding_workspaces.approval_policy`.
 ///
@@ -64,8 +94,9 @@ impl ApprovalPolicy {
     }
 }
 
-/// Whether a call would change the workspace. `git` depends on the subcommand.
-fn is_mutating(name: &str, args: &Value) -> bool {
+/// Whether a built-in call would change the workspace. `git` depends on the
+/// subcommand. Pure — MCP tools are classified by [`is_mutating`].
+fn builtin_is_mutating(name: &str, args: &Value) -> bool {
     match name {
         "write_file" | "edit_file" | "run_command" | "dev_server_start" => true,
         "git" => !tools::git_is_readonly(args.get("args").and_then(Value::as_str).unwrap_or("")),
@@ -73,11 +104,24 @@ fn is_mutating(name: &str, args: &Value) -> bool {
     }
 }
 
+/// Whether a call (built-in or MCP) would change the workspace. MCP tools are
+/// mutating by default — a third-party tool is only treated as read-only when the
+/// user marked its server `Trusted` *and* the tool declared `readOnlyHint`, a
+/// decision precomputed into `McpToolDef.mutating`. A call to a tool not in the
+/// snapshot fails closed (mutating), so the approval gate still covers it.
+fn is_mutating(cx: &CodingContext, name: &str, args: &Value) -> bool {
+    if name.starts_with(mcp::MCP_PREFIX) {
+        return cx.mcp.snapshot.find(name).map(|t| t.mutating).unwrap_or(true);
+    }
+    builtin_is_mutating(name, args)
+}
+
 /// Everything a coding turn needs to execute tools: the confined workspace and
 /// the approval policy resolved from the session's workspace row.
 pub struct CodingContext {
     pub workspace: Workspace,
     pub policy: ApprovalPolicy,
+    pub mcp: McpAccess,
 }
 
 /// GUI-only services available to local desktop coding turns. Keeping this
@@ -103,36 +147,54 @@ pub struct ToolRun {
     pub activity: Option<Value>,
 }
 
-/// True for the coding tool function names the agent executes locally.
+/// True for the coding tool function names the agent executes locally. Any
+/// `mcp__…` name is admitted here; whether that specific MCP tool is actually
+/// available is resolved at execution time (an unknown one fails per-call rather
+/// than aborting the turn).
 pub fn is_known_tool(name: &str) -> bool {
-    matches!(
-        name,
-        "read_file" | "list_dir" | "search" | "write_file" | "edit_file" | "run_command" | "git"
-            | "dev_server_start" | "dev_server_logs" | "dev_server_stop"
-            | "web_preview_open" | "web_preview_snapshot" | "web_preview_click"
-            | "web_preview_fill" | "web_preview_press" | "web_preview_reload"
-            | "web_preview_resize" | "web_preview_console" | "web_preview_close"
-    )
+    name.starts_with(mcp::MCP_PREFIX)
+        || matches!(
+            name,
+            "read_file" | "list_dir" | "search" | "write_file" | "edit_file" | "run_command" | "git"
+                | "dev_server_start" | "dev_server_logs" | "dev_server_stop"
+                | "web_preview_open" | "web_preview_snapshot" | "web_preview_click"
+                | "web_preview_fill" | "web_preview_press" | "web_preview_reload"
+                | "web_preview_resize" | "web_preview_console" | "web_preview_close"
+        )
 }
 
-/// The tools offered to the model under `policy`. Inspection-only modes withhold
+/// The tools offered to the model for this turn. Inspection-only modes withhold
 /// the mutating tools so the model doesn't plan around capabilities it lacks;
 /// `execute` refuses them regardless. `git` stays available in every mode — its
 /// read-only subcommands are useful, and mutating ones are refused per call.
-pub fn tool_defs_for(policy: ApprovalPolicy, include_preview: bool) -> Vec<Value> {
+///
+/// `include_mcp` is set only when the runtime supports native tool calling.
+/// Prompt-injection tool mode re-serializes every full JSON Schema into the
+/// prompt each round, so third-party MCP schemas are withheld there — see
+/// `local_coding::build_context`.
+pub fn tool_defs_for(cx: &CodingContext, include_preview: bool, include_mcp: bool) -> Vec<Value> {
+    let allows = cx.policy.allows_mutations();
     let mut all = tool_defs();
     if include_preview {
         all.extend(preview_tool_defs());
     }
-    if policy.allows_mutations() {
-        return all;
-    }
-    all.into_iter()
-        .filter(|d| {
+    if !allows {
+        all.retain(|d| {
             let name = d.pointer("/function/name").and_then(Value::as_str).unwrap_or("");
             !matches!(name, "write_file" | "edit_file" | "run_command" | "dev_server_start")
-        })
-        .collect()
+        });
+    }
+    if include_mcp {
+        for tool in &cx.mcp.snapshot.tools {
+            // Withhold mutating MCP tools under inspection-only modes, mirroring
+            // the built-in filter above.
+            if !allows && tool.mutating {
+                continue;
+            }
+            all.push(tool.to_ollama_def());
+        }
+    }
+    all
 }
 
 /// Desktop-only preview tools. These are appended only by the local GUI coding
@@ -214,8 +276,11 @@ pub fn tool_defs() -> Vec<Value> {
 /// If this call must be approved before it runs, return the human-readable
 /// preview (a diff or the command) to show the approver. `None` means run now.
 pub fn approval_preview(cx: &CodingContext, name: &str, args: &Value) -> Option<String> {
-    if !cx.policy.gates_mutations() || !is_mutating(name, args) {
+    if !cx.policy.gates_mutations() || !is_mutating(cx, name, args) {
         return None;
+    }
+    if name.starts_with(mcp::MCP_PREFIX) {
+        return Some(mcp_approval_preview(cx, name, args));
     }
     match name {
         "write_file" | "edit_file" => Some(
@@ -235,13 +300,35 @@ pub fn approval_preview(cx: &CodingContext, name: &str, args: &Value) -> Option<
     }
 }
 
+/// Human-readable approval preview for an MCP call: the owning server and tool
+/// plus its (pretty-printed, bounded) arguments.
+fn mcp_approval_preview(cx: &CodingContext, name: &str, args: &Value) -> String {
+    let (server, tool) = cx
+        .mcp
+        .snapshot
+        .find(name)
+        .map(|t| (t.server_id.clone(), t.tool_name.clone()))
+        .unwrap_or_else(|| (String::from("?"), name.to_string()));
+    let mut rendered = serde_json::to_string_pretty(args).unwrap_or_else(|_| args.to_string());
+    const MAX: usize = 2_000;
+    if rendered.len() > MAX {
+        let mut end = MAX;
+        while !rendered.is_char_boundary(end) {
+            end -= 1;
+        }
+        rendered.truncate(end);
+        rendered.push_str("\n…[truncated]");
+    }
+    format!("MCP {server} · {tool}\n{rendered}")
+}
+
 /// Execute a coding tool by name. Errors are returned as tool content so a
 /// single failure does not abort the turn (mirrors the built-in tool path).
 pub async fn execute(cx: &CodingContext, host: Option<&CodingHost>, name: &str, args: &Value) -> ToolRun {
     // Withholding the schemas is not enforcement — a model can still emit a call
     // for a tool it was never offered, and in prompt-injection tool mode it only
     // ever sees a text manifest. Refuse here, the single choke point.
-    if !cx.policy.allows_mutations() && is_mutating(name, args) {
+    if !cx.policy.allows_mutations() && is_mutating(cx, name, args) {
         let mode = if cx.policy == ApprovalPolicy::Plan { "plan" } else { "read-only" };
         return ToolRun {
             content: format!(
@@ -282,6 +369,29 @@ mod tests {
             .collect()
     }
 
+    fn mcp_tool(server: &str, tool: &str, mutating: bool) -> mcp::McpToolDef {
+        mcp::McpToolDef {
+            server_id: server.into(),
+            tool_name: tool.into(),
+            qualified: mcp::qualified_name(server, tool),
+            description: String::new(),
+            parameters: json!({ "type": "object" }),
+            read_only_hint: !mutating,
+            mutating,
+        }
+    }
+
+    /// A context with a synthetic MCP snapshot and no live manager (gating and
+    /// def-assembly are pure; execution is covered by the mcp module's tests).
+    fn ctx(policy: ApprovalPolicy, mcp_tools: Vec<mcp::McpToolDef>) -> CodingContext {
+        let snapshot = Arc::new(mcp::McpSnapshot { tools: mcp_tools, truncated: 0 });
+        CodingContext {
+            workspace: Workspace::new(std::env::temp_dir().to_str().unwrap()).unwrap(),
+            policy,
+            mcp: McpAccess { snapshot, manager: None },
+        }
+    }
+
     #[test]
     fn policy_strings_round_trip() {
         for p in [
@@ -313,7 +423,8 @@ mod tests {
     #[test]
     fn inspection_modes_withhold_mutating_tools() {
         for p in [ApprovalPolicy::ReadOnly, ApprovalPolicy::Plan] {
-            let offered = names(&tool_defs_for(p, true));
+            let cx = ctx(p, vec![]);
+            let offered = names(&tool_defs_for(&cx, true, false));
             for withheld in ["write_file", "edit_file", "run_command", "dev_server_start"] {
                 assert!(!offered.contains(&withheld.to_string()), "{p:?} offered {withheld}");
             }
@@ -323,16 +434,69 @@ mod tests {
                 assert!(offered.contains(&kept.to_string()), "{p:?} withheld {kept}");
             }
         }
-        assert_eq!(names(&tool_defs_for(ApprovalPolicy::Auto, false)).len(), tool_defs().len());
+        let cx = ctx(ApprovalPolicy::Auto, vec![]);
+        assert_eq!(names(&tool_defs_for(&cx, false, false)).len(), tool_defs().len());
+    }
+
+    #[test]
+    fn mcp_tools_offered_by_policy_and_mutation() {
+        let tools = vec![mcp_tool("db", "read_query", false), mcp_tool("db", "write_query", true)];
+
+        // ApproveWrites/Auto see both MCP tools when include_mcp is set.
+        let cx = ctx(ApprovalPolicy::ApproveWrites, tools.clone());
+        let offered = names(&tool_defs_for(&cx, false, true));
+        assert!(offered.contains(&"mcp__db__read_query".to_string()));
+        assert!(offered.contains(&"mcp__db__write_query".to_string()));
+
+        // include_mcp=false (prompt-injection tool mode) withholds all MCP tools.
+        let offered = names(&tool_defs_for(&cx, false, false));
+        assert!(!offered.iter().any(|n| n.starts_with(mcp::MCP_PREFIX)));
+
+        // Inspection-only modes withhold the mutating MCP tool but keep read-only.
+        for p in [ApprovalPolicy::ReadOnly, ApprovalPolicy::Plan] {
+            let cx = ctx(p, tools.clone());
+            let offered = names(&tool_defs_for(&cx, false, true));
+            assert!(offered.contains(&"mcp__db__read_query".to_string()), "{p:?} withheld read");
+            assert!(!offered.contains(&"mcp__db__write_query".to_string()), "{p:?} offered write");
+        }
     }
 
     #[test]
     fn git_mutation_depends_on_subcommand() {
-        assert!(!is_mutating("git", &json!({ "args": "status" })));
-        assert!(is_mutating("git", &json!({ "args": "commit -m x" })));
-        assert!(is_mutating("write_file", &json!({})));
-        assert!(!is_mutating("read_file", &json!({})));
-        assert!(is_mutating("dev_server_start", &json!({})));
-        assert!(!is_mutating("web_preview_click", &json!({})));
+        assert!(!builtin_is_mutating("git", &json!({ "args": "status" })));
+        assert!(builtin_is_mutating("git", &json!({ "args": "commit -m x" })));
+        assert!(builtin_is_mutating("write_file", &json!({})));
+        assert!(!builtin_is_mutating("read_file", &json!({})));
+        assert!(builtin_is_mutating("dev_server_start", &json!({})));
+        assert!(!builtin_is_mutating("web_preview_click", &json!({})));
+    }
+
+    #[test]
+    fn mcp_tool_mutation_comes_from_snapshot_and_fails_closed() {
+        let cx = ctx(
+            ApprovalPolicy::ApproveWrites,
+            vec![mcp_tool("db", "read_query", false), mcp_tool("db", "write_query", true)],
+        );
+        // Classification is driven by the precomputed snapshot flag…
+        assert!(!is_mutating(&cx, "mcp__db__read_query", &json!({})));
+        assert!(is_mutating(&cx, "mcp__db__write_query", &json!({})));
+        // …and a tool not in the snapshot is treated as mutating (fail closed).
+        assert!(is_mutating(&cx, "mcp__db__unknown", &json!({})));
+    }
+
+    #[test]
+    fn mcp_calls_are_known_and_get_a_preview() {
+        assert!(is_known_tool("mcp__db__anything"));
+        let cx = ctx(
+            ApprovalPolicy::ApproveWrites,
+            // A read-only-hinted tool on an untrusted server: mutating=true.
+            vec![mcp_tool("db", "write_query", true), mcp_tool("db", "read_query", false)],
+        );
+        let preview = approval_preview(&cx, "mcp__db__write_query", &json!({ "sql": "delete" }));
+        let preview = preview.expect("mutating MCP call should require approval");
+        assert!(preview.contains("MCP db · write_query"));
+        assert!(preview.contains("sql"));
+        // A non-mutating (trusted read-only) MCP tool runs without a pause.
+        assert!(approval_preview(&cx, "mcp__db__read_query", &json!({})).is_none());
     }
 }

@@ -32,6 +32,10 @@ pub struct AgentConfig {
     /// the configured models directory, so cloud aliases and local IDs converge.
     #[serde(default)]
     pub model_load_settings: BTreeMap<String, ModelLoadSettings>,
+    /// Configured MCP servers, in user-meaningful order (order drives the tool
+    /// cap's truncation). Secret env values live in `mcp_secrets.json`.
+    #[serde(default)]
+    pub mcp_servers: Vec<crate::mcp::McpServerConfig>,
 }
 
 /// Serializes tests that mutate the process-global `LOCALLMOS_CONFIG_DIR` env
@@ -68,16 +72,60 @@ impl AgentConfig {
     }
 
     pub fn load() -> Self {
-        Self::path()
-            .and_then(|p| Ok(std::fs::read_to_string(p)?))
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
+        let path = match Self::path() {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!("cannot resolve config path: {e}; using defaults");
+                return Self::default();
+            }
+        };
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            // No file yet (first run) is the normal case — start from defaults.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Self::default(),
+            Err(e) => {
+                tracing::warn!("cannot read {}: {e}; using defaults", path.display());
+                return Self::default();
+            }
+        };
+        match serde_json::from_str(&raw) {
+            Ok(config) => config,
+            Err(e) => {
+                // A corrupt/hand-edited config would otherwise silently reset to
+                // defaults, discarding the rig's enrollment (rig_id +
+                // refresh_secret) with no trace. Preserve the file so it can be
+                // recovered, and log loudly rather than quietly un-enrolling.
+                let backup = path.with_extension("json.bak");
+                if let Err(be) = std::fs::rename(&path, &backup) {
+                    tracing::error!(
+                        "config.json is invalid ({e}) and could not be backed up ({be}); using defaults"
+                    );
+                } else {
+                    tracing::error!(
+                        "config.json is invalid ({e}); backed up to {} and using defaults",
+                        backup.display()
+                    );
+                }
+                Self::default()
+            }
+        }
     }
 
     pub fn save(&self) -> Result<()> {
         let path = Self::path()?;
-        std::fs::write(path, serde_json::to_string_pretty(self)?)?;
+        std::fs::write(&path, serde_json::to_string_pretty(self)?)?;
+        // The file holds `refresh_secret` (and, once configured, MCP server
+        // credentials). Restrict it to the owner on unix; Windows inherits the
+        // per-user config dir's ACL.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(e) =
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            {
+                tracing::warn!("could not restrict permissions on {}: {e}", path.display());
+            }
+        }
         Ok(())
     }
 }
@@ -91,6 +139,50 @@ mod tests {
         let config: AgentConfig = serde_json::from_str(r#"{"rig_name":"old rig"}"#).unwrap();
         assert_eq!(config.rig_name.as_deref(), Some("old rig"));
         assert!(config.model_load_settings.is_empty());
+    }
+
+    #[test]
+    fn invalid_config_is_backed_up_not_discarded_silently() {
+        let _guard = TEST_CONFIG_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("llmos-cfg-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("LOCALLMOS_CONFIG_DIR", &dir);
+
+        let path = dir.join("config.json");
+        std::fs::write(&path, "{ not valid json,,, }").unwrap();
+
+        // Load recovers to defaults rather than propagating the error…
+        let config = AgentConfig::load();
+        assert!(config.rig_id.is_none());
+        // …and the corrupt file is preserved for recovery, not deleted.
+        assert!(!path.exists(), "invalid config should have been moved aside");
+        assert!(path.with_extension("json.bak").exists(), "backup should exist");
+
+        std::env::remove_var("LOCALLMOS_CONFIG_DIR");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saved_config_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let _guard = TEST_CONFIG_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("llmos-cfg-perm-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("LOCALLMOS_CONFIG_DIR", &dir);
+
+        AgentConfig {
+            refresh_secret: Some("super-secret".into()),
+            ..Default::default()
+        }
+        .save()
+        .unwrap();
+
+        let mode = std::fs::metadata(dir.join("config.json")).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "config.json must not be group/world readable");
+
+        std::env::remove_var("LOCALLMOS_CONFIG_DIR");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

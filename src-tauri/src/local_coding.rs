@@ -78,11 +78,18 @@ pub async fn send(
         return Err("no model selected".to_string());
     }
 
+    // Lazily start the session's MCP servers (if it opted in) before freezing the
+    // snapshot, so both the preflight count and the turn see the same tools.
+    if session.mcp_enabled {
+        state.mcp.ensure_enabled_started().await;
+    }
+
     // The workspace must exist + resolve on this machine.
     let workspace = coding::Workspace::new(&session.workspace_root).map_err(|e| e.to_string())?;
     let cx = CodingContext {
         workspace,
         policy: coding::ApprovalPolicy::parse(&session.approval_policy),
+        mcp: mcp_access_for(&state, &session),
     };
 
     // Count the exact request shape before any tool activity. Auto-compaction
@@ -278,9 +285,13 @@ async fn build_context(
     cx: &CodingContext,
     session: &CodingSession,
 ) -> Result<BuiltContext, String> {
-    let tool_defs = coding::tool_defs_for(cx.policy, true);
     let native_tools = state.runtime.template_supports_tools(&session.model).await;
     let prompt_tool_mode = !native_tools;
+    // MCP tools are included only in native tool-calling mode. Prompt-injection
+    // mode re-serializes every full JSON Schema into the prompt each round, which
+    // is prohibitively expensive with third-party schemas on the small-context
+    // models that need that fallback.
+    let tool_defs = coding::tool_defs_for(cx, true, native_tools);
     let tool_names = tool_defs
         .iter()
         .filter_map(|d| d.pointer("/function/name").and_then(Value::as_str))
@@ -291,7 +302,7 @@ async fn build_context(
     let mut messages = Vec::with_capacity(session.messages.len() + 2);
     messages.push(json!({
         "role": "system",
-        "content": coding::system_prompt(&cx.workspace.root_str(), cx.policy),
+        "content": coding::system_prompt(&cx.workspace.root_str(), cx.policy, &cx.mcp),
     }));
     let mut start = 0usize;
     if let (Some(checkpoint), Some(boundary)) = (
@@ -350,11 +361,25 @@ fn context_info(session: &CodingSession, used: u32, max: u32, exact: bool) -> Co
     }
 }
 
+/// The MCP tool access for a session's turn: the manager's current snapshot,
+/// frozen. Both `send` (the run path) and `calculate_context` (the preflight
+/// count) go through here, so they see the same tools as long as the snapshot
+/// doesn't rebuild between them — which it only does on explicit config or
+/// lifecycle events, never mid-turn. This is a pure read; server startup is
+/// driven from `send` so a context poll never spawns a process.
+fn mcp_access_for(state: &Arc<AppState>, session: &CodingSession) -> coding::McpAccess {
+    if !session.mcp_enabled {
+        return coding::McpAccess::disabled();
+    }
+    coding::McpAccess::frozen(state.mcp.clone())
+}
+
 async fn calculate_context(state: &Arc<AppState>, session: &CodingSession) -> Result<CodingContextInfo, String> {
     let workspace = coding::Workspace::new(&session.workspace_root).map_err(|e| e.to_string())?;
     let cx = CodingContext {
         workspace,
         policy: coding::ApprovalPolicy::parse(&session.approval_policy),
+        mcp: mcp_access_for(state, session),
     };
     let built = build_context(state, &cx, session).await?;
     let (_, settings) = state.model_settings(&session.model).await.map_err(|e| e.to_string())?;

@@ -498,6 +498,9 @@ async fn persist_and_reconcile(
         config.save().map_err(|e| e.to_string())?;
     }
     state.mcp.set_configs(servers).await;
+    // Reflect the new server set to the cloud (best-effort, non-blocking).
+    let bg = Arc::clone(state);
+    tauri::async_runtime::spawn(async move { local_coding::sync_mcp_to_cloud(&bg).await });
     Ok(())
 }
 
@@ -619,12 +622,17 @@ async fn mcp_delete_server(
 #[tauri::command]
 async fn mcp_start_server(state: State<'_, Arc<AppState>>, id: String) -> Result<McpOverview, String> {
     state.mcp.start(&id).await.map_err(|e| e.to_string())?;
+    // A server's tools become known only after it starts — re-advertise.
+    let bg = state.inner().clone();
+    tauri::async_runtime::spawn(async move { local_coding::sync_mcp_to_cloud(&bg).await });
     Ok(build_overview(&state).await)
 }
 
 #[tauri::command]
 async fn mcp_stop_server(state: State<'_, Arc<AppState>>, id: String) -> Result<McpOverview, String> {
     state.mcp.stop(&id).await.map_err(|e| e.to_string())?;
+    let bg = state.inner().clone();
+    tauri::async_runtime::spawn(async move { local_coding::sync_mcp_to_cloud(&bg).await });
     Ok(build_overview(&state).await)
 }
 

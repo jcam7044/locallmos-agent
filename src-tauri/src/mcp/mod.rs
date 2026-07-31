@@ -265,6 +265,41 @@ impl McpManager {
         list
     }
 
+    /// Build the `{ servers: [...] }` payload for the `mcp-sync` edge function:
+    /// every configured server with its status and its currently-known enabled
+    /// tools (from the frozen snapshot, i.e. running servers). Tools are keyed by
+    /// their qualified name so they match what the model will call.
+    pub async fn advertise_payload(&self) -> Value {
+        let statuses = self.statuses().await;
+        let snapshot = self.snapshot();
+        let servers: Vec<Value> = statuses
+            .iter()
+            .map(|s| {
+                let tools: Vec<Value> = snapshot
+                    .tools
+                    .iter()
+                    .filter(|t| t.server_id == s.id)
+                    .map(|t| {
+                        serde_json::json!({
+                            "name": t.qualified,
+                            "description": t.description,
+                            "parameters": t.parameters,
+                            "mutating": t.mutating,
+                            "enabled": true,
+                        })
+                    })
+                    .collect();
+                serde_json::json!({
+                    "serverId": s.id,
+                    "label": s.label,
+                    "status": serde_json::to_value(s.status).unwrap_or(Value::Null),
+                    "tools": tools,
+                })
+            })
+            .collect();
+        serde_json::json!({ "servers": servers })
+    }
+
     pub async fn server_logs(&self, id: &str) -> Result<String> {
         let servers = self.servers.lock().await;
         let handle = servers.get(id).ok_or_else(|| anyhow!("no such server: {id}"))?;
@@ -364,17 +399,12 @@ impl McpManager {
         true
     }
 
-    /// Execute one tool by its qualified name. Resolves the owning server from
-    /// the current snapshot, so a call always targets a tool the model was shown.
+    /// Execute one tool by its qualified name. The owning server is resolved by
+    /// matching a configured server-id prefix (`mcp__<id>__`), so this works both
+    /// for a locally-offered tool and for a cloud-driven turn whose tools come
+    /// from the control-plane snapshot rather than the local one.
     pub async fn call_tool(&self, qualified: &str, args: &Value) -> Result<McpCallOutcome> {
-        let (server_id, tool_name) = {
-            let snap = self.snapshot();
-            let def = snap
-                .find(qualified)
-                .ok_or_else(|| anyhow!("{qualified} is not an available MCP tool"))?;
-            (def.server_id.clone(), def.tool_name.clone())
-        };
-
+        let (server_id, tool_name) = self.resolve_server(qualified).await?;
         let client = self.live_client(&server_id).await?;
         let params = protocol::tools_call_params(&tool_name, args);
         let value = client.request("tools/call", Some(params), CALL_TIMEOUT).await?;
@@ -386,6 +416,25 @@ impl McpManager {
             text: result.to_model_text(),
             is_error: result.is_error,
         })
+    }
+
+    /// Split a qualified name (`mcp__<server>__<tool>`) into (server_id, tool)
+    /// by matching a configured server's id prefix. Matching against the real
+    /// configured ids handles server slugs that themselves contain underscores.
+    async fn resolve_server(&self, qualified: &str) -> Result<(String, String)> {
+        let servers = self.servers.lock().await;
+        // Prefer the longest matching id so "a" never shadows "a_b".
+        let mut best: Option<(String, String)> = None;
+        for id in servers.keys() {
+            let prefix = format!("{MCP_PREFIX}{id}__");
+            if let Some(tool) = qualified.strip_prefix(&prefix) {
+                let better = best.as_ref().map(|(cur, _)| id.len() > cur.len()).unwrap_or(true);
+                if better {
+                    best = Some((id.clone(), tool.to_string()));
+                }
+            }
+        }
+        best.ok_or_else(|| anyhow!("{qualified} does not map to a configured MCP server"))
     }
 
     /// Fetch a running client for `server_id`, reconnecting if it died. Returns an
@@ -700,6 +749,20 @@ mod tests {
         let snap = m.snapshot();
         assert_eq!(snap.tools.len(), MAX_TOOLS_PER_SERVER);
         assert_eq!(snap.truncated, 3);
+    }
+
+    #[tokio::test]
+    async fn resolve_server_matches_longest_id_prefix() {
+        let m = McpManager::new("test");
+        m.set_configs(vec![cfg("a", McpTrust::Untrusted), cfg("a_b", McpTrust::Untrusted)]).await;
+        // "a_b" must win over "a" so the tool name isn't mangled into "b__do".
+        let (id, tool) = m.resolve_server("mcp__a_b__do").await.unwrap();
+        assert_eq!(id, "a_b");
+        assert_eq!(tool, "do");
+        let (id, tool) = m.resolve_server("mcp__a__thing").await.unwrap();
+        assert_eq!(id, "a");
+        assert_eq!(tool, "thing");
+        assert!(m.resolve_server("mcp__zzz__x").await.is_err());
     }
 
     #[tokio::test]

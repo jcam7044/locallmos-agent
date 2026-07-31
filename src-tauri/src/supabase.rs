@@ -754,6 +754,24 @@ impl Supabase {
         Ok(v)
     }
 
+    /// Advertise the rig's configured MCP servers (and their enabled tools) to the
+    /// cloud via the `mcp-sync` edge function, so a web-initiated coding turn can
+    /// offer those tools. `body` is `{ servers: [...] }`.
+    pub async fn mcp_sync(&self, token: &str, body: Value) -> Result<Value> {
+        let resp = self
+            .auth(self.http.post(format!("{}/mcp-sync", self.functions)), token)
+            .json(&body)
+            .send()
+            .await?;
+        let status = resp.status();
+        let v: Value = resp.json().await.unwrap_or_else(|_| json!({}));
+        if !status.is_success() {
+            let detail = v.get("error").and_then(Value::as_str).unwrap_or("mcp-sync failed");
+            return Err(anyhow!("mcp-sync: {detail}"));
+        }
+        Ok(v)
+    }
+
     /// Record a tool invocation. `awaiting` inserts it in `awaiting_approval`
     /// (paused for the approver); otherwise `running`. The row `id` is set to the
     /// agent-chosen `invocation_id` so every surface references the same id.
@@ -763,7 +781,9 @@ impl Supabase {
         token: &str,
         message_id: &str,
         invocation_id: &str,
-        tool_id: &str,
+        // None for MCP tools: they are per-rig and dynamic, not tool_catalog rows,
+        // so their invocation row carries a null catalog tool_id (0040).
+        tool_id: Option<&str>,
         provider: &str,
         arguments_hash: &str,
         preview: Option<&str>,

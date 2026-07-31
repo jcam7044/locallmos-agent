@@ -175,8 +175,11 @@ pub async fn process(state: &Arc<AppState>, pending: ChatPending) -> Result<()> 
             Ok(workspace) => {
                 local_session_id = meta.local_session_id.clone();
                 let policy = coding::ApprovalPolicy::parse(&meta.approval_policy);
-                // Freeze the MCP snapshot so cloud-driven coding turns can resolve
-                // and execute `mcp__…` tools too (they arrive via platform_tools).
+                // Cloud-driven coding turns get their MCP tools from the control
+                // plane's platform_tools. Start the rig's enabled servers so the
+                // local snapshot is populated (accurate gating + previews) and
+                // freeze it for the turn.
+                state.mcp.ensure_enabled_started().await;
                 let mcp = coding::McpAccess::frozen(state.mcp.clone());
                 messages.insert(
                     0,
@@ -745,12 +748,15 @@ async fn run_local_tool(
     };
     let invocation_id = Uuid::new_v4().to_string();
     let args_hash = sha256_hex(&call.arguments);
+    // MCP tools are not tool_catalog rows, so their invocation carries a null
+    // catalog tool_id (see supabase migration 0040).
+    let catalog_tool_id = (tool.provider != "mcp").then_some(tool.id.as_str());
 
     if let Some(preview) = coding::approval_preview(cx, &call.name, &call.arguments) {
         state
             .supabase
             .create_tool_invocation(
-                token, message_id, &invocation_id, &tool.id, &tool.provider, &args_hash,
+                token, message_id, &invocation_id, catalog_tool_id, &tool.provider, &args_hash,
                 Some(&preview), &call.name, true,
             )
             .await
@@ -782,7 +788,7 @@ async fn run_local_tool(
         state
             .supabase
             .create_tool_invocation(
-                token, message_id, &invocation_id, &tool.id, &tool.provider, &args_hash,
+                token, message_id, &invocation_id, catalog_tool_id, &tool.provider, &args_hash,
                 None, &call.name, false,
             )
             .await

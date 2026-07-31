@@ -308,6 +308,13 @@ fn mcp_approval_preview(cx: &CodingContext, name: &str, args: &Value) -> String 
         .snapshot
         .find(name)
         .map(|t| (t.server_id.clone(), t.tool_name.clone()))
+        // Fall back to parsing the qualified name (a cloud turn may name a tool
+        // the local snapshot hasn't discovered yet).
+        .or_else(|| {
+            name.strip_prefix(mcp::MCP_PREFIX)
+                .and_then(|rest| rest.split_once("__"))
+                .map(|(s, t)| (s.to_string(), t.to_string()))
+        })
         .unwrap_or_else(|| (String::from("?"), name.to_string()));
     let mut rendered = serde_json::to_string_pretty(args).unwrap_or_else(|_| args.to_string());
     const MAX: usize = 2_000;

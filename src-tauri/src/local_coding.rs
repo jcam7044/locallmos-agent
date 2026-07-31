@@ -228,6 +228,23 @@ pub async fn backfill_unsynced(state: Arc<AppState>) {
     }
 }
 
+/// Advertise the rig's MCP servers to the cloud via `mcp-sync` (no-op when not
+/// enrolled). Best-effort: a failure only means web-initiated turns won't see the
+/// tools until the next sync. Call after any server config/lifecycle change.
+pub async fn sync_mcp_to_cloud(state: &Arc<AppState>) {
+    if !state.config.lock().await.is_enrolled() {
+        return;
+    }
+    let token = match crate::worker::ensure_token(state).await {
+        Ok(t) => t,
+        Err(_) => return,
+    };
+    let body = state.mcp.advertise_payload().await;
+    if let Err(e) = state.supabase.mcp_sync(&token, body).await {
+        tracing::debug!("mcp-sync push failed: {e}");
+    }
+}
+
 /// Push the on-disk transcript to Supabase via `coding-sync` (no-op when not
 /// enrolled). Persists the returned remote ids on the session's first sync.
 pub async fn push_to_cloud(state: &Arc<AppState>, session: &coding_store::CodingSession) {

@@ -1313,12 +1313,18 @@ fn run_gui() {
             }
 
             // Register configured MCP servers with the manager (lazy-started on
-            // first turn that enables them; nothing is spawned here).
+            // first turn that enables them; nothing is spawned here), then
+            // advertise them to the cloud so the dashboard and web-initiated turns
+            // see them. Advertising on startup is what makes the mirror self-heal
+            // — the other sync triggers only fire on a config or lifecycle change,
+            // so without this a rig that was configured before the mcp-sync
+            // function existed would never appear on the web.
             {
                 let state = loop_state.clone();
                 tauri::async_runtime::spawn(async move {
                     let configs = state.config.lock().await.mcp_servers.clone();
                     state.mcp.set_configs(configs).await;
+                    local_coding::sync_mcp_to_cloud(&state).await;
                 });
             }
 

@@ -28,6 +28,7 @@ export function ToolsView() {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [installing, setInstalling] = useState<McpCatalogEntry | null>(null);
+  const [details, setDetails] = useState<McpCatalogEntry | null>(null);
   const [logs, setLogs] = useState<{ id: string; text: string } | null>(null);
 
   const load = useCallback(async () => {
@@ -161,8 +162,28 @@ export function ToolsView() {
           {catalog.map((entry) => {
             const runtimeMissing =
               (entry.runtime === "npx" && !runtimes.node) || (entry.runtime === "uvx" && !runtimes.uv);
+            const installed = installedIds.has(entry.id);
             return (
-              <div key={entry.id} style={{ ...card, display: "flex", flexDirection: "column", gap: 6 }}>
+              <div
+                key={entry.id}
+                role="button"
+                tabIndex={0}
+                aria-label={`View details for ${entry.label}`}
+                onClick={() => setDetails(entry)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" || event.key === " ") {
+                    event.preventDefault();
+                    setDetails(entry);
+                  }
+                }}
+                style={{
+                  ...card,
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: 6,
+                  cursor: "pointer",
+                }}
+              >
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
                   <span style={{ fontWeight: 600, fontSize: 13 }}>{entry.label}</span>
                   <span style={{ ...label, fontFamily: "monospace" }}>{entry.runtime}</span>
@@ -171,13 +192,17 @@ export function ToolsView() {
                 {entry.caveat && (
                   <p style={{ fontSize: 11, color: "#fbbf24", lineHeight: 1.4 }}>⚠ {entry.caveat}</p>
                 )}
-                <button
-                  style={{ ...secondaryButton, marginTop: "auto", opacity: runtimeMissing ? 0.5 : 1 }}
-                  disabled={runtimeMissing || installedIds.has(entry.id)}
-                  onClick={() => setInstalling(entry)}
+                <div
+                  aria-hidden="true"
+                  style={{
+                    ...secondaryButton,
+                    marginTop: "auto",
+                    textAlign: "center",
+                    boxSizing: "border-box",
+                  }}
                 >
-                  {installedIds.has(entry.id) ? "Installed" : "Install…"}
-                </button>
+                  {installed ? "Installed · view details" : runtimeMissing ? "View requirements" : "View details"}
+                </div>
               </div>
             );
           })}
@@ -199,8 +224,130 @@ export function ToolsView() {
         />
       )}
 
+      {details && (
+        <CatalogDetailsDialog
+          entry={details}
+          installed={installedIds.has(details.id)}
+          runtimeAvailable={
+            (details.runtime === "npx" && runtimes.node) || (details.runtime === "uvx" && runtimes.uv)
+          }
+          onClose={() => setDetails(null)}
+          onInstall={() => {
+            setDetails(null);
+            setInstalling(details);
+          }}
+        />
+      )}
+
       {logs && <LogsDialog id={logs.id} text={logs.text} onClose={() => setLogs(null)} />}
     </div>
+  );
+}
+
+export function CatalogDetailsDialog({
+  entry,
+  installed,
+  runtimeAvailable,
+  onClose,
+  onInstall,
+}: {
+  entry: McpCatalogEntry;
+  installed: boolean;
+  runtimeAvailable: boolean;
+  onClose: () => void;
+  onInstall: () => void;
+}) {
+  return (
+    <Modal onClose={onClose} ariaLabel={`${entry.label} details`}>
+      <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 16 }}>
+        <div>
+          <h3 style={{ margin: 0 }}>{entry.label}</h3>
+          <div style={{ ...label, marginTop: 4 }}>
+            MCP server · connects with <span style={{ fontFamily: "monospace" }}>{entry.runtime}</span>
+          </div>
+        </div>
+        {installed && (
+          <span
+            style={{
+              border: "1px solid #166534",
+              borderRadius: 999,
+              color: "#34d399",
+              fontSize: 11,
+              padding: "3px 8px",
+              whiteSpace: "nowrap",
+            }}
+          >
+            Installed
+          </span>
+        )}
+      </div>
+
+      <p style={{ color: "#cbd5e1", fontSize: 13, lineHeight: 1.55, margin: "16px 0 0" }}>
+        {entry.details}
+      </p>
+
+      <section style={{ marginTop: 18 }}>
+        <h4 style={{ margin: "0 0 6px", fontSize: 13 }}>Typical connection</h4>
+        <p style={{ ...label, lineHeight: 1.55, margin: 0 }}>{entry.connection}</p>
+      </section>
+
+      <section style={{ marginTop: 18 }}>
+        <h4 style={{ margin: "0 0 8px", fontSize: 13 }}>Tools it provides</h4>
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          {entry.tools.map((tool) => (
+            <div
+              key={tool.name}
+              style={{
+                border: "1px solid #1f2937",
+                background: "#0b0f17",
+                borderRadius: 8,
+                padding: "8px 10px",
+              }}
+            >
+              <div style={{ fontFamily: "monospace", fontSize: 12, color: "#e2e8f0" }}>{tool.name}</div>
+              <div style={{ ...label, lineHeight: 1.4, marginTop: 3 }}>{tool.description}</div>
+            </div>
+          ))}
+        </div>
+        <p style={{ ...label, fontSize: 11, lineHeight: 1.4, margin: "8px 0 0" }}>
+          The connected server reports the authoritative tool list; it may change with the pinned server version.
+        </p>
+      </section>
+
+      {entry.caveat && (
+        <p
+          style={{
+            border: "1px solid #78350f",
+            background: "#1c1408",
+            borderRadius: 8,
+            color: "#fbbf24",
+            fontSize: 12,
+            lineHeight: 1.45,
+            padding: 10,
+            margin: "16px 0 0",
+          }}
+        >
+          ⚠ {entry.caveat}
+        </p>
+      )}
+
+      {!runtimeAvailable && (
+        <p style={{ color: "#fbbf24", fontSize: 12, margin: "12px 0 0" }}>
+          Install {entry.runtime === "npx" ? "Node.js (npx)" : "uv (uvx)"} before adding this server.
+        </p>
+      )}
+
+      <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 18 }}>
+        <button style={secondaryButton} onClick={onClose}>
+          Close
+        </button>
+        {!installed && (
+          <button style={buttonStyle} disabled={!runtimeAvailable} onClick={onInstall}>
+            Install…
+          </button>
+        )}
+      </div>
+    </Modal>
   );
 }
 
@@ -419,7 +566,7 @@ function InstallDialog({
   };
 
   return (
-    <Modal onClose={onClose}>
+    <Modal onClose={onClose} ariaLabel={`Install ${entry.label}`}>
       <h3 style={{ margin: "0 0 4px" }}>Install {entry.label}</h3>
       <p style={{ ...label, lineHeight: 1.4 }}>{entry.description}</p>
       {entry.caveat && <p style={{ fontSize: 12, color: "#fbbf24", lineHeight: 1.4 }}>⚠ {entry.caveat}</p>}
@@ -486,7 +633,7 @@ function InstallDialog({
 
 function LogsDialog({ id, text, onClose }: { id: string; text: string; onClose: () => void }) {
   return (
-    <Modal onClose={onClose}>
+    <Modal onClose={onClose} ariaLabel={`Logs for ${id}`}>
       <h3 style={{ margin: "0 0 8px" }}>Logs — {id}</h3>
       <pre
         style={{
@@ -511,7 +658,23 @@ function LogsDialog({ id, text, onClose }: { id: string; text: string; onClose: 
   );
 }
 
-function Modal({ children, onClose }: { children: React.ReactNode; onClose: () => void }) {
+function Modal({
+  children,
+  onClose,
+  ariaLabel,
+}: {
+  children: React.ReactNode;
+  onClose: () => void;
+  ariaLabel: string;
+}) {
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [onClose]);
+
   return (
     <div
       onClick={onClose}
@@ -527,6 +690,9 @@ function Modal({ children, onClose }: { children: React.ReactNode; onClose: () =
       }}
     >
       <div
+        role="dialog"
+        aria-modal="true"
+        aria-label={ariaLabel}
         onClick={(e) => e.stopPropagation()}
         style={{
           ...card,

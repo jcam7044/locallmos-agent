@@ -278,6 +278,9 @@ export type McpCatalogEntry = {
   id: string;
   label: string;
   description: string;
+  details: string;
+  connection: string;
+  tools: { name: string; description: string }[];
   runtime: "npx" | "uvx";
   inputs: McpInputSpec[];
   defaultTrust: McpTrust;

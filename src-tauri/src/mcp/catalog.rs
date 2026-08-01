@@ -42,6 +42,9 @@ pub struct CatalogEntry {
     pub id: &'static str,
     pub label: &'static str,
     pub description: &'static str,
+    pub details: &'static str,
+    pub connection: &'static str,
+    pub tools: &'static [CatalogTool],
     pub runtime: RuntimeKind,
     /// Full argument list after the launcher, with `{key}` placeholders.
     #[serde(skip)]
@@ -49,6 +52,16 @@ pub struct CatalogEntry {
     pub inputs: &'static [InputSpec],
     pub default_trust: McpTrust,
     pub caveat: Option<&'static str>,
+}
+
+/// A representative tool advertised by a catalog server. Keeping this metadata
+/// in the catalog lets people understand a server before downloading it. The
+/// live tool list remains authoritative after a server connects.
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogTool {
+    pub name: &'static str,
+    pub description: &'static str,
 }
 
 impl CatalogEntry {
@@ -163,6 +176,12 @@ pub const CATALOG: &[CatalogEntry] = &[
         id: "context7",
         label: "Context7 (library docs)",
         description: "Up-to-date documentation and code examples for thousands of libraries — counters stale training data.",
+        details: "Context7 looks up version-aware documentation and examples for public software libraries. It is useful when an agent needs current API guidance that may be newer than the model's training data.",
+        connection: "Runs locally through npx and connects to Context7's hosted documentation index. No account or API key is typically required.",
+        tools: &[
+            CatalogTool { name: "resolve-library-id", description: "Find the Context7 identifier for a library or package." },
+            CatalogTool { name: "get-library-docs", description: "Retrieve current documentation and examples for a resolved library." },
+        ],
         runtime: RuntimeKind::Npx,
         args: &["-y", "@upstash/context7-mcp@3.2.5"],
         inputs: &[],
@@ -173,6 +192,18 @@ pub const CATALOG: &[CatalogEntry] = &[
         id: "github",
         label: "GitHub",
         description: "Issues, pull requests, and cross-repository code search beyond the local workspace.",
+        details: "GitHub gives the agent repository-level context and collaboration actions that are not available from the local checkout, including issues, pull requests, branches, commits, and remote code search.",
+        connection: "Runs locally through npx and calls the GitHub API using a personal access token. A fine-grained token scoped only to the repositories and operations you need is typical.",
+        tools: &[
+            CatalogTool { name: "search_repositories", description: "Find repositories that match a GitHub search query." },
+            CatalogTool { name: "search_code", description: "Search code across repositories accessible to the token." },
+            CatalogTool { name: "get_file_contents", description: "Read a file or directory from a repository." },
+            CatalogTool { name: "list_issues", description: "List and filter issues in a repository." },
+            CatalogTool { name: "create_issue", description: "Create a new issue in a repository." },
+            CatalogTool { name: "create_pull_request", description: "Open a pull request from an existing branch." },
+            CatalogTool { name: "get_pull_request", description: "Read pull-request details, files, status, and comments." },
+            CatalogTool { name: "push_files", description: "Commit and push one or more file changes." },
+        ],
         runtime: RuntimeKind::Npx,
         args: &["-y", "@modelcontextprotocol/server-github@2025.4.8"],
         inputs: &[InputSpec {
@@ -189,6 +220,16 @@ pub const CATALOG: &[CatalogEntry] = &[
         id: "sqlite",
         label: "SQLite",
         description: "Inspect schema and run read queries against a local SQLite database file.",
+        details: "SQLite exposes a selected database file for schema discovery, SQL queries, and lightweight analysis. It is well suited to inspecting application data without first configuring a database service.",
+        connection: "Runs locally through uvx and opens the database file path supplied during installation. The server process needs operating-system access to that file.",
+        tools: &[
+            CatalogTool { name: "list_tables", description: "List tables in the connected database." },
+            CatalogTool { name: "describe_table", description: "Inspect a table's columns and schema." },
+            CatalogTool { name: "read_query", description: "Run a read-only SQL query." },
+            CatalogTool { name: "write_query", description: "Run an INSERT, UPDATE, or DELETE statement." },
+            CatalogTool { name: "create_table", description: "Create a table with a SQL statement." },
+            CatalogTool { name: "append_insight", description: "Record an analysis insight in the database." },
+        ],
         runtime: RuntimeKind::Uvx,
         args: &["mcp-server-sqlite@2025.4.25", "--db-path", "{db_path}"],
         inputs: &[InputSpec {
@@ -205,6 +246,11 @@ pub const CATALOG: &[CatalogEntry] = &[
         id: "postgres",
         label: "Postgres",
         description: "Schema introspection and read-only SQL against a Postgres database.",
+        details: "Postgres lets the agent inspect database schemas and query live relational data. This catalog server intentionally exposes a narrow, read-only interface for investigation and analysis.",
+        connection: "Runs locally through npx and connects directly to PostgreSQL using the connection string supplied during installation. A dedicated read-only database user is recommended.",
+        tools: &[
+            CatalogTool { name: "query", description: "Run a read-only SQL query and return its result rows." },
+        ],
         runtime: RuntimeKind::Npx,
         args: &["-y", "@modelcontextprotocol/server-postgres@0.6.2", "{connection}"],
         inputs: &[InputSpec {
@@ -221,6 +267,16 @@ pub const CATALOG: &[CatalogEntry] = &[
         id: "playwright",
         label: "Playwright (browser)",
         description: "Real cross-browser automation and genuine screenshots — beyond the built-in loopback preview.",
+        details: "Playwright gives the agent an interactive browser for navigating pages, inspecting content, filling forms, clicking controls, and capturing screenshots. It can test sites outside the local preview.",
+        connection: "Runs a local Playwright MCP process through npx. It launches or attaches to a browser on this machine and connects from that browser to the sites you ask it to visit.",
+        tools: &[
+            CatalogTool { name: "playwright_navigate", description: "Open a URL in the automated browser." },
+            CatalogTool { name: "playwright_screenshot", description: "Capture a page or element screenshot." },
+            CatalogTool { name: "playwright_click", description: "Click an element on the current page." },
+            CatalogTool { name: "playwright_fill", description: "Enter a value into a form field." },
+            CatalogTool { name: "playwright_evaluate", description: "Evaluate JavaScript in the page." },
+            CatalogTool { name: "playwright_get_visible_text", description: "Read the visible text from the page." },
+        ],
         runtime: RuntimeKind::Npx,
         args: &["-y", "@executeautomation/playwright-mcp-server@1.0.12"],
         inputs: &[],
@@ -231,6 +287,17 @@ pub const CATALOG: &[CatalogEntry] = &[
         id: "memory",
         label: "Memory (knowledge graph)",
         description: "Persistent facts and relationships that survive across sessions.",
+        details: "Memory maintains a small local knowledge graph of entities, observations, and relationships. It helps the agent retain durable project or user context between otherwise independent conversations.",
+        connection: "Runs locally through npx and stores its knowledge graph in a local data file. It does not normally require a remote account or API credential.",
+        tools: &[
+            CatalogTool { name: "create_entities", description: "Add entities and initial observations to the graph." },
+            CatalogTool { name: "create_relations", description: "Create directed relationships between entities." },
+            CatalogTool { name: "add_observations", description: "Attach new facts to existing entities." },
+            CatalogTool { name: "search_nodes", description: "Search entities and observations." },
+            CatalogTool { name: "open_nodes", description: "Retrieve specific entities and their relations." },
+            CatalogTool { name: "read_graph", description: "Read the complete knowledge graph." },
+            CatalogTool { name: "delete_entities", description: "Remove entities and their connected relations." },
+        ],
         runtime: RuntimeKind::Npx,
         args: &["-y", "@modelcontextprotocol/server-memory@2026.7.4"],
         inputs: &[],
@@ -241,6 +308,11 @@ pub const CATALOG: &[CatalogEntry] = &[
         id: "fetch",
         label: "Fetch (web pages)",
         description: "Fetch a URL and return clean Markdown — more robust extraction than the built-in web_fetch.",
+        details: "Fetch downloads a web page and converts its main content into model-friendly Markdown. It is useful for reading documentation, articles, and pages whose raw HTML would waste context.",
+        connection: "Runs locally through uvx and makes outbound HTTP or HTTPS requests directly from this machine. It normally needs no account or API key.",
+        tools: &[
+            CatalogTool { name: "fetch", description: "Retrieve a URL and return its content as Markdown or raw text." },
+        ],
         runtime: RuntimeKind::Uvx,
         args: &["mcp-server-fetch@2026.7.10"],
         inputs: &[],
@@ -251,6 +323,18 @@ pub const CATALOG: &[CatalogEntry] = &[
         id: "filesystem",
         label: "Filesystem (outside workspace)",
         description: "Read and write files under a directory you choose — reaches beyond the coding workspace root.",
+        details: "Filesystem extends the agent's file operations to one explicitly selected directory outside the current coding workspace. It can browse, search, read, edit, move, and create files within that boundary.",
+        connection: "Runs locally through npx and receives an allowed root directory during installation. Access is limited by that configured root and the operating-system permissions of this app.",
+        tools: &[
+            CatalogTool { name: "list_directory", description: "List files and directories under an allowed path." },
+            CatalogTool { name: "directory_tree", description: "Return a recursive tree of a directory." },
+            CatalogTool { name: "read_text_file", description: "Read all or part of a text file." },
+            CatalogTool { name: "search_files", description: "Search for files matching a pattern." },
+            CatalogTool { name: "write_file", description: "Create or overwrite a file." },
+            CatalogTool { name: "edit_file", description: "Apply text edits to an existing file." },
+            CatalogTool { name: "move_file", description: "Move or rename a file or directory." },
+            CatalogTool { name: "create_directory", description: "Create a directory, including missing parents." },
+        ],
         runtime: RuntimeKind::Npx,
         args: &["-y", "@modelcontextprotocol/server-filesystem@2026.7.10", "{root}"],
         inputs: &[InputSpec {
@@ -275,6 +359,14 @@ mod tests {
         for e in CATALOG {
             assert!(seen.insert(e.id), "duplicate catalog id: {}", e.id);
             assert!(super::super::config::is_valid_slug(e.id), "bad slug: {}", e.id);
+            assert!(!e.details.is_empty(), "entry {} has no detailed description", e.id);
+            assert!(!e.connection.is_empty(), "entry {} has no connection guidance", e.id);
+            assert!(!e.tools.is_empty(), "entry {} has no documented tools", e.id);
+            assert!(
+                e.tools.iter().all(|tool| !tool.name.is_empty() && !tool.description.is_empty()),
+                "entry {} has incomplete tool metadata",
+                e.id
+            );
             // A pinned version means an `@x.y` somewhere in the args (uvx or npx).
             let has_pin = e.args.iter().any(|a| a.contains('@') && a.chars().any(|c| c.is_ascii_digit()));
             assert!(has_pin, "entry {} is not version-pinned: {:?}", e.id, e.args);

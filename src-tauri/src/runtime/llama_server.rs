@@ -78,9 +78,10 @@ pub struct LlamaServerAdapter {
     backend: Option<String>,
     /// Extra `llama-server` args (whitespace-split from `LOCALLMOS_LLAMACPP_ARGS`).
     extra_args: Vec<String>,
-    /// Whether this rig's model reasons; toggles Qwen-style `enable_thinking` and
-    /// the reported "thinking" capability.
-    thinking: bool,
+    /// Explicit opt-in for thinking on models that cannot be recognized from
+    /// their identifier. Known reasoning-capable families are detected per
+    /// model below.
+    thinking_override: bool,
     startup_timeout: u64,
     proc: Mutex<Option<ChildProc>>,
     /// Cached auto device selection: `None` = not yet probed; `Some(None)` = probed,
@@ -129,7 +130,7 @@ impl LlamaServerAdapter {
             backend,
             bin,
             extra_args,
-            thinking: !std::env::var("LOCALLMOS_LLAMACPP_THINKING")
+            thinking_override: !std::env::var("LOCALLMOS_LLAMACPP_THINKING")
                 .unwrap_or_default()
                 .is_empty(),
             startup_timeout: std::env::var("LOCALLMOS_LLAMACPP_STARTUP_SECS")
@@ -250,8 +251,8 @@ impl LlamaServerAdapter {
     pub async fn template_supports_tools(&self, _model: &str) -> bool {
         true
     }
-    pub async fn model_supports_thinking(&self, _model: &str) -> bool {
-        self.thinking
+    pub async fn model_supports_thinking(&self, model: &str) -> bool {
+        self.thinking_override || model_supports_thinking(model)
     }
 
     pub async fn is_model_loaded(&self, model: &str) -> bool {
@@ -432,15 +433,18 @@ impl LlamaServerAdapter {
 
     async fn list_models(&self, current: Option<&str>) -> Vec<ModelInfo> {
         let reported = self.server_models().await;
-        let mut caps = vec!["tools".to_string()];
-        if self.thinking {
-            caps.push("thinking".to_string());
-        }
+        let caps = vec!["tools".to_string()];
         let mut models = Vec::new();
         let root = Path::new(&self.models_dir);
         for m in grouped_ggufs(&self.models_dir) {
             let mtp = self.has_embedded_mtp(&root.join(&m.id)).await;
             let mut model_caps = caps.clone();
+            if self.thinking_override
+                || model_supports_thinking(&m.id)
+                || model_supports_thinking(&m.display_name)
+            {
+                model_caps.push("thinking".into());
+            }
             if mtp {
                 model_caps.push("mtp".into());
             }
@@ -593,6 +597,14 @@ fn chat_request_body(
         body["tool_choice"] = json!("auto");
     }
     body
+}
+
+/// Qwen3 and later Qwen3-family templates accept `enable_thinking` and emit
+/// their reasoning separately. The model ID is stable across GGUF filenames,
+/// directory names, and the display names surfaced by the UI, so it is a
+/// reliable capability hint when llama-server does not expose model metadata.
+fn model_supports_thinking(model: &str) -> bool {
+    model.to_ascii_lowercase().contains("qwen3")
 }
 
 impl RuntimeAdapter for LlamaServerAdapter {
@@ -1650,6 +1662,13 @@ mod tests {
         fs::write(&path, bytes).unwrap();
         assert!(gguf_has_embedded_mtp(&path).unwrap());
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn detects_qwen3_family_thinking_from_model_id() {
+        assert!(model_supports_thinking("Qwen3.6-27B-Q4_K_M.gguf"));
+        assert!(model_supports_thinking("models/Qwen3-8B-Instruct"));
+        assert!(!model_supports_thinking("Llama-3.3-70B-Instruct-Q4_K_M.gguf"));
     }
 
     #[test]

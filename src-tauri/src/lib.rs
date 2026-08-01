@@ -339,7 +339,7 @@ async fn unload_model(state: State<'_, Arc<AppState>>, model: String) -> Result<
     Ok(())
 }
 
-/// Delete a completed Hub download. Loaded models must be ejected first.
+/// Delete a locally discovered model. Loaded models must be ejected first.
 #[tauri::command]
 async fn delete_local_model(state: State<'_, Arc<AppState>>, model_id: String) -> Result<(), String> {
     if state.runtime.snapshot().await.models.iter().any(|model| model.id == model_id && model.loaded) {
@@ -353,7 +353,7 @@ async fn delete_local_model(state: State<'_, Arc<AppState>>, model_id: String) -
             .await
             .map_err(|error| error.to_string())?;
     } else {
-        runtime::llama_server::delete_hub_model(&runtime::llamacpp_models_dir(), &model_id)
+        runtime::llama_server::delete_local_model(&runtime::llamacpp_models_dir(), &model_id)
             .map_err(|error| error.to_string())?;
     }
     let mut config = state.config.lock().await;

@@ -3,6 +3,8 @@ import { buttonStyle, inputStyle, secondaryButton } from "../styles";
 import { AttachmentChip } from "./AttachmentChip";
 import { FILE_ACCEPT } from "./attachments";
 import type { Attachment } from "../types";
+import type { ChatContextInfo } from "../types";
+import { ContextRing, formatTokens } from "../components/ContextIndicator";
 
 export function Composer({
   disabled,
@@ -22,6 +24,7 @@ export function Composer({
   attachments,
   onAddFiles,
   onRemoveAttachment,
+  contextInfo,
 }: {
   disabled: boolean;
   streaming: boolean;
@@ -40,8 +43,10 @@ export function Composer({
   attachments: Attachment[];
   onAddFiles: (files: FileList) => void;
   onRemoveAttachment: (index: number) => void;
+  contextInfo: ChatContextInfo | null;
 }) {
   const [input, setInput] = useState("");
+  const [contextOpen, setContextOpen] = useState(false);
   const fileInput = useRef<HTMLInputElement>(null);
 
   const send = () => {
@@ -87,6 +92,71 @@ export function Composer({
             🔌 MCP
           </TogglePill>
         )}
+        <div style={{ flex: 1 }} />
+        <div style={{ position: "relative" }}>
+          <button
+            onClick={() => setContextOpen((open) => !open)}
+            disabled={!contextInfo}
+            aria-label={contextInfo ? `Context ${contextInfo.percent}% filled` : "Loading context usage"}
+            title={
+              contextInfo
+                ? `${contextInfo.percent}% filled (${formatTokens(contextInfo.usedTokens)} of ${formatTokens(contextInfo.maxTokens)})`
+                : "Loading context usage"
+            }
+            style={{
+              width: 28,
+              height: 28,
+              padding: 0,
+              border: "none",
+              borderRadius: 7,
+              background: "transparent",
+              cursor: contextInfo ? "pointer" : "default",
+            }}
+          >
+            {contextInfo ? <ContextRing percent={contextInfo.percent} level={contextInfo.level} /> : "…"}
+          </button>
+          {contextOpen && contextInfo && (
+            <div
+              style={{
+                position: "absolute",
+                right: 0,
+                bottom: "calc(100% + 6px)",
+                width: 270,
+                padding: 10,
+                border: "1px solid #1f2937",
+                borderRadius: 10,
+                background: "#0b1220",
+                boxShadow: "0 12px 32px rgba(0,0,0,0.45)",
+                zIndex: 20,
+                color: "#cbd5e1",
+                fontSize: 12,
+              }}
+            >
+              <div style={{ fontWeight: 600, color: "#e2e8f0" }}>Context window</div>
+              <div style={{ marginTop: 6 }}>
+                {formatTokens(contextInfo.usedTokens)} / {formatTokens(contextInfo.maxTokens)} ·{" "}
+                {contextInfo.countExact ? "exact" : "estimated"}
+              </div>
+              <div style={{ marginTop: 4, color: "#64748b" }}>
+                {formatTokens(contextInfo.reserveTokens)} reserved for generation and tool results
+              </div>
+              {contextInfo.mcpTools > 0 && (
+                <div style={{ marginTop: 8, paddingTop: 8, borderTop: "1px solid #1f2937" }}>
+                  MCP definitions: {contextInfo.mcpTools} tools · approximately{" "}
+                  {formatTokens(contextInfo.mcpSchemaTokens)} tokens ({Math.max(
+                    0,
+                    Math.round((contextInfo.mcpSchemaTokens / contextInfo.maxTokens) * 100),
+                  )}% of context)
+                </div>
+              )}
+              {mcp && contextInfo.mcpTools === 0 && (
+                <div style={{ marginTop: 8, paddingTop: 8, borderTop: "1px solid #1f2937" }}>
+                  No trusted read-only MCP tools are currently available in Chat.
+                </div>
+              )}
+            </div>
+          )}
+        </div>
       </div>
       <div style={{ display: "flex", gap: 8, alignItems: "flex-end" }}>
         <input

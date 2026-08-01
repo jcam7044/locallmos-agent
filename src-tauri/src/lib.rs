@@ -146,7 +146,11 @@ fn build_state() -> Arc<AppState> {
     ));
 
     let preview = coding::preview::PreviewManager::new(http.clone());
-    let mcp = mcp::McpManager::new(env!("CARGO_PKG_VERSION"));
+    let initial_mcp_limit = cfg
+        .mcp_tool_limit
+        .map(usize::from)
+        .unwrap_or(mcp::DEFAULT_MCP_TOOL_LIMIT);
+    let mcp = mcp::McpManager::new_with_tool_limit(env!("CARGO_PKG_VERSION"), initial_mcp_limit);
     Arc::new(AppState {
         settings,
         supabase,
@@ -404,7 +408,9 @@ struct McpToolView {
     qualified: String,
     description: String,
     enabled: bool,
+    available: bool,
     mutating: bool,
+    schema_tokens: u32,
 }
 
 /// A catalog entry plus the exact base command (with `{placeholder}` tokens
@@ -424,6 +430,10 @@ struct CatalogEntryView {
 struct McpOverview {
     servers: Vec<McpServerView>,
     truncated: usize,
+    tool_limit: usize,
+    available_tools: usize,
+    active_schema_tokens: u32,
+    available_schema_tokens: u32,
     runtimes: mcp::catalog::RuntimeAvailability,
     catalog: Vec<CatalogEntryView>,
 }
@@ -432,6 +442,27 @@ async fn build_overview(state: &Arc<AppState>) -> McpOverview {
     let configs = state.config.lock().await.mcp_servers.clone();
     let statuses = state.mcp.statuses().await;
     let snapshot = state.mcp.snapshot();
+    let inventory = state.mcp.inventory().await;
+    let enabled_inventory: Vec<&mcp::McpToolDef> = inventory
+        .iter()
+        .filter(|tool| {
+            configs
+                .iter()
+                .find(|server| server.id == tool.server_id)
+                .map(|server| server.is_tool_enabled(&tool.tool_name))
+                .unwrap_or(false)
+        })
+        .collect();
+    let available_tools = enabled_inventory.len();
+    let available_schema_tokens = enabled_inventory
+        .iter()
+        .map(|tool| mcp::estimated_schema_tokens(tool))
+        .sum();
+    let active_schema_tokens = snapshot
+        .tools
+        .iter()
+        .map(mcp::estimated_schema_tokens)
+        .sum();
 
     let servers = configs
         .into_iter()
@@ -449,8 +480,7 @@ async fn build_overview(state: &Arc<AppState>) -> McpOverview {
                     tool_count: 0,
                     last_error: None,
                 });
-            let tools = snapshot
-                .tools
+            let tools = inventory
                 .iter()
                 .filter(|t| t.server_id == c.id)
                 .map(|t| McpToolView {
@@ -458,7 +488,9 @@ async fn build_overview(state: &Arc<AppState>) -> McpOverview {
                     qualified: t.qualified.clone(),
                     description: t.description.clone(),
                     enabled: c.is_tool_enabled(&t.tool_name),
+                    available: snapshot.find(&t.qualified).is_some(),
                     mutating: t.mutating,
+                    schema_tokens: mcp::estimated_schema_tokens(t),
                 })
                 .collect();
             McpServerView {
@@ -481,6 +513,10 @@ async fn build_overview(state: &Arc<AppState>) -> McpOverview {
     McpOverview {
         servers,
         truncated: snapshot.truncated,
+        tool_limit: state.mcp.tool_limit(),
+        available_tools,
+        active_schema_tokens,
+        available_schema_tokens,
         runtimes: mcp::catalog::detect_runtimes(),
         catalog,
     }
@@ -506,6 +542,25 @@ async fn persist_and_reconcile(
 
 #[tauri::command]
 async fn mcp_overview(state: State<'_, Arc<AppState>>) -> Result<McpOverview, String> {
+    Ok(build_overview(&state).await)
+}
+
+#[tauri::command]
+async fn mcp_set_tool_limit(
+    state: State<'_, Arc<AppState>>,
+    limit: u16,
+) -> Result<McpOverview, String> {
+    if !(1..=mcp::MAX_MCP_TOOL_LIMIT as u16).contains(&limit) {
+        return Err(format!("MCP tool limit must be between 1 and {}", mcp::MAX_MCP_TOOL_LIMIT));
+    }
+    {
+        let mut config = state.config.lock().await;
+        config.mcp_tool_limit = Some(limit);
+        config.save().map_err(|error| error.to_string())?;
+    }
+    state.mcp.set_tool_limit(usize::from(limit)).await;
+    let background = state.inner().clone();
+    tauri::async_runtime::spawn(async move { local_coding::sync_mcp_to_cloud(&background).await });
     Ok(build_overview(&state).await)
 }
 
@@ -767,6 +822,14 @@ async fn local_chat_cancel(
         flag.store(true, std::sync::atomic::Ordering::Relaxed);
     }
     Ok(())
+}
+
+#[tauri::command]
+async fn chat_context(
+    state: State<'_, Arc<AppState>>,
+    session_id: String,
+) -> Result<local_chat::ChatContextInfo, String> {
+    local_chat::context_info(state.inner(), &session_id).await
 }
 
 // --- Persistent chat sessions (local, on-disk) ------------------------------
@@ -1390,6 +1453,7 @@ fn run_gui() {
             get_model_load_settings,
             save_model_load_settings,
             mcp_overview,
+            mcp_set_tool_limit,
             mcp_add_server,
             mcp_install_catalog_entry,
             mcp_update_server,
@@ -1412,6 +1476,7 @@ fn run_gui() {
             hub_cancel_download,
             local_chat_send,
             local_chat_cancel,
+            chat_context,
             local_update,
             chat_list_sessions,
             chat_create_session,

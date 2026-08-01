@@ -28,6 +28,7 @@ use anyhow::{anyhow, Result};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
@@ -41,12 +42,12 @@ use stdio::StdioClient;
 /// dispatch and gating discriminator throughout the tool loops.
 pub const MCP_PREFIX: &str = "mcp__";
 
-/// Per-server and total tool caps. A single real server (GitHub ships ~35 tools)
-/// can add thousands of tokens of JSON Schema to every request; on a small local
-/// context that is fatal. Excess tools are dropped deterministically and the
-/// count surfaced to the user rather than silently swallowed.
-pub const MAX_TOOLS_PER_SERVER: usize = 24;
-pub const MAX_TOTAL_MCP_TOOLS: usize = 48;
+/// The user-facing default is deliberately conservative, but can be raised for
+/// large-context models. The hard ceilings are denial-of-service protection for
+/// malformed servers and are not presented as normal product limits.
+pub const DEFAULT_MCP_TOOL_LIMIT: usize = 48;
+pub const MAX_MCP_TOOL_LIMIT: usize = 256;
+const EMERGENCY_MAX_TOOLS_PER_SERVER: usize = 128;
 
 const CALL_TIMEOUT: Duration = Duration::from_secs(120);
 const LIST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -198,16 +199,31 @@ pub struct McpManager {
     /// Read by `build_context` and `calculate_context` so the preflight token
     /// count and the turn itself see the same tools.
     current: RwLock<Arc<McpSnapshot>>,
+    tool_limit: AtomicUsize,
     client_version: String,
 }
 
 impl McpManager {
     pub fn new(client_version: impl Into<String>) -> Arc<Self> {
+        Self::new_with_tool_limit(client_version, DEFAULT_MCP_TOOL_LIMIT)
+    }
+
+    pub fn new_with_tool_limit(client_version: impl Into<String>, tool_limit: usize) -> Arc<Self> {
         Arc::new(Self {
             servers: Mutex::new(HashMap::new()),
             current: RwLock::new(McpSnapshot::empty()),
+            tool_limit: AtomicUsize::new(tool_limit.clamp(1, MAX_MCP_TOOL_LIMIT)),
             client_version: client_version.into(),
         })
+    }
+
+    pub fn tool_limit(&self) -> usize {
+        self.tool_limit.load(Ordering::Relaxed)
+    }
+
+    pub async fn set_tool_limit(&self, limit: usize) {
+        self.tool_limit.store(limit.clamp(1, MAX_MCP_TOOL_LIMIT), Ordering::Relaxed);
+        self.rebuild_snapshot().await;
     }
 
     /// The current frozen snapshot. Cheap and lock-light; safe to call per turn.
@@ -263,6 +279,30 @@ impl McpManager {
         let mut list: Vec<McpServerStatus> = servers.values().map(ServerHandle::status_view).collect();
         list.sort_by(|a, b| a.id.cmp(&b.id));
         list
+    }
+
+    /// Every tool currently reported by running servers, before user disablement
+    /// and the model-facing limit. Used by the Tools tab so excluded tools remain
+    /// inspectable and can be enabled/disabled deliberately.
+    pub async fn inventory(&self) -> Vec<McpToolDef> {
+        let servers = self.servers.lock().await;
+        let mut ids: Vec<&String> = servers.keys().collect();
+        ids.sort();
+        let mut tools = Vec::new();
+        for id in ids {
+            let handle = &servers[id];
+            if !handle.config.enabled || handle.status != McpStatus::Running {
+                continue;
+            }
+            tools.extend(
+                handle
+                    .tools
+                    .iter()
+                    .take(EMERGENCY_MAX_TOOLS_PER_SERVER)
+                    .map(|tool| tool_def(handle, tool)),
+            );
+        }
+        tools
     }
 
     /// Build the `{ servers: [...] }` payload for the `mcp-sync` edge function:
@@ -543,51 +583,73 @@ impl McpManager {
         }
     }
 
-    /// Recompute the snapshot from every running server's enabled tools, applying
-    /// the per-server and total caps deterministically.
+    /// Recompute the model-facing snapshot. Tools are selected round-robin by
+    /// server so one large catalog cannot starve every other connected server.
     async fn rebuild_snapshot(&self) {
         let servers = self.servers.lock().await;
-        // Deterministic order: by server id, then server-declared tool order.
         let mut ids: Vec<&String> = servers.keys().collect();
         ids.sort();
-
-        let mut tools: Vec<McpToolDef> = Vec::new();
-        let mut truncated = 0usize;
-
+        let mut candidates: Vec<Vec<McpToolDef>> = Vec::new();
         for id in ids {
             let handle = &servers[id];
             if !handle.config.enabled || handle.status != McpStatus::Running {
                 continue;
             }
-            let trusted = handle.config.trust == McpTrust::Trusted;
-            let mut per_server = 0usize;
-            for tool in &handle.tools {
-                if !handle.config.is_tool_enabled(&tool.name) {
-                    continue;
-                }
-                if per_server >= MAX_TOOLS_PER_SERVER || tools.len() >= MAX_TOTAL_MCP_TOOLS {
-                    truncated += 1;
-                    continue;
-                }
-                let read_only = tool.annotations.read_only_hint;
-                tools.push(McpToolDef {
-                    server_id: handle.config.id.clone(),
-                    tool_name: tool.name.clone(),
-                    qualified: qualified_name(&handle.config.id, &tool.name),
-                    description: tool.description.clone(),
-                    parameters: normalize_schema(&tool.input_schema),
-                    read_only_hint: read_only,
-                    // Untrusted servers: everything is mutating. Trusted: believe
-                    // the read-only hint.
-                    mutating: !(trusted && read_only),
-                });
-                per_server += 1;
-            }
+            candidates.push(
+                handle
+                    .tools
+                    .iter()
+                    .filter(|tool| handle.config.is_tool_enabled(&tool.name))
+                    .take(EMERGENCY_MAX_TOOLS_PER_SERVER)
+                    .map(|tool| tool_def(handle, tool))
+                    .collect(),
+            );
         }
-
+        let available: usize = candidates.iter().map(Vec::len).sum();
+        let limit = self.tool_limit().min(MAX_MCP_TOOL_LIMIT);
+        let mut tools = Vec::with_capacity(available.min(limit));
+        let mut index = 0usize;
+        while tools.len() < limit {
+            let mut added = false;
+            for server in &candidates {
+                if let Some(tool) = server.get(index) {
+                    tools.push(tool.clone());
+                    added = true;
+                    if tools.len() == limit {
+                        break;
+                    }
+                }
+            }
+            if !added {
+                break;
+            }
+            index += 1;
+        }
+        let truncated = available.saturating_sub(tools.len());
         let snapshot = Arc::new(McpSnapshot { tools, truncated });
         *self.current.write().expect("snapshot lock poisoned") = snapshot;
     }
+}
+
+fn tool_def(handle: &ServerHandle, tool: &McpTool) -> McpToolDef {
+    let read_only = tool.annotations.read_only_hint;
+    McpToolDef {
+        server_id: handle.config.id.clone(),
+        tool_name: tool.name.clone(),
+        qualified: qualified_name(&handle.config.id, &tool.name),
+        description: tool.description.clone(),
+        parameters: normalize_schema(&tool.input_schema),
+        read_only_hint: read_only,
+        mutating: !(handle.config.trust == McpTrust::Trusted && read_only),
+    }
+}
+
+/// Conservative schema cost shown in the UI. This mirrors the runtime fallback
+/// estimator: structured JSON averages roughly three UTF-8 bytes per token.
+pub fn estimated_schema_tokens(tool: &McpToolDef) -> u32 {
+    serde_json::to_vec(&tool.to_ollama_def())
+        .map(|bytes| (bytes.len() as u64).div_ceil(3).min(u32::MAX as u64) as u32)
+        .unwrap_or(0)
 }
 
 /// Ensure the parameters are a JSON Schema object; some servers omit it. The
@@ -704,29 +766,25 @@ mod tests {
 
     #[tokio::test]
     async fn total_cap_truncates_deterministically() {
-        // Two servers, each declaring more tools than the per-server cap. Each is
-        // first clamped to MAX_TOOLS_PER_SERVER; the two together must not exceed
-        // the total cap. With 24 per server and a 48 total, both fit exactly.
-        let many: Vec<McpTool> = (0..(MAX_TOOLS_PER_SERVER + 10))
+        let many: Vec<McpTool> = (0..34)
             .map(|i| tool(&format!("t{i:02}"), false))
             .collect();
         let a = running(cfg("aaa", McpTrust::Untrusted), many.clone());
         let b = running(cfg("bbb", McpTrust::Untrusted), many);
         let m = manager_with(vec![a, b]).await;
         let snap = m.snapshot();
-        assert_eq!(snap.tools.len(), MAX_TOTAL_MCP_TOOLS);
+        assert_eq!(snap.tools.len(), DEFAULT_MCP_TOOL_LIMIT);
         assert!(snap.truncated > 0);
-        // Deterministic per-server split: 24 from each, id-sorted.
+        // Round-robin selection gives equally sized servers an equal share.
         let from_a = snap.tools.iter().filter(|t| t.server_id == "aaa").count();
         let from_b = snap.tools.iter().filter(|t| t.server_id == "bbb").count();
-        assert_eq!(from_a, MAX_TOOLS_PER_SERVER);
-        assert_eq!(from_b, MAX_TOTAL_MCP_TOOLS - MAX_TOOLS_PER_SERVER);
+        assert_eq!(from_a, DEFAULT_MCP_TOOL_LIMIT / 2);
+        assert_eq!(from_b, DEFAULT_MCP_TOOL_LIMIT / 2);
     }
 
     #[tokio::test]
     async fn total_cap_across_many_small_servers() {
-        // Three servers of 20 tools each = 60 declared; total cap clamps to 48,
-        // and the drop lands on the id-last server.
+        // Three servers of 20 tools each = 60 declared; the default clamps to 48.
         let handles: Vec<ServerHandle> = ["s1", "s2", "s3"]
             .iter()
             .map(|id| {
@@ -737,18 +795,30 @@ mod tests {
             .collect();
         let m = manager_with(handles).await;
         let snap = m.snapshot();
-        assert_eq!(snap.tools.len(), MAX_TOTAL_MCP_TOOLS);
-        assert_eq!(snap.truncated, 60 - MAX_TOTAL_MCP_TOOLS);
+        assert_eq!(snap.tools.len(), DEFAULT_MCP_TOOL_LIMIT);
+        assert_eq!(snap.truncated, 60 - DEFAULT_MCP_TOOL_LIMIT);
+        for id in ["s1", "s2", "s3"] {
+            assert_eq!(snap.tools.iter().filter(|tool| tool.server_id == id).count(), 16);
+        }
     }
 
     #[tokio::test]
-    async fn per_server_cap_applies() {
+    async fn user_limit_applies_to_one_large_server() {
         let many: Vec<McpTool> =
-            (0..(MAX_TOOLS_PER_SERVER + 3)).map(|i| tool(&format!("t{i:02}"), false)).collect();
+            (0..(DEFAULT_MCP_TOOL_LIMIT + 3)).map(|i| tool(&format!("t{i:02}"), false)).collect();
         let m = manager_with(vec![running(cfg("srv", McpTrust::Untrusted), many)]).await;
         let snap = m.snapshot();
-        assert_eq!(snap.tools.len(), MAX_TOOLS_PER_SERVER);
+        assert_eq!(snap.tools.len(), DEFAULT_MCP_TOOL_LIMIT);
         assert_eq!(snap.truncated, 3);
+    }
+
+    #[tokio::test]
+    async fn changing_user_limit_rebuilds_the_snapshot() {
+        let many: Vec<McpTool> = (0..80).map(|i| tool(&format!("t{i:02}"), false)).collect();
+        let m = manager_with(vec![running(cfg("srv", McpTrust::Untrusted), many)]).await;
+        m.set_tool_limit(72).await;
+        assert_eq!(m.snapshot().tools.len(), 72);
+        assert_eq!(m.snapshot().truncated, 8);
     }
 
     #[tokio::test]

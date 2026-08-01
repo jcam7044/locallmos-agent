@@ -248,7 +248,9 @@ export type McpToolView = {
   qualified: string;
   description: string;
   enabled: boolean;
+  available: boolean;
   mutating: boolean;
+  schemaTokens: number;
 };
 
 export type McpServerView = {
@@ -293,6 +295,10 @@ export type McpRuntimeAvailability = { node: boolean; uv: boolean };
 export type McpOverview = {
   servers: McpServerView[];
   truncated: number;
+  toolLimit: number;
+  availableTools: number;
+  activeSchemaTokens: number;
+  availableSchemaTokens: number;
   runtimes: McpRuntimeAvailability;
   catalog: McpCatalogEntry[];
 };
@@ -332,6 +338,19 @@ export type CodingContextInfo = {
   autoThreshold: number;
   compacted: boolean;
   status: "idle" | "compacting";
+  mcpTools: number;
+  mcpSchemaTokens: number;
+};
+
+export type ChatContextInfo = {
+  usedTokens: number;
+  maxTokens: number;
+  reserveTokens: number;
+  percent: number;
+  level: "normal" | "orange" | "red";
+  countExact: boolean;
+  mcpTools: number;
+  mcpSchemaTokens: number;
 };
 
 export type CodingPreviewStatus = {

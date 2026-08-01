@@ -8,6 +8,7 @@ import {
   chatListSessions,
   chatRenameSession,
   chatUpdateSettings,
+  chatGetContext,
   localChatCancel,
   localChatSend,
   readDroppedFile,
@@ -17,6 +18,7 @@ import {
   newUserMessage,
   type Attachment,
   type ChatSession,
+  type ChatContextInfo,
   type LocalModel,
   type SessionMeta,
   type SessionSettings,
@@ -45,6 +47,7 @@ export function ChatView({
   const [streaming, setStreaming] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [contextInfo, setContextInfo] = useState<ChatContextInfo | null>(null);
   const { stream, begin, end } = useChatStream();
   const activeRequest = useRef<string | null>(null);
   const saveTimer = useRef<number | undefined>(undefined);
@@ -128,6 +131,27 @@ export function ChatView({
   const canWebTools = selectedModel?.capabilities.includes("tools") ?? false;
   const canVisionRef = useRef(canVision);
   canVisionRef.current = canVision;
+
+  useEffect(() => {
+    if (!active?.id || !active.model) {
+      setContextInfo(null);
+      return;
+    }
+    let disposed = false;
+    const timer = window.setTimeout(() => {
+      void chatGetContext(active.id)
+        .then((info) => {
+          if (!disposed) setContextInfo(info);
+        })
+        .catch(() => {
+          if (!disposed) setContextInfo(null);
+        });
+    }, 650);
+    return () => {
+      disposed = true;
+      window.clearTimeout(timer);
+    };
+  }, [active?.id, active?.model, active?.settings, active?.messages.length]);
 
   // --- Attachments -----------------------------------------------------------
   const [pending, setPending] = useState<Attachment[]>([]);
@@ -331,6 +355,7 @@ export function ChatView({
           attachments={pending}
           onAddFiles={addFiles}
           onRemoveAttachment={(i) => setPending((p) => p.filter((_, idx) => idx !== i))}
+          contextInfo={contextInfo}
         />
         {error && <p style={{ color: "#f87171", fontSize: 12, marginTop: 8 }}>{error}</p>}
       </div>

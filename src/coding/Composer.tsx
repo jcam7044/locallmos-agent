@@ -3,6 +3,9 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { codingAttach } from "../api";
 import type { ApprovalPolicy, CodingContextInfo, ModelOption } from "../types";
 import { C } from "./tokens";
+import { ContextRing, formatTokens } from "../components/ContextIndicator";
+
+export { ContextRing } from "../components/ContextIndicator";
 
 /**
  * The session's mode. One menu covers both axes the backend exposes: whether
@@ -164,7 +167,9 @@ export function Composer({
             style={{ ...pill, opacity: mcpEnabled ? 1 : 0.5 }}
             title={
               mcpEnabled
-                ? "MCP tools are available to this session. Manage servers in the Tools tab."
+                ? contextInfo
+                  ? `${contextInfo.mcpTools} MCP tools use approximately ${formatTokens(contextInfo.mcpSchemaTokens)} context tokens.`
+                  : "MCP tools are available to this session. Manage servers in the Tools tab."
                 : "Enable the configured MCP servers' tools for this session."
             }
           >
@@ -252,6 +257,15 @@ export function Composer({
           <div style={contextSummary}>
             <strong>{formatTokens(contextInfo.usedTokens)} / {formatTokens(contextInfo.maxTokens)}</strong>
             <span>{contextInfo.countExact ? "Exact count" : "Estimated count"} · {formatTokens(contextInfo.reserveTokens)} reserved</span>
+            {contextInfo.mcpTools > 0 && (
+              <span>
+                MCP definitions: {contextInfo.mcpTools} tools · approximately{" "}
+                {formatTokens(contextInfo.mcpSchemaTokens)} tokens ({Math.max(
+                  0,
+                  Math.round((contextInfo.mcpSchemaTokens / contextInfo.maxTokens) * 100),
+                )}% of context)
+              </span>
+            )}
             {contextInfo.compacted && <span>Older turns are represented by a checkpoint.</span>}
           </div>
           <MenuItem
@@ -281,37 +295,6 @@ export function Composer({
         </Popup>
       )}
     </div>
-  );
-}
-
-function formatTokens(value: number) {
-  if (value < 1000) return String(value);
-  const scaled = value / 1000;
-  return `${scaled >= 10 ? scaled.toFixed(0) : scaled.toFixed(1)}k`;
-}
-
-export function ContextRing({ percent, level }: Pick<CodingContextInfo, "percent" | "level">) {
-  const color = level === "red" ? "#f87171" : level === "orange" ? "#fb923c" : "#3b82f6";
-  const radius = 6;
-  const circumference = 2 * Math.PI * radius;
-  const offset = circumference * (1 - Math.min(100, Math.max(0, percent)) / 100);
-  return (
-    <span style={ringWrap} aria-hidden="true">
-      <svg width="16" height="16" viewBox="0 0 16 16" style={{ transform: "rotate(-90deg)" }}>
-        <circle cx="8" cy="8" r={radius} fill="none" stroke="rgba(148,163,184,0.32)" strokeWidth="2.25" />
-        <circle
-          cx="8"
-          cy="8"
-          r={radius}
-          fill="none"
-          stroke={color}
-          strokeWidth="2.25"
-          strokeLinecap="round"
-          strokeDasharray={circumference}
-          strokeDashoffset={offset}
-        />
-      </svg>
-    </span>
   );
 }
 
@@ -445,13 +428,6 @@ const contextPill: React.CSSProperties = {
   padding: 0,
   cursor: "pointer",
   whiteSpace: "nowrap",
-};
-const ringWrap: React.CSSProperties = {
-  width: 16,
-  height: 16,
-  display: "inline-flex",
-  alignItems: "center",
-  justifyContent: "center",
 };
 const ringLoading: React.CSSProperties = {
   width: 16,

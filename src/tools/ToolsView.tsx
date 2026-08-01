@@ -8,11 +8,10 @@ import {
   mcpStopServer,
   mcpServerLogs,
   mcpSetSecret,
+  mcpSetToolLimit,
 } from "../api";
 import type { McpCatalogEntry, McpOverview, McpServerView, McpStatus } from "../types";
 import { card, label, buttonStyle, secondaryButton, inputStyle } from "../styles";
-
-const MAX_TOTAL_MCP_TOOLS = 48;
 
 const STATUS_COLOR: Record<McpStatus, string> = {
   running: "#34d399",
@@ -30,6 +29,7 @@ export function ToolsView() {
   const [installing, setInstalling] = useState<McpCatalogEntry | null>(null);
   const [details, setDetails] = useState<McpCatalogEntry | null>(null);
   const [logs, setLogs] = useState<{ id: string; text: string } | null>(null);
+  const [customLimit, setCustomLimit] = useState(48);
 
   const load = useCallback(async () => {
     try {
@@ -42,6 +42,10 @@ export function ToolsView() {
   useEffect(() => {
     void load();
   }, [load]);
+
+  useEffect(() => {
+    if (overview) setCustomLimit(overview.toolLimit);
+  }, [overview?.toolLimit]);
 
   const run = useCallback(async (fn: () => Promise<McpOverview>) => {
     setBusy(true);
@@ -56,7 +60,11 @@ export function ToolsView() {
   }, []);
 
   const activeTools = useMemo(
-    () => (overview?.servers ?? []).reduce((n, s) => n + (s.status === "running" ? s.tools.length : 0), 0),
+    () =>
+      (overview?.servers ?? []).reduce(
+        (n, s) => n + (s.status === "running" ? s.tools.filter((tool) => tool.available).length : 0),
+        0,
+      ),
     [overview],
   );
 
@@ -70,6 +78,12 @@ export function ToolsView() {
   }
 
   const { runtimes, catalog, servers, truncated } = overview;
+  const presets = [
+    { label: "Conservative", limit: 24, context: "8k–16k context" },
+    { label: "Balanced", limit: 48, context: "32k–64k context" },
+    { label: "Expanded", limit: 96, context: "64k–128k context" },
+    { label: "Large context", limit: 128, context: "128k+ context" },
+  ];
 
   return (
     <div style={{ marginTop: 16, display: "flex", flexDirection: "column", gap: 16 }}>
@@ -92,15 +106,63 @@ export function ToolsView() {
         </div>
       )}
 
-      {/* Active-tool budget */}
-      <div style={{ ...label }}>
-        {activeTools} / {MAX_TOTAL_MCP_TOOLS} MCP tools active across running servers.
+      <div style={{ ...card, display: "flex", flexDirection: "column", gap: 10 }}>
+        <div>
+          <div style={{ fontSize: 14, fontWeight: 600 }}>MCP tool limit</div>
+          <p style={{ ...label, lineHeight: 1.45, margin: "4px 0 0" }}>
+            Limits how many tool definitions are sent with each model request. Larger catalogs use
+            more context and may make tool selection harder for smaller models.
+          </p>
+        </div>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+          {presets.map((preset) => (
+            <button
+              key={preset.limit}
+              disabled={busy}
+              title={`Suggested for ${preset.context}`}
+              onClick={() => run(() => mcpSetToolLimit(preset.limit))}
+              style={{
+                ...secondaryButton,
+                borderColor: overview.toolLimit === preset.limit ? "#38bdf8" : "#1f2937",
+                color: overview.toolLimit === preset.limit ? "#38bdf8" : "#e2e8f0",
+              }}
+            >
+              {preset.label} · {preset.limit}
+            </button>
+          ))}
+          <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+            <input
+              type="number"
+              min={1}
+              max={256}
+              value={customLimit}
+              aria-label="Custom MCP tool limit"
+              onChange={(event) => setCustomLimit(Number(event.target.value))}
+              style={{ ...inputStyle, width: 76, marginTop: 0, padding: "6px 8px" }}
+            />
+            <button
+              style={secondaryButton}
+              disabled={busy || !Number.isInteger(customLimit) || customLimit < 1 || customLimit > 256}
+              onClick={() => run(() => mcpSetToolLimit(customLimit))}
+            >
+              Apply custom
+            </button>
+          </div>
+        </div>
+        <div style={{ ...label }}>
+          {activeTools} of {overview.availableTools} enabled tools available · approximately{" "}
+          {formatTokenCount(overview.activeSchemaTokens)} context tokens
+          {overview.availableTools > activeTools &&
+            ` (${formatTokenCount(overview.availableSchemaTokens)} if all enabled tools were included)`}
+        </div>
+        <div style={{ ...label, fontSize: 11 }}>
+          Suggestions are starting points: tool schema sizes and model tool-selection quality vary.
+        </div>
         {truncated > 0 && (
-          <span style={{ color: "#fbbf24" }}>
-            {" "}
-            {truncated} tool{truncated === 1 ? "" : "s"} dropped by the cap — disable some tools or
-            servers to fit within the model's context.
-          </span>
+          <div style={{ color: "#fbbf24", fontSize: 12 }}>
+            {truncated} tool{truncated === 1 ? " is" : "s are"} excluded by your {overview.toolLimit}-tool
+            limit. Raise the limit or disable tools you do not need.
+          </div>
         )}
       </div>
 
@@ -480,12 +542,22 @@ function ServerCard({
               ) : (
                 <span style={{ fontSize: 10, color: "#34d399" }}>read-only</span>
               )}
+              {t.enabled && !t.available && (
+                <span style={{ fontSize: 10, color: "#fbbf24" }}>excluded by tool limit</span>
+              )}
+              <span style={{ ...label, fontSize: 10, marginLeft: "auto" }}>
+                ~{formatTokenCount(t.schemaTokens)} tokens
+              </span>
             </label>
           ))}
         </div>
       )}
     </div>
   );
+}
+
+function formatTokenCount(value: number) {
+  return value >= 1_000 ? `${(value / 1_000).toFixed(value >= 10_000 ? 0 : 1)}k` : String(value);
 }
 
 function SecretsEditor({

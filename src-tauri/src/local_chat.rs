@@ -18,6 +18,25 @@ use tauri::Emitter;
 /// single frontend listener can route concurrent turns.
 const EVENT: &str = "local-chat";
 
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatContextInfo {
+    pub used_tokens: u32,
+    pub max_tokens: u32,
+    pub reserve_tokens: u32,
+    pub percent: u8,
+    pub level: &'static str,
+    pub count_exact: bool,
+    pub mcp_tools: usize,
+    pub mcp_schema_tokens: u32,
+}
+
+struct ToolDefinitions {
+    value: Option<Value>,
+    mcp_tools: usize,
+    mcp_schema_tokens: u32,
+}
+
 fn emit(app: &tauri::AppHandle, request_id: &str, session_id: &str, mut payload: Value) {
     payload["requestId"] = json!(request_id);
     payload["sessionId"] = json!(session_id);
@@ -61,76 +80,17 @@ pub async fn send(
         return Err("no model selected".to_string());
     }
 
-    // Ollama chat history: optional system prompt, then messages with
-    // attachments folded in (images → base64 `images`, text → inlined content).
-    let mut messages: Vec<Value> = Vec::with_capacity(session.messages.len() + 1);
-    if let Some(sys) = session.settings.system_prompt.as_deref().filter(|s| !s.trim().is_empty()) {
-        messages.push(json!({ "role": "system", "content": sys }));
-    }
-    for m in &session.messages {
-        let mut content = m.content.clone();
-        let mut images: Vec<String> = Vec::new();
-        for a in &m.attachments {
-            match a.kind.as_str() {
-                "image" => {
-                    if let Some(data) = a.data.as_deref().filter(|d| !d.is_empty()) {
-                        images.push(data.to_string());
-                    }
-                }
-                "text" => {
-                    if let Some(text) = a.text.as_deref().filter(|t| !t.is_empty()) {
-                        content.push_str(&format!("\n\n[Attached file: {}]\n{text}", a.name));
-                    }
-                }
-                _ => {}
-            }
-        }
-        let mut obj = json!({ "role": m.role, "content": content });
-        if !images.is_empty() {
-            obj["images"] = json!(images);
-        }
-        messages.push(obj);
-    }
+    let messages = request_messages(&session);
 
     // Generation options from session settings.
-    let mut opts = serde_json::Map::new();
-    if let Some(t) = session.settings.temperature {
-        opts.insert("temperature".into(), json!(t));
-    }
-    if let Some(n) = session.settings.num_ctx {
-        opts.insert("num_ctx".into(), json!(n));
-    }
-    let options = (!opts.is_empty()).then(|| Value::Object(opts));
+    let options = request_options(&session);
 
     let think = session.settings.think && state.runtime.model_supports_thinking(&model).await;
 
     // Tools are only offered when the model supports native tool calling.
     let native_tools = state.runtime.model_supports_tools(&model).await;
-    let mut tool_defs: Vec<Value> = Vec::new();
-
-    // Built-in web tools when enabled. Unenrolled rigs get web_fetch only —
-    // web_search relays through the cloud.
-    if session.settings.web_tools && native_tools {
-        let enrolled = state.config.lock().await.is_enrolled();
-        let web = if enrolled { tools::builtin_defs() } else { tools::fetch_only_defs() };
-        if let Some(arr) = web.as_array() {
-            tool_defs.extend(arr.iter().cloned());
-        }
-    }
-
-    // Read-only MCP tools from trusted servers. Chat has no approval gate, so
-    // only non-mutating tools are ever offered here; mutating work belongs in the
-    // coding harness. Start the servers first so the snapshot reflects them.
-    if session.settings.mcp && native_tools {
-        state.mcp.ensure_enabled_started().await;
-        for tool in &state.mcp.snapshot().tools {
-            if !tool.mutating {
-                tool_defs.push(tool.to_ollama_def());
-            }
-        }
-    }
-
-    let tools_value = (!tool_defs.is_empty()).then(|| Value::Array(tool_defs));
+    let tool_defs = tool_definitions(&state, &session, native_tools, true).await;
+    let tools_value = tool_defs.value;
 
     // Register the cancel flag so `local_chat_cancel` can stop this turn.
     let cancel = Arc::new(AtomicBool::new(false));
@@ -175,6 +135,154 @@ pub async fn send(
     }
 
     Ok(assistant)
+}
+
+fn request_messages(session: &chat_store::ChatSession) -> Vec<Value> {
+    // Ollama chat history: optional system prompt, then messages with
+    // attachments folded in (images → base64 `images`, text → inlined content).
+    let mut messages: Vec<Value> = Vec::with_capacity(session.messages.len() + 1);
+    if let Some(sys) = session.settings.system_prompt.as_deref().filter(|s| !s.trim().is_empty()) {
+        messages.push(json!({ "role": "system", "content": sys }));
+    }
+    for m in &session.messages {
+        let mut content = m.content.clone();
+        let mut images: Vec<String> = Vec::new();
+        for a in &m.attachments {
+            match a.kind.as_str() {
+                "image" => {
+                    if let Some(data) = a.data.as_deref().filter(|d| !d.is_empty()) {
+                        images.push(data.to_string());
+                    }
+                }
+                "text" => {
+                    if let Some(text) = a.text.as_deref().filter(|t| !t.is_empty()) {
+                        content.push_str(&format!("\n\n[Attached file: {}]\n{text}", a.name));
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut obj = json!({ "role": m.role, "content": content });
+        if !images.is_empty() {
+            obj["images"] = json!(images);
+        }
+        messages.push(obj);
+    }
+    messages
+}
+
+fn request_options(session: &chat_store::ChatSession) -> Option<Value> {
+    let mut opts = serde_json::Map::new();
+    if let Some(t) = session.settings.temperature {
+        opts.insert("temperature".into(), json!(t));
+    }
+    if let Some(n) = session.settings.num_ctx {
+        opts.insert("num_ctx".into(), json!(n));
+    }
+    (!opts.is_empty()).then(|| Value::Object(opts))
+}
+
+async fn tool_definitions(
+    state: &Arc<AppState>,
+    session: &chat_store::ChatSession,
+    native_tools: bool,
+    start_servers: bool,
+) -> ToolDefinitions {
+    let mut tool_defs: Vec<Value> = Vec::new();
+
+    // Built-in web tools when enabled. Unenrolled rigs get web_fetch only —
+    // web_search relays through the cloud.
+    if session.settings.web_tools && native_tools {
+        let enrolled = state.config.lock().await.is_enrolled();
+        let web = if enrolled { tools::builtin_defs() } else { tools::fetch_only_defs() };
+        if let Some(arr) = web.as_array() {
+            tool_defs.extend(arr.iter().cloned());
+        }
+    }
+
+    // Read-only MCP tools from trusted servers. Chat has no approval gate, so
+    // only non-mutating tools are ever offered here; mutating work belongs in the
+    // coding harness. Start the servers first so the snapshot reflects them.
+    if session.settings.mcp && native_tools {
+        if start_servers {
+            state.mcp.ensure_enabled_started().await;
+        }
+        for tool in &state.mcp.snapshot().tools {
+            if !tool.mutating {
+                tool_defs.push(tool.to_ollama_def());
+            }
+        }
+    }
+    let mcp_defs: Vec<&Value> = tool_defs
+        .iter()
+        .filter(|definition| {
+            definition
+                .pointer("/function/name")
+                .and_then(Value::as_str)
+                .map(|name| name.starts_with(crate::mcp::MCP_PREFIX))
+                .unwrap_or(false)
+        })
+        .collect();
+    let mcp_tools = mcp_defs.len();
+    let mcp_schema_tokens = mcp_defs
+        .iter()
+        .map(|definition| {
+            serde_json::to_vec(definition)
+                .map(|bytes| (bytes.len() as u64).div_ceil(3).min(u32::MAX as u64) as u32)
+                .unwrap_or(0)
+        })
+        .sum();
+    ToolDefinitions {
+        value: (!tool_defs.is_empty()).then(|| Value::Array(tool_defs)),
+        mcp_tools,
+        mcp_schema_tokens,
+    }
+}
+
+pub async fn context_info(
+    state: &Arc<AppState>,
+    session_id: &str,
+) -> Result<ChatContextInfo, String> {
+    let session = chat_store::load(session_id).map_err(|error| error.to_string())?;
+    if session.model.is_empty() {
+        return Err("no model selected".into());
+    }
+    let messages = request_messages(&session);
+    let options = request_options(&session);
+    let native_tools = state.runtime.model_supports_tools(&session.model).await;
+    let think = session.settings.think && state.runtime.model_supports_thinking(&session.model).await;
+    let definitions = tool_definitions(state, &session, native_tools, false).await;
+    let (_, settings) = state.model_settings(&session.model).await.map_err(|error| error.to_string())?;
+    let max_tokens = session
+        .settings
+        .num_ctx
+        .unwrap_or(state.runtime.context_size_for_model(&session.model, &settings).await);
+    let count = state
+        .runtime
+        .count_input_tokens(
+            &session.model,
+            &Value::Array(messages),
+            think,
+            definitions.value.as_ref(),
+            options.as_ref(),
+            &settings,
+        )
+        .await;
+    let reserve_tokens = (max_tokens / 10)
+        .clamp(2_048, 8_192)
+        .min(max_tokens.saturating_sub(1));
+    let denominator = u64::from(max_tokens.max(1));
+    let percent = ((u64::from(count.tokens) * 100 + denominator / 2) / denominator).min(100) as u8;
+    Ok(ChatContextInfo {
+        used_tokens: count.tokens,
+        max_tokens,
+        reserve_tokens,
+        percent,
+        level: if percent >= 90 { "red" } else if percent >= 70 { "orange" } else { "normal" },
+        count_exact: count.exact,
+        mcp_tools: definitions.mcp_tools,
+        mcp_schema_tokens: definitions.mcp_schema_tokens,
+    })
 }
 
 struct TurnOutput {

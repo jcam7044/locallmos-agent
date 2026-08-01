@@ -32,10 +32,13 @@ pub struct AgentConfig {
     /// the configured models directory, so cloud aliases and local IDs converge.
     #[serde(default)]
     pub model_load_settings: BTreeMap<String, ModelLoadSettings>,
-    /// Configured MCP servers, in user-meaningful order (order drives the tool
-    /// cap's truncation). Secret env values live in `mcp_secrets.json`.
+    /// Configured MCP servers. Secret env values live in `mcp_secrets.json`.
     #[serde(default)]
     pub mcp_servers: Vec<crate::mcp::McpServerConfig>,
+    /// User-selected maximum number of MCP tools offered to a model. `None`
+    /// preserves the recommended default so older configs migrate cleanly.
+    #[serde(default)]
+    pub mcp_tool_limit: Option<u16>,
 }
 
 /// Serializes tests that mutate the process-global `LOCALLMOS_CONFIG_DIR` env
@@ -139,6 +142,7 @@ mod tests {
         let config: AgentConfig = serde_json::from_str(r#"{"rig_name":"old rig"}"#).unwrap();
         assert_eq!(config.rig_name.as_deref(), Some("old rig"));
         assert!(config.model_load_settings.is_empty());
+        assert!(config.mcp_tool_limit.is_none());
     }
 
     #[test]
@@ -202,5 +206,16 @@ mod tests {
                 .context_size,
             Some(16384)
         );
+    }
+
+    #[test]
+    fn mcp_tool_limit_round_trips() {
+        let config = AgentConfig {
+            mcp_tool_limit: Some(96),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let restored: AgentConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.mcp_tool_limit, Some(96));
     }
 }

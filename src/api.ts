@@ -20,6 +20,7 @@ import type {
   McpOverview,
   McpServerConfig,
   McpTrust,
+  ChatContextInfo,
 } from "./types";
 
 export const getLocalStatus = () => invoke<LocalStatus>("local_status");
@@ -64,6 +65,9 @@ export const localChatSend = (args: {
 
 export const localChatCancel = (requestId: string) =>
   invoke("local_chat_cancel", { requestId });
+
+export const chatGetContext = (sessionId: string) =>
+  invoke<ChatContextInfo>("chat_context", { sessionId });
 
 export const readDroppedFile = (path: string) =>
   invoke<Attachment>("read_dropped_file", { path });
@@ -145,6 +149,9 @@ export const codingSetMcpEnabled = (id: string, enabled: boolean) =>
 // ---- MCP server management ----
 
 export const mcpOverview = () => invoke<McpOverview>("mcp_overview");
+
+export const mcpSetToolLimit = (limit: number) =>
+  invoke<McpOverview>("mcp_set_tool_limit", { limit });
 
 export const mcpAddServer = (config: McpServerConfig) =>
   invoke<McpOverview>("mcp_add_server", { config });

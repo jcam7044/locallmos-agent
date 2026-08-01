@@ -342,9 +342,15 @@ async fn reconcile_tick(state: &Arc<AppState>) -> Result<()> {
             tracing::debug!("reconcile: leaving locally ejected model {model} unloaded");
             return Ok(());
         }
-        let loaded = snap.models.iter().any(|m| m.name == model && m.loaded);
-        if !loaded {
-            tracing::info!("reconcile: loading desired model {model}");
+        // desired_model is the default to warm when the rig is *idle*, not a model
+        // to force-restore over one the user actively chose. A different model may
+        // be resident because it was loaded locally (agent UI) or on demand by a
+        // chat/code turn; evicting it back to the default is the surprising
+        // behavior we avoid. Explicit web loads come through the `set_model`
+        // command, so this restore only needs to cover the "nothing loaded" case.
+        let any_loaded = snap.models.iter().any(|m| m.loaded);
+        if !any_loaded {
+            tracing::info!("reconcile: no model resident, loading default {model}");
             state.load_model_configured(model, false).await.ok();
         }
     }

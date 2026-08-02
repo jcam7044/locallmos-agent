@@ -33,6 +33,10 @@ pub struct SessionSettings {
     pub think: bool,
     #[serde(default)]
     pub web_tools: bool,
+    /// Offer read-only tools from trusted MCP servers. Chat has no approval gate,
+    /// so mutating MCP tools are never exposed here — use the coding harness.
+    #[serde(default)]
+    pub mcp: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

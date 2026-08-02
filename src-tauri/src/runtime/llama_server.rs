@@ -78,9 +78,10 @@ pub struct LlamaServerAdapter {
     backend: Option<String>,
     /// Extra `llama-server` args (whitespace-split from `LOCALLMOS_LLAMACPP_ARGS`).
     extra_args: Vec<String>,
-    /// Whether this rig's model reasons; toggles Qwen-style `enable_thinking` and
-    /// the reported "thinking" capability.
-    thinking: bool,
+    /// Explicit opt-in for thinking on models that cannot be recognized from
+    /// their identifier. Known reasoning-capable families are detected per
+    /// model below.
+    thinking_override: bool,
     startup_timeout: u64,
     proc: Mutex<Option<ChildProc>>,
     /// Cached auto device selection: `None` = not yet probed; `Some(None)` = probed,
@@ -129,7 +130,7 @@ impl LlamaServerAdapter {
             backend,
             bin,
             extra_args,
-            thinking: !std::env::var("LOCALLMOS_LLAMACPP_THINKING")
+            thinking_override: !std::env::var("LOCALLMOS_LLAMACPP_THINKING")
                 .unwrap_or_default()
                 .is_empty(),
             startup_timeout: std::env::var("LOCALLMOS_LLAMACPP_STARTUP_SECS")
@@ -250,8 +251,8 @@ impl LlamaServerAdapter {
     pub async fn template_supports_tools(&self, _model: &str) -> bool {
         true
     }
-    pub async fn model_supports_thinking(&self, _model: &str) -> bool {
-        self.thinking
+    pub async fn model_supports_thinking(&self, model: &str) -> bool {
+        self.thinking_override || model_supports_thinking(model)
     }
 
     pub async fn is_model_loaded(&self, model: &str) -> bool {
@@ -432,15 +433,18 @@ impl LlamaServerAdapter {
 
     async fn list_models(&self, current: Option<&str>) -> Vec<ModelInfo> {
         let reported = self.server_models().await;
-        let mut caps = vec!["tools".to_string()];
-        if self.thinking {
-            caps.push("thinking".to_string());
-        }
+        let caps = vec!["tools".to_string()];
         let mut models = Vec::new();
         let root = Path::new(&self.models_dir);
         for m in grouped_ggufs(&self.models_dir) {
             let mtp = self.has_embedded_mtp(&root.join(&m.id)).await;
             let mut model_caps = caps.clone();
+            if self.thinking_override
+                || model_supports_thinking(&m.id)
+                || model_supports_thinking(&m.display_name)
+            {
+                model_caps.push("thinking".into());
+            }
             if mtp {
                 model_caps.push("mtp".into());
             }
@@ -593,6 +597,14 @@ fn chat_request_body(
         body["tool_choice"] = json!("auto");
     }
     body
+}
+
+/// Qwen3 and later Qwen3-family templates accept `enable_thinking` and emit
+/// their reasoning separately. The model ID is stable across GGUF filenames,
+/// directory names, and the display names surfaced by the UI, so it is a
+/// reliable capability hint when llama-server does not expose model metadata.
+fn model_supports_thinking(model: &str) -> bool {
+    model.to_ascii_lowercase().contains("qwen3")
 }
 
 impl RuntimeAdapter for LlamaServerAdapter {
@@ -1305,22 +1317,16 @@ fn grouped_ggufs(dir: &str) -> Vec<InstalledModel> {
     groups.into_values().collect()
 }
 
-/// Remove a completed LocalLMOS-managed Hub download. The model is located by
-/// its scanned stable id rather than accepting a filesystem path from the UI;
-/// a matching manifest is required before any files can be deleted.
-pub fn delete_hub_model(dir: &str, model_id: &str) -> Result<()> {
+/// Remove a locally discovered GGUF model. The model is located by its scanned
+/// stable id rather than accepting a filesystem path from the UI. This supports
+/// both Hub downloads and GGUFs added directly to the models directory.
+pub fn delete_local_model(dir: &str, model_id: &str) -> Result<()> {
     let root = Path::new(dir);
     let model = grouped_ggufs(dir)
         .into_iter()
         .find(|model| model.id == model_id)
         .ok_or_else(|| anyhow!("model is no longer on disk"))?;
-    let repo = model
-        .source_repo
-        .as_deref()
-        .ok_or_else(|| anyhow!("only LocalLMOS Hub downloads can be removed"))?;
-    if model.revision.is_none() {
-        return Err(anyhow!("only LocalLMOS Hub downloads with a manifest can be removed"));
-    }
+    let repo = model.source_repo.clone();
     let files = model.files;
     let first = files.first().ok_or_else(|| anyhow!("model has no GGUF files"))?;
     let parent_rel = Path::new(first).parent().unwrap_or(Path::new(""));
@@ -1358,22 +1364,33 @@ pub fn delete_hub_model(dir: &str, model_id: &str) -> Result<()> {
                 .filter_map(|file| Path::new(file).file_name()?.to_str().map(str::to_string))
                 .collect();
             manifest_names.sort();
-            (manifest_repo == repo && manifest_names == expected_names).then_some(path)
-        })
-        .ok_or_else(|| anyhow!("LocalLMOS download manifest was not found"))?;
+            (repo.as_deref().map_or(true, |repo| manifest_repo == repo)
+                && manifest_names == expected_names)
+                .then_some(path)
+        });
 
     for file in files {
         let relative = Path::new(&file);
-        if relative.is_absolute() || relative.components().any(|part| !matches!(part, std::path::Component::Normal(_))) {
+        if relative.is_absolute()
+            || relative
+                .components()
+                .any(|part| !matches!(part, std::path::Component::Normal(_)))
+        {
             return Err(anyhow!("invalid installed model path"));
         }
         let target = root.join(relative);
-        if !target.starts_with(root) || std::fs::symlink_metadata(&target).map(|meta| meta.file_type().is_symlink()).unwrap_or(true) {
+        if !target.starts_with(root)
+            || std::fs::symlink_metadata(&target)
+                .map(|meta| meta.file_type().is_symlink())
+                .unwrap_or(true)
+        {
             return Err(anyhow!("invalid installed model file"));
         }
         std::fs::remove_file(target)?;
     }
-    std::fs::remove_file(manifest)?;
+    if let Some(manifest) = manifest {
+        std::fs::remove_file(manifest)?;
+    }
     Ok(())
 }
 
@@ -1648,6 +1665,13 @@ mod tests {
     }
 
     #[test]
+    fn detects_qwen3_family_thinking_from_model_id() {
+        assert!(model_supports_thinking("Qwen3.6-27B-Q4_K_M.gguf"));
+        assert!(model_supports_thinking("models/Qwen3-8B-Instruct"));
+        assert!(!model_supports_thinking("Llama-3.3-70B-Instruct-Q4_K_M.gguf"));
+    }
+
+    #[test]
     fn detects_an_externally_served_model_from_v1_models() {
         let response: ServerModelsResponse = serde_json::from_value(json!({
             "models": [{"name": "huggingface/unsloth/gemma-4-12b-it-GGUF/gemma-4-12b-it-Q4_K_M.gguf"}],
@@ -1873,7 +1897,7 @@ mod tests {
     }
 
     #[test]
-    fn deletes_only_manifest_backed_hub_models() {
+    fn deletes_manifest_backed_hub_models() {
         let root = std::env::temp_dir().join(format!("locallmos-delete-model-{}", std::process::id()));
         let repo = root.join("huggingface/owner/model");
         let _ = fs::remove_dir_all(&root);
@@ -1888,7 +1912,7 @@ mod tests {
             "files":[{"path":"model-Q4_K_M.gguf","sizeBytes":3}]
         }"#).unwrap();
 
-        delete_hub_model(
+        delete_local_model(
             root.to_str().unwrap(),
             "huggingface/owner/model/model-Q4_K_M.gguf",
         ).unwrap();
@@ -1898,19 +1922,19 @@ mod tests {
     }
 
     #[test]
-    fn refuses_to_delete_a_model_without_a_manifest() {
-        let root = std::env::temp_dir().join(format!("locallmos-refuse-delete-{}", std::process::id()));
+    fn deletes_a_model_without_a_manifest() {
+        let root = std::env::temp_dir().join(format!("locallmos-delete-unmanaged-{}", std::process::id()));
         let repo = root.join("huggingface/owner/model");
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&repo).unwrap();
         let weight = repo.join("model-Q4_K_M.gguf");
         fs::write(&weight, [0u8; 3]).unwrap();
 
-        assert!(delete_hub_model(
+        delete_local_model(
             root.to_str().unwrap(),
             "huggingface/owner/model/model-Q4_K_M.gguf",
-        ).is_err());
-        assert!(weight.exists());
+        ).unwrap();
+        assert!(!weight.exists());
         let _ = fs::remove_dir_all(root);
     }
 }

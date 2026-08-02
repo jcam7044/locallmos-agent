@@ -93,6 +93,8 @@ describe("coding context indicator", () => {
         onStop={() => undefined}
         policy="read_only"
         onPolicyChange={() => undefined}
+        mcpEnabled
+        onMcpToggle={() => undefined}
         sessionId="session-1"
         attachments={[]}
         setAttachments={() => undefined}
@@ -108,6 +110,8 @@ describe("coding context indicator", () => {
           autoThreshold: 80,
           compacted: false,
           status: "idle",
+          mcpTools: 8,
+          mcpSchemaTokens: 1_200,
         }}
         compacting={false}
         onCompact={() => undefined}
@@ -116,6 +120,7 @@ describe("coding context indicator", () => {
     );
     expect(html).toContain("Context 75% filled");
     expect(html).toContain("75% filled (24k of 32k)");
+    expect(html).toContain("8 MCP tools use approximately 1.2k context tokens");
     expect(html).toContain("#fb923c");
   });
 

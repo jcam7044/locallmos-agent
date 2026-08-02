@@ -33,6 +33,8 @@ pub struct CodingContextInfo {
     pub auto_threshold: u8,
     pub compacted: bool,
     pub status: &'static str,
+    pub mcp_tools: usize,
+    pub mcp_schema_tokens: u32,
 }
 
 struct BuiltContext {
@@ -40,6 +42,8 @@ struct BuiltContext {
     tools_value: Option<Value>,
     prompt_tool_mode: bool,
     tool_names: Vec<String>,
+    mcp_tools: usize,
+    mcp_schema_tokens: u32,
 }
 
 fn emit(app: &tauri::AppHandle, session_id: &str, message_id: &str, event: Value) {
@@ -78,11 +82,18 @@ pub async fn send(
         return Err("no model selected".to_string());
     }
 
+    // Lazily start the session's MCP servers (if it opted in) before freezing the
+    // snapshot, so both the preflight count and the turn see the same tools.
+    if session.mcp_enabled {
+        state.mcp.ensure_enabled_started().await;
+    }
+
     // The workspace must exist + resolve on this machine.
     let workspace = coding::Workspace::new(&session.workspace_root).map_err(|e| e.to_string())?;
     let cx = CodingContext {
         workspace,
         policy: coding::ApprovalPolicy::parse(&session.approval_policy),
+        mcp: mcp_access_for(&state, &session),
     };
 
     // Count the exact request shape before any tool activity. Auto-compaction
@@ -221,6 +232,23 @@ pub async fn backfill_unsynced(state: Arc<AppState>) {
     }
 }
 
+/// Advertise the rig's MCP servers to the cloud via `mcp-sync` (no-op when not
+/// enrolled). Best-effort: a failure only means web-initiated turns won't see the
+/// tools until the next sync. Call after any server config/lifecycle change.
+pub async fn sync_mcp_to_cloud(state: &Arc<AppState>) {
+    if !state.config.lock().await.is_enrolled() {
+        return;
+    }
+    let token = match crate::worker::ensure_token(state).await {
+        Ok(t) => t,
+        Err(_) => return,
+    };
+    let body = state.mcp.advertise_payload().await;
+    if let Err(e) = state.supabase.mcp_sync(&token, body).await {
+        tracing::debug!("mcp-sync push failed: {e}");
+    }
+}
+
 /// Push the on-disk transcript to Supabase via `coding-sync` (no-op when not
 /// enrolled). Persists the returned remote ids on the session's first sync.
 pub async fn push_to_cloud(state: &Arc<AppState>, session: &coding_store::CodingSession) {
@@ -278,20 +306,43 @@ async fn build_context(
     cx: &CodingContext,
     session: &CodingSession,
 ) -> Result<BuiltContext, String> {
-    let tool_defs = coding::tool_defs_for(cx.policy, true);
     let native_tools = state.runtime.template_supports_tools(&session.model).await;
     let prompt_tool_mode = !native_tools;
+    // MCP tools are included only in native tool-calling mode. Prompt-injection
+    // mode re-serializes every full JSON Schema into the prompt each round, which
+    // is prohibitively expensive with third-party schemas on the small-context
+    // models that need that fallback.
+    let tool_defs = coding::tool_defs_for(cx, true, native_tools);
     let tool_names = tool_defs
         .iter()
         .filter_map(|d| d.pointer("/function/name").and_then(Value::as_str))
         .map(str::to_string)
         .collect();
+    let mcp_defs: Vec<&Value> = tool_defs
+        .iter()
+        .filter(|definition| {
+            definition
+                .pointer("/function/name")
+                .and_then(Value::as_str)
+                .map(|name| name.starts_with(crate::mcp::MCP_PREFIX))
+                .unwrap_or(false)
+        })
+        .collect();
+    let mcp_tools = mcp_defs.len();
+    let mcp_schema_tokens = mcp_defs
+        .iter()
+        .map(|definition| {
+            serde_json::to_vec(definition)
+                .map(|bytes| (bytes.len() as u64).div_ceil(3).min(u32::MAX as u64) as u32)
+                .unwrap_or(0)
+        })
+        .sum();
     let tools_value = native_tools.then(|| Value::Array(tool_defs.clone()));
 
     let mut messages = Vec::with_capacity(session.messages.len() + 2);
     messages.push(json!({
         "role": "system",
-        "content": coding::system_prompt(&cx.workspace.root_str(), cx.policy),
+        "content": coding::system_prompt(&cx.workspace.root_str(), cx.policy, &cx.mcp),
     }));
     let mut start = 0usize;
     if let (Some(checkpoint), Some(boundary)) = (
@@ -323,7 +374,14 @@ async fn build_context(
             message["content"] = json!(format!("{manifest}\n\n---\n\n{existing}"));
         }
     }
-    Ok(BuiltContext { messages, tools_value, prompt_tool_mode, tool_names })
+    Ok(BuiltContext {
+        messages,
+        tools_value,
+        prompt_tool_mode,
+        tool_names,
+        mcp_tools,
+        mcp_schema_tokens,
+    })
 }
 
 fn reserve_tokens(max_tokens: u32) -> u32 {
@@ -332,7 +390,14 @@ fn reserve_tokens(max_tokens: u32) -> u32 {
         .min(max_tokens.saturating_sub(1))
 }
 
-fn context_info(session: &CodingSession, used: u32, max: u32, exact: bool) -> CodingContextInfo {
+fn context_info(
+    session: &CodingSession,
+    used: u32,
+    max: u32,
+    exact: bool,
+    mcp_tools: usize,
+    mcp_schema_tokens: u32,
+) -> CodingContextInfo {
     let reserve = reserve_tokens(max);
     let denominator = u64::from(max.max(1));
     let percent = ((u64::from(used) * 100 + denominator / 2) / denominator).min(100) as u8;
@@ -347,7 +412,22 @@ fn context_info(session: &CodingSession, used: u32, max: u32, exact: bool) -> Co
         auto_threshold: session.context_state.auto_threshold,
         compacted: session.context_state.checkpoint.is_some(),
         status: "idle",
+        mcp_tools,
+        mcp_schema_tokens,
     }
+}
+
+/// The MCP tool access for a session's turn: the manager's current snapshot,
+/// frozen. Both `send` (the run path) and `calculate_context` (the preflight
+/// count) go through here, so they see the same tools as long as the snapshot
+/// doesn't rebuild between them — which it only does on explicit config or
+/// lifecycle events, never mid-turn. This is a pure read; server startup is
+/// driven from `send` so a context poll never spawns a process.
+fn mcp_access_for(state: &Arc<AppState>, session: &CodingSession) -> coding::McpAccess {
+    if !session.mcp_enabled {
+        return coding::McpAccess::disabled();
+    }
+    coding::McpAccess::frozen(state.mcp.clone())
 }
 
 async fn calculate_context(state: &Arc<AppState>, session: &CodingSession) -> Result<CodingContextInfo, String> {
@@ -355,8 +435,11 @@ async fn calculate_context(state: &Arc<AppState>, session: &CodingSession) -> Re
     let cx = CodingContext {
         workspace,
         policy: coding::ApprovalPolicy::parse(&session.approval_policy),
+        mcp: mcp_access_for(state, session),
     };
     let built = build_context(state, &cx, session).await?;
+    let mcp_tools = built.mcp_tools;
+    let mcp_schema_tokens = built.mcp_schema_tokens;
     let (_, settings) = state.model_settings(&session.model).await.map_err(|e| e.to_string())?;
     let max = state.runtime.context_size_for_model(&session.model, &settings).await;
     let options = settings.context_size.map(|size| json!({ "num_ctx": size }));
@@ -373,7 +456,14 @@ async fn calculate_context(state: &Arc<AppState>, session: &CodingSession) -> Re
             count.tokens = ((count.tokens as f32) * scale).ceil().min(u32::MAX as f32) as u32;
         }
     }
-    Ok(context_info(session, count.tokens, max, count.exact))
+    Ok(context_info(
+        session,
+        count.tokens,
+        max,
+        count.exact,
+        mcp_tools,
+        mcp_schema_tokens,
+    ))
 }
 
 async fn refresh_context(
@@ -569,7 +659,13 @@ async fn run_turn(
     cancel: Arc<AtomicBool>,
 ) -> anyhow::Result<TurnOutput> {
     let (_, load_settings) = state.model_settings(model).await?;
-    let BuiltContext { mut messages, tools_value, prompt_tool_mode, tool_names } = built;
+    let BuiltContext {
+        mut messages,
+        tools_value,
+        prompt_tool_mode,
+        tool_names,
+        ..
+    } = built;
     let options = load_settings.context_size.map(|size| json!({ "num_ctx": size }));
 
     let mut out = TurnOutput {
@@ -849,13 +945,13 @@ mod tests {
     #[test]
     fn context_budget_levels_track_actual_fill() {
         let session = CodingSession::new("model".into(), "/tmp".into(), "read_only".into());
-        let normal = context_info(&session, 10_000, 32_000, true);
+        let normal = context_info(&session, 10_000, 32_000, true, 0, 0);
         assert_eq!(normal.reserve_tokens, 3_200);
         assert_eq!(normal.level, "normal");
 
-        let orange = context_info(&session, 23_000, 32_000, true);
+        let orange = context_info(&session, 23_000, 32_000, true, 0, 0);
         assert_eq!(orange.level, "orange");
-        let red = context_info(&session, 29_000, 32_000, true);
+        let red = context_info(&session, 29_000, 32_000, true, 0, 0);
         assert_eq!(red.level, "red");
     }
 

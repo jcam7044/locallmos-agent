@@ -8,6 +8,7 @@ import { DownloadBanner } from "./downloads/DownloadBanner";
 import type { AgentStatus, DownloadState, LocalStatus } from "./types";
 import { useTabWindowSize, type Tab } from "./useTabWindowSize";
 import { ModelsView } from "./models/ModelsView";
+import { ToolsView } from "./tools/ToolsView";
 
 export function App() {
   const [tab, setTab] = useState<Tab>("dashboard");
@@ -84,6 +85,9 @@ export function App() {
         <TabButton active={tab === "code"} onClick={() => setTab("code")}>
           Code
         </TabButton>
+        <TabButton active={tab === "tools"} onClick={() => setTab("tools")}>
+          Tools
+        </TabButton>
       </nav>
 
       {tab === "dashboard" ? (
@@ -100,6 +104,8 @@ export function App() {
         />
       ) : tab === "code" ? (
         <CodingView models={local?.models ?? []} />
+      ) : tab === "tools" ? (
+        <ToolsView />
       ) : (
         <ModelsView local={local} onChanged={refresh} />
       )}

@@ -53,6 +53,7 @@ export function ModelsView({ local, onChanged }: { local: LocalStatus | null; on
   const [authorAvatars, setAuthorAvatars] = useState<Record<string, string>>({});
   const [modelAction, setModelAction] = useState<{ id: string; type: LocalModelAction } | null>(null);
   const [settingsModel, setSettingsModel] = useState<LocalModel | null>(null);
+  const [removalModel, setRemovalModel] = useState<LocalModel | null>(null);
   const request = useRef(0);
   const isOllama = local?.runtime.kind === "ollama";
 
@@ -171,7 +172,13 @@ export function ModelsView({ local, onChanged }: { local: LocalStatus | null; on
   };
 
   const remove = async (model: LocalModel) => {
-    if (!window.confirm(`Remove ${model.name} from this device? This deletes its downloaded files.`)) return;
+    setRemovalModel(model);
+  };
+
+  const confirmRemove = async () => {
+    const model = removalModel;
+    if (!model) return;
+    setRemovalModel(null);
     setError(null);
     setModelAction({ id: model.id, type: "remove" });
     try {
@@ -254,6 +261,7 @@ export function ModelsView({ local, onChanged }: { local: LocalStatus | null; on
         </div>
       ) : <OnDevice models={local?.models ?? []} runtimeKind={local?.runtime.kind} onSelect={selectDevice} action={modelAction} onLoad={load} onEject={eject} onRemove={remove} onSettings={local?.runtime.kind === "llamacpp" ? setSettingsModel : undefined} />}
       {settingsModel && <ModelLoadSettingsDialog model={settingsModel} onClose={() => setSettingsModel(null)} onChanged={onChanged} />}
+      {removalModel && <ModelRemovalDialog model={removalModel} onCancel={() => setRemovalModel(null)} onConfirm={() => void confirmRemove()} />}
     </main>
   );
 }
@@ -433,7 +441,7 @@ function OnDevice({ models, runtimeKind, onSelect, action, onLoad, onEject, onRe
       <button className="hub-device-select" onClick={() => onSelect(model)} disabled={!model.sourceRepo}>
         <span className="hub-device-icon">◫</span><span><strong>{model.name}</strong><small>{model.sourceRepo ?? (runtimeKind === "ollama" ? "Ollama" : "Local GGUF")}</small><em>{model.quantization ?? (runtimeKind === "ollama" ? "Managed model" : "GGUF")} · {formatBytes(model.sizeBytes)}</em></span><b className={model.loaded ? "loaded" : ""}>{model.loaded ? "Loaded" : "On Device"}</b>
       </button>
-      <ModelAction model={model} action={localModelAction(action, model.id)} onLoad={onLoad} onEject={onEject} onRemove={onRemove} onSettings={onSettings} canRemove={runtimeKind === "ollama"} compact />
+      <ModelAction model={model} action={localModelAction(action, model.id)} onLoad={onLoad} onEject={onEject} onRemove={onRemove} onSettings={onSettings} canRemove compact />
     </article>)}</div> : <Empty title="No models on device" body={runtimeKind === "ollama" ? "Pull a model from Ollama to get started." : "Download a GGUF model or place one in the llama.cpp models directory."} />}
   </section>;
 }
@@ -453,12 +461,36 @@ function ModelAction({ model, action, onLoad, onEject, onRemove, onSettings, can
   </div>;
 }
 
+export function ModelRemovalDialog({ model, onCancel, onConfirm }: { model: LocalModel; onCancel: () => void; onConfirm: () => void }) {
+  return <div className="hub-settings-backdrop" role="presentation" onMouseDown={onCancel}>
+    <section className="hub-removal-dialog" role="dialog" aria-modal="true" aria-labelledby="model-removal-title" onMouseDown={(event) => event.stopPropagation()}>
+      <header>
+        <h3 id="model-removal-title">Remove model?</h3>
+        <button aria-label="Cancel removing model" onClick={onCancel}>×</button>
+      </header>
+      <div>
+        <p>Remove <strong>{model.name}</strong> from this device?</p>
+        <p className="hub-removal-warning">This permanently deletes {formatBytes(model.sizeBytes)} of downloaded model files. This cannot be undone.</p>
+      </div>
+      <footer>
+        <span />
+        <button onClick={onCancel}>Cancel</button>
+        <button className="danger" onClick={onConfirm}>Remove model</button>
+      </footer>
+    </section>
+  </div>;
+}
+
 export function localModelAction(action: { id: string; type: LocalModelAction } | null, modelId: string | undefined): LocalModelAction | null {
   return action && action.id === modelId ? action.type : null;
 }
 
 export function isLocalModelRemovable(model: LocalModel, runtimeManaged = false) {
-  return runtimeManaged || (!!model.sourceRepo && !!model.revision && !!model.variantId);
+  // Every model shown here was found in the active runtime's local model store.
+  // The backend resolves the stable id again before deleting files, so models
+  // downloaded outside the Hub (and older Hub downloads without a manifest)
+  // are removable too.
+  return runtimeManaged || !!model.id;
 }
 
 export const recommendedModelLoadSettings = (): ModelLoadSettings => ({

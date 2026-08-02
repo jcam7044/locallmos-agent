@@ -302,6 +302,12 @@ fn parse_dsl_value(v: &str) -> Value {
 /// (split on `_ - .`) with exactly one known tool — so `search`/`google_search`
 /// resolve to `web_search`, `fetch` to `web_fetch_page`, while an ambiguous
 /// token like `web` (shared by both) resolves to nothing.
+///
+/// MCP tools (`mcp__server__tool`) are excluded from the fuzzy pass: their names
+/// share generic tokens (`search`, `read`, `file`) with the built-ins, so
+/// including them would make almost every near-miss ambiguous and silently break
+/// recovery for the built-in tools too. MCP tools must be called by their exact
+/// qualified name — reasonable, since those names are not guessable anyway.
 fn resolve_name(called: &str, known: &[String]) -> Option<String> {
     let c = called.trim().to_lowercase();
     if c.is_empty() {
@@ -313,6 +319,9 @@ fn resolve_name(called: &str, known: &[String]) -> Option<String> {
     let ctoks = tokens(&c);
     let mut hit: Option<&String> = None;
     for k in known {
+        if k.starts_with(crate::mcp::MCP_PREFIX) {
+            continue; // fuzzy-match built-ins only; MCP tools need an exact name
+        }
         let ktoks = tokens(&k.to_lowercase());
         if ctoks.iter().any(|t| ktoks.contains(t)) {
             if hit.is_some() {
@@ -520,6 +529,31 @@ mod tests {
         assert!(parse_text_tool_calls("{\"name\": \"web\", \"q\": \"x\"}", &known()).is_empty());
         // Unrelated JSON answer stays an answer.
         assert!(parse_text_tool_calls("{\"name\": \"Bob\", \"age\": 3}", &known()).is_empty());
+    }
+
+    /// Regression: an MCP tool sharing a generic token (`search`) with a built-in
+    /// must not make the built-in's fuzzy recovery ambiguous, and must not be
+    /// fuzzily resolved itself — only its exact qualified name works.
+    #[test]
+    fn mcp_tools_do_not_poison_builtin_fuzzy_matching() {
+        let known = vec![
+            "search".to_string(),
+            "read_file".to_string(),
+            "mcp__github__search_code".to_string(),
+        ];
+        // Bare `search` still resolves to the built-in despite the MCP tool also
+        // owning a `search` token.
+        let calls = parse_text_tool_calls("{\"name\": \"search\", \"query\": \"x\"}", &known);
+        assert_eq!(calls[0].name, "search");
+        // The MCP tool resolves only by its exact qualified name.
+        let exact = parse_text_tool_calls(
+            "{\"name\": \"mcp__github__search_code\", \"query\": \"x\"}",
+            &known,
+        );
+        assert_eq!(exact[0].name, "mcp__github__search_code");
+        // A token unique to the MCP tool (`github`) does not fuzzy-resolve to it;
+        // MCP tools are exact-match only.
+        assert!(parse_text_tool_calls("{\"name\": \"github_code\", \"q\": \"x\"}", &known).is_empty());
     }
 
     #[test]

@@ -16,6 +16,7 @@ import {
   codingPreviewStatus,
   codingSend,
   codingSetPolicy,
+  codingSetMcpEnabled,
   codingSetContextSettings,
 } from "../api";
 import type { ApprovalPolicy, CodingContextInfo, CodingEvent, CodingPreviewStatus, CodingSessionMeta, CodingStoredMessage, ModelOption } from "../types";
@@ -38,6 +39,7 @@ export function CodingView({ models }: { models: ModelOption[] }) {
   const [error, setError] = useState<string | null>(null);
   // Mode + attachments belong to the active session, so both reload with it.
   const [policy, setPolicy] = useState<ApprovalPolicy>("approve_writes");
+  const [mcpEnabled, setMcpEnabled] = useState(false);
   const [attachments, setAttachments] = useState<string[]>([]);
   const [preview, setPreview] = useState<CodingPreviewStatus | null>(null);
   const [contextInfo, setContextInfo] = useState<CodingContextInfo | null>(null);
@@ -73,6 +75,7 @@ export function CodingView({ models }: { models: ModelOption[] }) {
       const session = await codingGetSession(id);
       setMessages(Array.isArray(session?.messages) ? session.messages : []);
       if (session?.approvalPolicy) setPolicy(session.approvalPolicy);
+      setMcpEnabled(session?.mcpEnabled ?? false);
     } catch (e) {
       setError(String(e));
     }
@@ -116,6 +119,18 @@ export function CodingView({ models }: { models: ModelOption[] }) {
       await refreshSessions();
     } catch (e) {
       setPolicy(previous);
+      setError(String(e));
+    }
+  }
+
+  async function toggleMcp(next: boolean) {
+    if (!activeId) return;
+    const previous = mcpEnabled;
+    setMcpEnabled(next); // optimistic
+    try {
+      await codingSetMcpEnabled(activeId, next);
+    } catch (e) {
+      setMcpEnabled(previous);
       setError(String(e));
     }
   }
@@ -353,6 +368,8 @@ export function CodingView({ models }: { models: ModelOption[] }) {
               onStop={() => requestIdRef.current && codingCancel(requestIdRef.current)}
               policy={policy}
               onPolicyChange={(p) => void changePolicy(p)}
+              mcpEnabled={mcpEnabled}
+              onMcpToggle={(v) => void toggleMcp(v)}
               sessionId={activeId}
               attachments={attachments}
               setAttachments={setAttachments}

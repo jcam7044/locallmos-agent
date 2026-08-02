@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { renderToStaticMarkup } from "react-dom/server";
 import type { HubModelDetail, LocalModel, LocalStatus } from "../types";
-import { isLocalModelRemovable, isRecommendedModelLoadSettings, isVariantOnDevice, localModelAction, ModelCardReadme, ModelsView, modelLoadSettingsError, modelLogo, recommendedModelLoadSettings, variantsBySizeAscending } from "./ModelsView";
+import { isLocalModelRemovable, isRecommendedModelLoadSettings, isVariantOnDevice, localModelAction, ModelCardReadme, ModelRemovalDialog, ModelsView, modelLoadSettingsError, modelLogo, recommendedModelLoadSettings, variantsBySizeAscending } from "./ModelsView";
 
 function detail(readmeMarkdown: string): HubModelDetail {
   return {
@@ -108,9 +108,9 @@ describe("Ollama model management", () => {
     expect(html).not.toContain("Popular GGUF Models");
   });
 
-  it("allows runtime-managed Ollama models to be removed without Hub metadata", () => {
+  it("allows discovered local models to be removed without Hub metadata", () => {
     expect(isLocalModelRemovable(ollamaModel, true)).toBe(true);
-    expect(isLocalModelRemovable(ollamaModel, false)).toBe(false);
+    expect(isLocalModelRemovable(ollamaModel, false)).toBe(true);
   });
 });
 
@@ -119,5 +119,15 @@ describe("model action labels", () => {
     expect(localModelAction({ id: "model-a", type: "load" }, "model-a")).toBe("load");
     expect(localModelAction({ id: "model-a", type: "load" }, "model-b")).toBeNull();
     expect(localModelAction({ id: "model-a", type: "eject" }, "model-a")).toBe("eject");
+  });
+});
+
+describe("model removal confirmation", () => {
+  it("requires explicit confirmation before removing model files", () => {
+    const model: LocalModel = { id: "model-q4", name: "Model Q4", sizeBytes: 4_000_000_000, quantization: "Q4", loaded: false, capabilities: [], sourceRepo: null, revision: null, variantId: null, files: ["model-q4.gguf"] };
+    const html = renderToStaticMarkup(<ModelRemovalDialog model={model} onCancel={() => undefined} onConfirm={() => undefined} />);
+    expect(html).toContain("Remove model?");
+    expect(html).toContain("This cannot be undone.");
+    expect(html).toContain("Remove model");
   });
 });

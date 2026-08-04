@@ -16,7 +16,7 @@
 # backend (no fallback).
 
 # Production locallmos.com backend is baked in as the default (both values are
-# public — the anon key ships in the web bundle and is gated by RLS). Override
+# public - the anon key ships in the web bundle and is gated by RLS). Override
 # with -SupabaseUrl / -AnonKey or the LOCALLMOS_SUPABASE_* env vars.
 param(
   [string]$Repo        = $(if ($env:LOCALLMOS_REPO) { $env:LOCALLMOS_REPO } else { "jcam7044/locallmos-agent" }),
@@ -88,7 +88,33 @@ if ($expected -ne $actual) {
 }
 
 Write-Host "==> Installing to $binDst"
-Copy-Item $tmp $binDst -Force
+
+# Windows locks a running executable's on-disk file, so upgrading over a live
+# agent fails with "being used by another process". Stop the startup task (its
+# supervised `service` loop) and any running agent (tray or service) first.
+function Stop-RunningAgent {
+  if (Get-ScheduledTask -TaskName "LocalLMOS Agent" -ErrorAction SilentlyContinue) {
+    Write-Host "   stopping startup task 'LocalLMOS Agent'"
+    Stop-ScheduledTask -TaskName "LocalLMOS Agent" -ErrorAction SilentlyContinue
+  }
+  $running = @(Get-Process -Name "locallmos-agent" -ErrorAction SilentlyContinue)
+  if ($running.Count -gt 0) {
+    Write-Host "   stopping $($running.Count) running agent process(es)"
+    $running | Stop-Process -Force -ErrorAction SilentlyContinue
+  }
+}
+Stop-RunningAgent
+
+# The OS may take a moment to release the file lock after the process exits, so
+# retry the copy for a few seconds before giving up.
+$copied = $false
+for ($i = 0; $i -lt 10; $i++) {
+  try { Copy-Item $tmp $binDst -Force; $copied = $true; break }
+  catch { Start-Sleep -Milliseconds 500 }
+}
+if (-not $copied) {
+  throw "could not overwrite $binDst - the agent may still be running. Stop it (Stop-ScheduledTask -TaskName 'LocalLMOS Agent'; Stop-Process -Name locallmos-agent -Force) and re-run the installer."
+}
 
 function Test-EnrolledConfig([string]$ConfigJson) {
   return (Test-Path $ConfigJson) -and (Select-String -Path $ConfigJson -Pattern "refresh_secret" -Quiet)
@@ -133,6 +159,10 @@ function Resolve-PinnedLlamaCppVersion([string]$Repo, [string]$Ref, [string]$Fal
 # else "" (too old / no NVIDIA -> not cuda).
 function Get-CudaVariant {
   if (-not (Get-Command nvidia-smi -ErrorAction SilentlyContinue)) { return "" }
+  # Same NativeCommandError trap as Test-LlamaServer: under the script-wide
+  # $ErrorActionPreference='Stop', '2>&1' on nvidia-smi's stderr would abort the
+  # whole installer. Neutralize it locally (function-scoped).
+  $ErrorActionPreference = 'SilentlyContinue'
   $out = (& nvidia-smi 2>&1 | Out-String)
   if ($out -match 'CUDA Version:\s*(\d+)\.(\d+)') {
     $maj = [int]$Matches[1]; $min = [int]$Matches[2]
@@ -207,8 +237,14 @@ function Find-LlamaServer([string]$Root) {
 }
 
 function Test-LlamaServer([string]$Bin) {
+  # llama-server writes its --version banner to stderr. Under the script-wide
+  # $ErrorActionPreference='Stop', a naive '2>&1' capture turns that stderr line
+  # into a terminating NativeCommandError, so a perfectly good binary (exit 0)
+  # would fail the smoke test. Neutralize error handling locally (function-scoped)
+  # and trust the real process exit code.
+  $ErrorActionPreference = 'SilentlyContinue'
   try {
-    $null = & $Bin --version 2>&1
+    & $Bin --version 2>&1 | Out-Null
     return ($LASTEXITCODE -eq 0)
   } catch { return $false }
 }
@@ -349,7 +385,7 @@ if ($mode -eq "desktop") {
 
   $configJson = Get-UserConfigJson
   if (Test-EnrolledConfig $configJson) {
-    Write-Host "==> Already enrolled — skipping enrollment"
+    Write-Host "==> Already enrolled - skipping enrollment"
   } elseif ($Code -ne "") {
     Write-Host "==> Enrolling desktop app as '$Name'"
     & $binDst enroll --code $Code --name $Name
@@ -393,7 +429,7 @@ if ($mode -eq "desktop") {
   $configJson = Join-Path $configDir "config.json"
   $serviceReady = $false
   if (Test-EnrolledConfig $configJson) {
-    Write-Host "==> Already enrolled — skipping enrollment"
+    Write-Host "==> Already enrolled - skipping enrollment"
     $serviceReady = $true
   } elseif ($Code -ne "") {
     Write-Host "==> Enrolling as '$Name'"
@@ -428,7 +464,7 @@ if ($mode -eq "desktop") {
 # ---- runtime check ---------------------------------------------------------
 if ($Runtime -eq "llamacpp") {
   Write-Host ""
-  Write-Host "==> Runtime: llama.cpp (llama-server, backend=$($llama.Backend)) — $($llama.Bin)"
+  Write-Host "==> Runtime: llama.cpp (llama-server, backend=$($llama.Backend)) - $($llama.Bin)"
   Write-Host "   Add a .gguf to $($llama.ModelsDir), then select it in the dashboard."
 } elseif (-not (Get-Command ollama -ErrorAction SilentlyContinue)) {
   Write-Host ""

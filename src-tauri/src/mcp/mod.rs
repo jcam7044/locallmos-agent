@@ -33,7 +33,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
-pub use config::{McpServerConfig, McpTransport, McpTrust};
+pub use config::{McpOrigin, McpServerConfig, McpTransport, McpTrust};
 
 use protocol::{CallToolResult, McpTool};
 use stdio::StdioClient;
@@ -691,6 +691,7 @@ mod tests {
             trust,
             disabled_tools: vec![],
             catalog_id: None,
+            origin: McpOrigin::Local,
         }
     }
 
@@ -921,6 +922,7 @@ for line in sys.stdin:
             trust: McpTrust::Untrusted,
             disabled_tools: vec![],
             catalog_id: None,
+            origin: McpOrigin::Local,
         };
         manager.set_configs(vec![config]).await;
         manager.start("fx").await.expect("server should start");

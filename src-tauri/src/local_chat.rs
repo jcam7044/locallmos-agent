@@ -200,15 +200,20 @@ async fn tool_definitions(
         }
     }
 
-    // Read-only MCP tools from trusted servers. Chat has no approval gate, so
-    // only non-mutating tools are ever offered here; mutating work belongs in the
-    // coding harness. Start the servers first so the snapshot reflects them.
+    // MCP tools from configured servers. Offline chat has no cross-device
+    // approval, so a mutating tool is offered only when its server is explicitly
+    // Trusted — the user's trust is the authorization (mirroring how trust
+    // downgrades the approval pause in the coding harness). This is what lets an
+    // offline agent write findings into, e.g., a local Supabase the user trusts.
+    // Read-only tools from any server are always offered. Start the servers first
+    // so the snapshot reflects them.
     if session.settings.mcp && native_tools {
         if start_servers {
             state.mcp.ensure_enabled_started().await;
         }
+        let trusted = trusted_server_ids(state).await;
         for tool in &state.mcp.snapshot().tools {
-            if !tool.mutating {
+            if !tool.mutating || trusted.contains(&tool.server_id) {
                 tool_defs.push(tool.to_ollama_def());
             }
         }
@@ -448,29 +453,50 @@ async fn run_turn(
 /// Cap on MCP tool output fed back into a chat turn.
 const MCP_CHAT_OUTPUT_CHARS: usize = 20_000;
 
-/// Execute an MCP tool for a chat turn. Chat has no approval gate, so a mutating
-/// tool is refused here even if the model conjures its name — only read-only
-/// tools from trusted servers are ever offered. Result text is capped.
+/// The ids of MCP servers the user has marked Trusted. Offline chat treats trust
+/// as authorization for a mutating tool, since there is no approval step.
+async fn trusted_server_ids(state: &Arc<AppState>) -> std::collections::HashSet<String> {
+    state
+        .config
+        .lock()
+        .await
+        .mcp_servers
+        .iter()
+        .filter(|s| s.trust == crate::mcp::McpTrust::Trusted)
+        .map(|s| s.id.clone())
+        .collect()
+}
+
+/// Execute an MCP tool for a chat turn. Offline chat has no approval gate, so a
+/// mutating tool runs only when its server is Trusted (its writes were authorized
+/// by that trust); an untrusted server's mutating tool is refused even if the
+/// model conjures its name. Result text is capped.
 async fn run_mcp(state: &Arc<AppState>, call: &ToolCall) -> (String, Option<Value>, String) {
     let snapshot = state.mcp.snapshot();
-    match snapshot.find(&call.name) {
-        None => (
+    let tool = match snapshot.find(&call.name) {
+        None => {
+            return (
+                format!(
+                    "{} is not an available tool in this chat. Answer without it, or enable the server in the Tools tab.",
+                    call.name
+                ),
+                None,
+                "unavailable".into(),
+            );
+        }
+        Some(tool) => tool,
+    };
+    if tool.mutating && !trusted_server_ids(state).await.contains(&tool.server_id) {
+        return (
             format!(
-                "{} is not an available tool in this chat. Answer without it, or enable the server in the Tools tab.",
-                call.name
-            ),
-            None,
-            "unavailable".into(),
-        ),
-        Some(tool) if tool.mutating => (
-            format!(
-                "{} changes state and is not available in chat (no approval step). Use a coding session for actions that modify data.",
+                "{} changes state and is not available in offline chat unless you mark its server Trusted in the Tools tab. Trust it to allow writes here, or use a coding session.",
                 call.name
             ),
             None,
             "blocked (mutating)".into(),
-        ),
-        Some(_) => match state.mcp.call_tool(&call.name, &call.arguments).await {
+        );
+    }
+    match state.mcp.call_tool(&call.name, &call.arguments).await {
             Ok(outcome) => {
                 let mut text = outcome.text;
                 if text.chars().count() > MCP_CHAT_OUTPUT_CHARS {
@@ -501,7 +527,6 @@ async fn run_mcp(state: &Arc<AppState>, call: &ToolCall) -> (String, Option<Valu
                 })),
                 "error".into(),
             ),
-        },
     }
 }
 

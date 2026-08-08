@@ -333,6 +333,14 @@ pub async fn process(state: &Arc<AppState>, pending: ChatPending) -> Result<()> 
     } else {
         Vec::new()
     };
+    // A plain chat turn (no coding workspace) can still carry the rig's MCP tools
+    // from the control-plane snapshot (0048) — e.g. a scheduled research agent's
+    // bound Supabase server. Warm the enabled servers so the first call is fast;
+    // call_tool would otherwise lazily connect on demand. Coding turns already
+    // start MCP during coding-context setup.
+    if coding_ctx.is_none() && platform_tools.iter().any(|t| t.provider == "mcp") {
+        state.mcp.ensure_enabled_started().await;
+    }
     let mut tool_defs: Vec<Value> = Vec::new();
     if !platform_tools.is_empty() {
         tool_defs.extend(tools::platform_defs(&platform_tools));
@@ -739,6 +747,12 @@ async fn run_local_tool(
     tool: &tools::PlatformTool,
     call: &ToolCall,
 ) -> (String, Option<Value>, String) {
+    // MCP tools run against the rig's local MCP client. In a coding turn they go
+    // through the coding harness (which owns the workspace context); in a plain
+    // chat turn there is no workspace, so dispatch them directly here.
+    if tool.provider == "mcp" && coding_ctx.is_none() {
+        return run_mcp_tool_direct(state, token, message_id, tx, cancel, tool, call).await;
+    }
     let Some(cx) = coding_ctx else {
         return (
             "coding tools are unavailable for this turn".into(),
@@ -807,6 +821,98 @@ async fn run_local_tool(
         .await
         .ok();
     (run.content, run.activity, run.summary)
+}
+
+/// Execute one MCP tool in a chat turn (no coding workspace) against the rig's
+/// local MCP client. Mutating tools — flagged `approvalRequired` in the
+/// control-plane snapshot — pause on the same cross-device approval flow as
+/// coding tools; an autonomous profile clears that flag (0048) so the call runs
+/// unattended (the scheduled research→store path).
+#[allow(clippy::too_many_arguments)]
+async fn run_mcp_tool_direct(
+    state: &Arc<AppState>,
+    token: &str,
+    message_id: &str,
+    tx: &tokio::sync::mpsc::UnboundedSender<StreamDelta>,
+    cancel: &Arc<AtomicBool>,
+    tool: &tools::PlatformTool,
+    call: &ToolCall,
+) -> (String, Option<Value>, String) {
+    let invocation_id = Uuid::new_v4().to_string();
+    let args_hash = sha256_hex(&call.arguments);
+
+    if tool.approval_required {
+        let preview = mcp_call_preview(&call.name, &call.arguments);
+        state
+            .supabase
+            .create_tool_invocation(
+                token, message_id, &invocation_id, None, "mcp", &args_hash,
+                Some(&preview), &call.name, true,
+            )
+            .await
+            .ok();
+        let _ = tx.send(StreamDelta::Event(json!({
+            "type": "approval_needed", "invocationId": invocation_id,
+            "name": call.name, "preview": preview,
+        })));
+        let decision = await_decision(state, token, &invocation_id, cancel).await;
+        let _ = tx.send(StreamDelta::Event(json!({
+            "type": "approval_resolved", "invocationId": invocation_id, "decision": decision,
+        })));
+        if decision != "approved" {
+            state
+                .supabase
+                .finalize_tool_invocation(token, &invocation_id, "cancelled", &decision)
+                .await
+                .ok();
+            return (
+                format!(
+                    "The user denied the {} action. Do not retry it; propose an alternative or ask the user how to proceed.",
+                    call.name
+                ),
+                None,
+                "denied".into(),
+            );
+        }
+    } else {
+        state
+            .supabase
+            .create_tool_invocation(
+                token, message_id, &invocation_id, None, "mcp", &args_hash,
+                None, &call.name, false,
+            )
+            .await
+            .ok();
+    }
+
+    match state.mcp.call_tool(&call.name, &call.arguments).await {
+        Ok(outcome) => {
+            let summary = if outcome.is_error { "error" } else { "ok" };
+            let status = if outcome.is_error { "failed" } else { "succeeded" };
+            state
+                .supabase
+                .finalize_tool_invocation(token, &invocation_id, status, summary)
+                .await
+                .ok();
+            (outcome.text, None, summary.into())
+        }
+        Err(e) => {
+            let msg = format!("MCP tool '{}' failed: {e}", call.name);
+            state
+                .supabase
+                .finalize_tool_invocation(token, &invocation_id, "failed", "error")
+                .await
+                .ok();
+            (msg, None, "error".into())
+        }
+    }
+}
+
+/// A compact, human-readable preview of an MCP call for the approval card.
+fn mcp_call_preview(name: &str, args: &Value) -> String {
+    let rendered = serde_json::to_string_pretty(args).unwrap_or_else(|_| args.to_string());
+    let truncated: String = rendered.chars().take(800).collect();
+    format!("{name}\n{truncated}")
 }
 
 /// Poll the invocation's decision until it is approved/denied, the turn is

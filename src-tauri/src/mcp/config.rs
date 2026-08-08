@@ -25,6 +25,22 @@ pub struct McpServerConfig {
     /// If installed from the built-in catalog, the entry id it came from.
     #[serde(default)]
     pub catalog_id: Option<String>,
+    /// Where this config came from. Cloud servers are web-authored (0048) and
+    /// owned by the reconcile loop; Local servers are added on this device and
+    /// the reconcile never touches them. Absent in older config.json ⇒ Local.
+    #[serde(default)]
+    pub origin: McpOrigin,
+}
+
+/// The authority for a server's configuration.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpOrigin {
+    /// Added on this device (Tools tab). Survives cloud reconcile untouched.
+    #[default]
+    Local,
+    /// Web-authored and pulled via mcp-desired; managed by the reconcile loop.
+    Cloud,
 }
 
 /// How the agent reaches a server. Only `Stdio` is honored in v1; the
@@ -116,6 +132,7 @@ mod tests {
             trust: McpTrust::Untrusted,
             disabled_tools: vec![],
             catalog_id: None,
+            origin: McpOrigin::Local,
         }
     }
 

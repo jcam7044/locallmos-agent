@@ -52,6 +52,28 @@ pub struct DesiredState {
     pub desired_runtime_state: Option<String>,
 }
 
+/// One web-authored MCP server the rig should run (0048), as returned by the
+/// `mcp-desired` function. `secrets` are decrypted values (e.g. an access token)
+/// merged into the catalog entry's inputs at reconcile time. `version` bumps on
+/// every save so the rig re-applies only on change.
+#[derive(Deserialize, Default, Clone)]
+pub struct DesiredMcpServer {
+    #[serde(rename = "serverId")]
+    pub server_id: String,
+    #[serde(rename = "catalogId")]
+    pub catalog_id: String,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub inputs: std::collections::BTreeMap<String, Value>,
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub secrets: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub version: String,
+}
+
 /// A published agent release. `artifacts` is a `{ "os-arch": { url, sha256, sig } }`
 /// map — the agent picks the entry matching its own platform.
 #[derive(Deserialize, Clone)]
@@ -329,6 +351,24 @@ impl Supabase {
             .await?;
         let rows: Vec<DesiredState> = resp.json().await?;
         Ok(rows.into_iter().next().unwrap_or_default())
+    }
+
+    /// Pull the web-authored MCP server config for this rig (0048). The rig is
+    /// resolved from the device token server-side; secrets come back decrypted
+    /// because the rig must spawn each local MCP process with them.
+    pub async fn fetch_desired_mcp(&self, token: &str) -> Result<Vec<DesiredMcpServer>> {
+        let resp = self
+            .auth(self.http.get(format!("{}/mcp-desired", self.functions)), token)
+            .send()
+            .await?;
+        let status = resp.status();
+        let v: Value = resp.json().await.unwrap_or_else(|_| json!({}));
+        if !status.is_success() {
+            let detail = v.get("error").and_then(Value::as_str).unwrap_or("mcp-desired failed");
+            return Err(anyhow!("mcp-desired: {detail}"));
+        }
+        let servers = v.get("servers").cloned().unwrap_or_else(|| json!([]));
+        Ok(serde_json::from_value(servers).unwrap_or_default())
     }
 
     // ---- self-update ----------------------------------------------------

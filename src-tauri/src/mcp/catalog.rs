@@ -10,7 +10,7 @@ use anyhow::{anyhow, Result};
 use serde::Serialize;
 use std::collections::BTreeMap;
 
-use super::config::{McpServerConfig, McpTransport, McpTrust};
+use super::config::{McpOrigin, McpServerConfig, McpTransport, McpTrust};
 
 /// The launcher a catalog entry needs on PATH.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -73,11 +73,13 @@ impl CatalogEntry {
     }
 
     /// The exact command line that will run, for the confirmation dialog. Secret
-    /// values are elided.
+    /// values are elided (secrets are passed as env, never as args).
     pub fn preview_command(&self, inputs: &BTreeMap<String, String>) -> String {
         let mut parts = vec![self.launcher().to_string()];
         for arg in self.args {
-            parts.push(substitute(arg, inputs, self.inputs));
+            if let Some(rendered) = render_arg(arg, inputs) {
+                parts.push(rendered);
+            }
         }
         parts.join(" ")
     }
@@ -95,14 +97,13 @@ impl CatalogEntry {
             }
         }
 
-        let args: Vec<String> =
-            self.args.iter().map(|a| substitute(a, inputs, self.inputs)).collect();
+        let args: Vec<String> = self.args.iter().filter_map(|a| render_arg(a, inputs)).collect();
 
         let mut env = BTreeMap::new();
         let mut secrets = BTreeMap::new();
         for spec in self.inputs {
             // Placeholder inputs are consumed by the args template, not env.
-            if self.args.iter().any(|a| a.contains(&format!("{{{}}}", spec.key))) {
+            if self.args.iter().any(|a| arg_uses_key(a, spec.key)) {
                 continue;
             }
             let Some(value) = inputs.get(spec.key).filter(|v| !v.is_empty()) else { continue };
@@ -121,21 +122,56 @@ impl CatalogEntry {
             trust: self.default_trust,
             disabled_tools: vec![],
             catalog_id: Some(self.id.to_string()),
+            // The reconcile loop overrides this to Cloud for web-authored servers.
+            origin: McpOrigin::Local,
         };
         Ok((config, secrets))
     }
 }
 
-fn substitute(arg: &str, inputs: &BTreeMap<String, String>, specs: &[InputSpec]) -> String {
-    let mut out = arg.to_string();
-    for spec in specs {
-        let token = format!("{{{}}}", spec.key);
-        if out.contains(&token) {
-            let value = inputs.get(spec.key).cloned().unwrap_or_default();
-            out = out.replace(&token, &value);
-        }
+/// A conditional-flag or optional value counts as truthy when the input is a
+/// non-empty value that is not an explicit falsey token.
+fn is_truthy(value: &str) -> bool {
+    !matches!(value.trim().to_ascii_lowercase().as_str(), "" | "false" | "0" | "no" | "off")
+}
+
+/// Does `arg` reference input `key` in any templating form (`{key}`, `{key?}`,
+/// or the conditional flag `{+key:…}`)? Used to decide whether an input is
+/// consumed by the args template (vs. passed as env/secret).
+fn arg_uses_key(arg: &str, key: &str) -> bool {
+    arg.contains(&format!("{{{key}}}"))
+        || arg.contains(&format!("{{{key}?}}"))
+        || arg.contains(&format!("{{+{key}:"))
+}
+
+/// Render one arg template against the supplied inputs, returning `None` when the
+/// whole arg should be omitted:
+/// - `{+key:--flag}` — conditional flag: emit `--flag` iff `key` is truthy.
+/// - `…{key?}…` — optional value: omit the whole arg if `key` is empty.
+/// - `…{key}…` — plain value substitution (empty allowed), the legacy behavior.
+fn render_arg(arg: &str, inputs: &BTreeMap<String, String>) -> Option<String> {
+    if let Some(rest) = arg.strip_prefix("{+").and_then(|s| s.strip_suffix('}')) {
+        let (key, literal) = rest.split_once(':')?;
+        let value = inputs.get(key).map(String::as_str).unwrap_or("");
+        return is_truthy(value).then(|| literal.to_string());
     }
-    out
+    let mut out = arg.to_string();
+    let mut cursor = 0;
+    while let Some(rel) = out[cursor..].find('{') {
+        let open = cursor + rel;
+        let Some(close_rel) = out[open..].find('}') else { break };
+        let close = open + close_rel;
+        let token = &out[open + 1..close];
+        let optional = token.ends_with('?');
+        let key = token.trim_end_matches('?');
+        let value = inputs.get(key).cloned().unwrap_or_default();
+        if optional && value.is_empty() {
+            return None; // an unset optional value drops the entire arg
+        }
+        out.replace_range(open..=close, &value);
+        cursor = open + value.len();
+    }
+    Some(out)
 }
 
 pub fn find(id: &str) -> Option<&'static CatalogEntry> {
@@ -262,6 +298,72 @@ pub const CATALOG: &[CatalogEntry] = &[
         }],
         default_trust: McpTrust::Untrusted,
         caveat: Some("The connection string usually contains a password; it is stored in the protected secrets file."),
+    },
+    CatalogEntry {
+        id: "supabase",
+        label: "Supabase",
+        description: "Query and manage a Supabase project — read tables, run SQL, and store findings back into your own database.",
+        details: "Supabase connects the agent to one of your Supabase projects through the official server. It can inspect schema, run SQL, apply migrations, and persist results into tables — for example, letting a scheduled research agent write what it finds into a project you own. Writes stay gated behind approval unless a profile is marked autonomous.",
+        connection: "Runs locally through npx and calls the Supabase Management API with a personal access token, scoped to the project ref you supply. Point `--api-url` at a self-hosted platform API for a self-managed deployment. For a purely local `supabase start` database, the Postgres catalog entry (direct connection string) is usually the better fit.",
+        tools: &[
+            CatalogTool { name: "list_tables", description: "List tables (and their schema) in the project." },
+            CatalogTool { name: "list_extensions", description: "List installed database extensions." },
+            CatalogTool { name: "list_migrations", description: "List applied database migrations." },
+            CatalogTool { name: "apply_migration", description: "Apply a DDL migration to the database." },
+            CatalogTool { name: "execute_sql", description: "Run a SQL query (including INSERTs to store findings)." },
+            CatalogTool { name: "get_project_url", description: "Get the project's API URL." },
+            CatalogTool { name: "get_anon_key", description: "Get the project's anonymous API key." },
+            CatalogTool { name: "list_edge_functions", description: "List the project's Edge Functions." },
+            CatalogTool { name: "search_docs", description: "Search the Supabase documentation." },
+        ],
+        runtime: RuntimeKind::Npx,
+        args: &[
+            "-y",
+            "@supabase/mcp-server-supabase@0.9.0",
+            "--project-ref={project_ref}",
+            "{+read_only:--read-only}",
+            "--features={features?}",
+            "--api-url={api_url?}",
+        ],
+        inputs: &[
+            InputSpec {
+                key: "SUPABASE_ACCESS_TOKEN",
+                label: "Supabase personal access token",
+                required: true,
+                secret: true,
+                placeholder: "sbp_…",
+            },
+            InputSpec {
+                key: "project_ref",
+                label: "Project ref",
+                required: true,
+                secret: false,
+                placeholder: "abcdefghijklmnopqrst",
+            },
+            InputSpec {
+                key: "read_only",
+                label: "Read-only (block writes)",
+                required: false,
+                secret: false,
+                placeholder: "false — leave off to allow storing findings",
+            },
+            InputSpec {
+                key: "features",
+                label: "Feature groups (comma-separated, optional)",
+                required: false,
+                secret: false,
+                placeholder: "database,docs",
+            },
+            InputSpec {
+                key: "api_url",
+                label: "Self-hosted platform API URL (optional)",
+                required: false,
+                secret: false,
+                placeholder: "https://supabase.example.com",
+            },
+        ],
+        default_trust: McpTrust::Untrusted,
+        caveat: Some("Acts on your Supabase project with the token's scope. Prefer a project-scoped token, and keep it Untrusted so writes require approval unless the agent is explicitly autonomous."),
     },
     CatalogEntry {
         id: "playwright",
@@ -414,5 +516,58 @@ mod tests {
         let cmd = entry.preview_command(&BTreeMap::new());
         assert!(cmd.starts_with("npx "));
         assert!(cmd.contains("@upstash/context7-mcp@3.2.5"));
+    }
+
+    #[test]
+    fn supabase_cloud_minimal_omits_optional_args() {
+        let entry = find("supabase").unwrap();
+        let mut inputs = BTreeMap::new();
+        inputs.insert("SUPABASE_ACCESS_TOKEN".to_string(), "sbp_secret".to_string());
+        inputs.insert("project_ref".to_string(), "abcdefgh".to_string());
+        let (config, secrets) = entry.to_config("supabase", &inputs).unwrap();
+        // Token is separated as a secret env value, never embedded in args/config.
+        assert_eq!(secrets.get("SUPABASE_ACCESS_TOKEN").map(String::as_str), Some("sbp_secret"));
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(!json.contains("sbp_secret"), "token leaked into config: {json}");
+        match config.transport {
+            McpTransport::Stdio { args, .. } => {
+                assert!(args.contains(&"--project-ref=abcdefgh".to_string()));
+                // read-only off, no features/api-url supplied ⇒ those args dropped.
+                assert!(!args.iter().any(|a| a == "--read-only"));
+                assert!(!args.iter().any(|a| a.starts_with("--features")));
+                assert!(!args.iter().any(|a| a.starts_with("--api-url")));
+            }
+            _ => panic!("expected stdio"),
+        }
+    }
+
+    #[test]
+    fn supabase_read_only_flag_and_optional_values() {
+        let entry = find("supabase").unwrap();
+        let mut inputs = BTreeMap::new();
+        inputs.insert("SUPABASE_ACCESS_TOKEN".to_string(), "sbp_x".to_string());
+        inputs.insert("project_ref".to_string(), "ref1".to_string());
+        inputs.insert("read_only".to_string(), "true".to_string());
+        inputs.insert("features".to_string(), "database,docs".to_string());
+        inputs.insert("api_url".to_string(), "https://sb.example.com".to_string());
+        let (config, _) = entry.to_config("supabase", &inputs).unwrap();
+        match config.transport {
+            McpTransport::Stdio { args, env, .. } => {
+                assert!(args.contains(&"--read-only".to_string()));
+                assert!(args.contains(&"--features=database,docs".to_string()));
+                assert!(args.contains(&"--api-url=https://sb.example.com".to_string()));
+                // Every non-secret input here is consumed by an arg ⇒ no stray env.
+                assert!(env.is_empty(), "unexpected env: {env:?}");
+            }
+            _ => panic!("expected stdio"),
+        }
+    }
+
+    #[test]
+    fn supabase_requires_ref_and_token() {
+        let entry = find("supabase").unwrap();
+        let mut only_ref = BTreeMap::new();
+        only_ref.insert("project_ref".to_string(), "ref1".to_string());
+        assert!(entry.to_config("supabase", &only_ref).is_err(), "token is required");
     }
 }

@@ -309,6 +309,14 @@ async fn reconcile_loop(state: Arc<AppState>) {
 async fn reconcile_tick(state: &Arc<AppState>) -> Result<()> {
     let token = ensure_token(state).await?;
     let rid = rig_id(state).await.ok_or_else(|| anyhow!("not enrolled"))?;
+
+    // Reconcile web-authored MCP servers (0048) first, best-effort — it is
+    // independent of, and must never be blocked by, the runtime/model
+    // reconciliation below (which has several early returns).
+    if let Err(e) = reconcile_mcp(state, &token).await {
+        tracing::warn!("reconcile mcp: {e}");
+    }
+
     let desired = state.supabase.fetch_desired(&token, &rid).await?;
 
     let snap = state.runtime.snapshot().await;
@@ -355,6 +363,123 @@ async fn reconcile_tick(state: &Arc<AppState>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Reconcile the rig's web-authored MCP servers (0048) toward the cloud's desired
+/// state: install/update/start the ones it owns, drop ones no longer desired, and
+/// re-advertise. Desktop-added (Local-origin) servers are left untouched. Applies
+/// work only when a server's version actually changed, so a steady state is a
+/// single cheap fetch per tick.
+async fn reconcile_mcp(state: &Arc<AppState>, token: &str) -> Result<()> {
+    use crate::mcp::{self, McpOrigin, McpServerConfig};
+    use std::collections::{BTreeMap, HashMap};
+
+    let desired = state.supabase.fetch_desired_mcp(token).await?;
+
+    // Build a runnable cloud config (and its secret env) from each desired server
+    // via its pinned catalog entry. An unknown catalog id or invalid inputs is
+    // skipped with a warning rather than failing the whole reconcile.
+    let mut cloud: Vec<McpServerConfig> = Vec::new();
+    let mut secrets_by_server: HashMap<String, BTreeMap<String, String>> = HashMap::new();
+    let mut desired_versions: HashMap<String, String> = HashMap::new();
+    for d in &desired {
+        let Some(entry) = mcp::catalog::find(&d.catalog_id) else {
+            tracing::warn!("reconcile mcp: unknown catalog '{}' for server '{}'", d.catalog_id, d.server_id);
+            continue;
+        };
+        // Merge non-secret inputs (coerced to strings) with the decrypted secrets;
+        // to_config re-separates the secrets by the catalog's `secret` flags.
+        let mut merged: BTreeMap<String, String> = BTreeMap::new();
+        for (k, v) in &d.inputs {
+            merged.insert(k.clone(), value_to_input_string(v));
+        }
+        for (k, v) in &d.secrets {
+            merged.insert(k.clone(), v.clone());
+        }
+        let (mut config, secrets) = match entry.to_config(&d.server_id, &merged) {
+            Ok(pair) => pair,
+            Err(e) => {
+                tracing::warn!("reconcile mcp: server '{}' misconfigured: {e}", d.server_id);
+                continue;
+            }
+        };
+        if !d.label.trim().is_empty() {
+            config.label = d.label.clone();
+        }
+        config.enabled = d.enabled;
+        config.origin = McpOrigin::Cloud;
+        desired_versions.insert(d.server_id.clone(), d.version.clone());
+        secrets_by_server.insert(d.server_id.clone(), secrets);
+        cloud.push(config);
+    }
+
+    // Snapshot the persisted config once: it drives both stale-server detection
+    // and the local-server merge. Basing "removed" on the persisted set (not just
+    // the in-memory applied map) means a cloud server deleted while the agent was
+    // offline is still cleaned up on the next start.
+    let current = state.config.lock().await.mcp_servers.clone();
+    let mut applied = state.mcp_cloud_applied.lock().await;
+    let changed: Vec<String> = desired_versions
+        .iter()
+        .filter(|(id, v)| applied.get(*id) != Some(*v))
+        .map(|(id, _)| id.clone())
+        .collect();
+    let removed: Vec<String> = current
+        .iter()
+        .filter(|c| c.origin == McpOrigin::Cloud && !desired_versions.contains_key(&c.id))
+        .map(|c| c.id.clone())
+        .collect();
+    if changed.is_empty() && removed.is_empty() {
+        return Ok(());
+    }
+
+    // Write secrets for changed servers before wiring config, so a crash never
+    // leaves a running server referencing a missing token.
+    for id in &changed {
+        if let Some(secrets) = secrets_by_server.get(id) {
+            for (k, v) in secrets {
+                mcp::set_secret(id, k, v).map_err(|e| anyhow!("mcp secret '{k}': {e}"))?;
+            }
+        }
+    }
+    for id in &removed {
+        mcp::remove_secrets(id).ok();
+    }
+
+    // Merge with the device-local servers (never touched) and reconcile.
+    let merged_all: Vec<McpServerConfig> = {
+        let mut locals: Vec<McpServerConfig> =
+            current.iter().filter(|c| c.origin != McpOrigin::Cloud).cloned().collect();
+        locals.extend(cloud.iter().cloned());
+        locals
+    };
+    crate::persist_and_reconcile(state, merged_all).await.map_err(|e| anyhow!("{e}"))?;
+
+    // set_configs reuses a running client when the transport is unchanged, so a
+    // secret-only rotation would keep the stale token; force a relaunch of every
+    // changed, enabled server so the new config/secret takes effect.
+    for id in &changed {
+        if cloud.iter().any(|c| &c.id == id && c.enabled) {
+            state.mcp.start(id).await.ok();
+        }
+    }
+    *applied = desired_versions;
+    drop(applied);
+
+    // Re-advertise: starting servers made their live tool lists known.
+    crate::local_coding::sync_mcp_to_cloud(state).await;
+    Ok(())
+}
+
+/// Coerce a desired MCP input value to the string the catalog templating expects.
+/// A bool maps to "true"/"" so a `{+key:--flag}` conditional flag reads it.
+fn value_to_input_string(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        Value::Bool(b) => if *b { "true".to_string() } else { String::new() },
+        Value::Null => String::new(),
+        other => other.to_string(),
+    }
 }
 
 fn same_model(left: &str, right: &str) -> bool {

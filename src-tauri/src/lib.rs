@@ -69,6 +69,11 @@ pub struct AppState {
     /// Configured MCP servers and their live tool snapshot. Empty until the user
     /// configures servers (phase 3); inert for turns that don't enable MCP.
     pub mcp: Arc<mcp::McpManager>,
+    /// Last-applied version per cloud-authored MCP server (serverId → version),
+    /// so the reconcile loop re-applies a web-configured server only when its
+    /// config or secret actually changed. In-memory: an empty map on restart just
+    /// means the first reconcile re-applies everything (idempotent).
+    pub mcp_cloud_applied: Mutex<HashMap<String, String>>,
     pub hub: Arc<hub::HubState>,
     /// The Tauri app handle, set once at GUI startup. Absent in headless service
     /// mode. Used to mirror coding-session stream events to the local webview.
@@ -165,6 +170,7 @@ fn build_state() -> Arc<AppState> {
         http,
         preview,
         mcp,
+        mcp_cloud_applied: Mutex::new(HashMap::new()),
         hub,
         app: std::sync::OnceLock::new(),
     })

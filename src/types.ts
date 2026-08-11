@@ -102,6 +102,24 @@ export type DownloadState = {
   error: string | null;
 };
 
+export type LlamaCppUpdateInfo = {
+  currentTag: string | null;
+  latestTag: string;
+  backend: string;
+  variant: string | null;
+  sizeBytes: number;
+  installable: boolean;
+  reason: string | null;
+};
+
+export type LlamaCppUpdateProgress = {
+  phase: "checking" | "downloading" | "verifying" | "installing" | "reloading" | "complete" | "error";
+  tag: string;
+  downloadedBytes: number;
+  totalBytes: number;
+  message: string | null;
+};
+
 export type OllamaPullProgress = {
   model: string;
   status: string;

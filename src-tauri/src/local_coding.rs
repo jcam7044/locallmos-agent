@@ -120,6 +120,13 @@ pub async fn send(
 
     let cancel = Arc::new(AtomicBool::new(false));
     state.cancels.lock().await.insert(request_id.clone(), cancel.clone());
+    if state
+        .llamacpp_update_running
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        state.cancels.lock().await.remove(&request_id);
+        return Err("llama.cpp is being updated; try again when the update finishes".into());
+    }
 
     let result = run_turn(
         &app,

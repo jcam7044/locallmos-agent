@@ -258,7 +258,13 @@ function Get-MarkerValue([string]$Marker, [string]$Key) {
 }
 
 function Install-LlamaCpp([string]$Backend, [string]$Tag, [string]$Repo, [string]$Mode) {
-  $llamaDir = Join-Path (Join-Path $env:ProgramFiles "LocalLMOS") "llama"
+  # Desktop runtimes are user-owned so the signed in-app updater can replace
+  # them without UAC. Headless/SYSTEM installs remain machine-owned.
+  $llamaDir = if ($Mode -eq "service") {
+    Join-Path (Join-Path $env:ProgramFiles "LocalLMOS") "llama"
+  } else {
+    Join-Path (Join-Path $env:LOCALAPPDATA "LocalLMOS") "llama"
+  }
   $modelsDir = if ($Mode -eq "service") {
     Join-Path $env:ProgramData "locallmos\models"
   } else {
@@ -323,7 +329,9 @@ function Install-LlamaCpp([string]$Backend, [string]$Tag, [string]$Repo, [string
     New-Item -ItemType Directory -Force -Path $llamaDir | Out-Null
     Copy-Item (Join-Path $stage "*") $llamaDir -Recurse -Force
     Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue
-    Set-Content -Path $marker -Value @("backend=$b", "tag=$Tag") -Encoding ASCII
+    Set-Content -Path $marker -Value @(
+      "schema=1", "backend=$b", "tag=$Tag", "source_repo=$Repo", "asset=$asset"
+    ) -Encoding ASCII
     $committed = $b
     break
   }

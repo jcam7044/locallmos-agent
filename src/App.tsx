@@ -1,14 +1,17 @@
 import { useCallback, useEffect, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { getAgentStatus, getLocalStatus, hubCancelDownload, hubListDownloads } from "./api";
+import { getAgentStatus, getLocalStatus, hubCancelDownload, hubListDownloads, llamaCppCheckUpdate, llamaCppInstallUpdate } from "./api";
 import { ChatView } from "./chat/ChatView";
 import { CodingView } from "./coding/CodingView";
 import { ConnectCloud, Dashboard } from "./dashboard/Dashboard";
 import { DownloadBanner } from "./downloads/DownloadBanner";
-import type { AgentStatus, DownloadState, LocalStatus } from "./types";
+import type { AgentStatus, DownloadState, LlamaCppUpdateInfo, LlamaCppUpdateProgress, LocalStatus } from "./types";
 import { useTabWindowSize, type Tab } from "./useTabWindowSize";
 import { ModelsView } from "./models/ModelsView";
 import { ToolsView } from "./tools/ToolsView";
+import { LlamaCppUpdateToast } from "./updates/LlamaCppUpdateToast";
+
+const DISMISSED_LLAMA_UPDATE = "locallmos.dismissedLlamaCppUpdate";
 
 export function App() {
   const [tab, setTab] = useState<Tab>("dashboard");
@@ -18,6 +21,8 @@ export function App() {
   const [error, setError] = useState<string | null>(null);
   const [downloads, setDownloads] = useState<Record<string, DownloadState>>({});
   const [dismissedDownloads, setDismissedDownloads] = useState<Set<string>>(() => new Set());
+  const [llamaUpdate, setLlamaUpdate] = useState<LlamaCppUpdateInfo | null>(null);
+  const [llamaProgress, setLlamaProgress] = useState<LlamaCppUpdateProgress | null>(null);
 
   const refresh = useCallback(async () => {
     try {
@@ -35,6 +40,55 @@ export function App() {
     const t = setInterval(refresh, 3000);
     return () => clearInterval(t);
   }, [refresh]);
+
+  const checkLlamaUpdate = useCallback(async (manual = false) => {
+    if (local?.runtime.kind !== "llamacpp") return "llama.cpp is not the active runtime.";
+    const update = await llamaCppCheckUpdate();
+    if (!update) {
+      if (manual) setLlamaUpdate(null);
+      return "llama.cpp is up to date.";
+    }
+    const dismissed = localStorage.getItem(DISMISSED_LLAMA_UPDATE);
+    if (manual || dismissed !== update.latestTag) setLlamaUpdate(update);
+    return `llama.cpp ${update.latestTag} is available.`;
+  }, [local?.runtime.kind]);
+
+  useEffect(() => {
+    if (local?.runtime.kind !== "llamacpp") {
+      setLlamaUpdate(null);
+      return;
+    }
+    void checkLlamaUpdate().catch(() => undefined);
+    const timer = setInterval(() => { void checkLlamaUpdate().catch(() => undefined); }, 24 * 60 * 60 * 1000);
+    return () => clearInterval(timer);
+  }, [checkLlamaUpdate, local?.runtime.kind]);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    void listen<LlamaCppUpdateProgress>("llamacpp-update", ({ payload }) => {
+      setLlamaProgress(payload);
+      if (payload.phase === "complete") {
+        setLlamaUpdate(null);
+        localStorage.removeItem(DISMISSED_LLAMA_UPDATE);
+        void refresh();
+      }
+    }).then((stop) => { unlisten = stop; });
+    return () => unlisten?.();
+  }, [refresh]);
+
+  const installLlamaUpdate = useCallback(() => {
+    if (!llamaUpdate) return;
+    setLlamaProgress({ phase: "checking", tag: llamaUpdate.latestTag, downloadedBytes: 0, totalBytes: llamaUpdate.sizeBytes, message: null });
+    void llamaCppInstallUpdate(llamaUpdate.latestTag).catch((reason) => {
+      setLlamaProgress({ phase: "error", tag: llamaUpdate.latestTag, downloadedBytes: 0, totalBytes: llamaUpdate.sizeBytes, message: String(reason) });
+    });
+  }, [llamaUpdate]);
+
+  const dismissLlamaUpdate = useCallback(() => {
+    if (llamaUpdate) localStorage.setItem(DISMISSED_LLAMA_UPDATE, llamaUpdate.latestTag);
+    setLlamaUpdate(null);
+    setLlamaProgress(null);
+  }, [llamaUpdate]);
 
   useEffect(() => {
     let disposed = false;
@@ -92,7 +146,7 @@ export function App() {
 
       {tab === "dashboard" ? (
         <>
-          <Dashboard local={local} running={running} onChanged={refresh} />
+          <Dashboard local={local} running={running} onChanged={refresh} onCheckLlamaCppUpdate={() => checkLlamaUpdate(true)} />
           <ConnectCloud status={status} onEnrolled={refresh} />
         </>
       ) : tab === "chat" ? (
@@ -115,6 +169,12 @@ export function App() {
         downloads={Object.values(downloads).filter((download) => !dismissedDownloads.has(download.id))}
         onDismiss={(id) => setDismissedDownloads((dismissed) => new Set(dismissed).add(id))}
         onCancel={(id) => { void hubCancelDownload(id).then((download) => setDownloads((current) => ({ ...current, [download.id]: download }))).catch((reason) => setError(String(reason))); }}
+      />
+      <LlamaCppUpdateToast
+        info={llamaUpdate}
+        progress={llamaProgress}
+        onInstall={installLlamaUpdate}
+        onDismiss={dismissLlamaUpdate}
       />
     </div>
   );

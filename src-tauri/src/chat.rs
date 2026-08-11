@@ -24,7 +24,7 @@ use crate::runtime::tool_protocol;
 use crate::runtime::tools;
 use crate::supabase::{ChatPending, WebSearchOutcome};
 use crate::AppState;
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use base64::Engine;
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -300,6 +300,13 @@ pub async fn process(state: &Arc<AppState>, pending: ChatPending) -> Result<()> 
     // Register a cancel flag so a Stop request can abort this turn.
     let cancel = Arc::new(AtomicBool::new(false));
     state.cancels.lock().await.insert(pending.id.clone(), cancel.clone());
+    if state
+        .llamacpp_update_running
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        state.cancels.lock().await.remove(&pending.id);
+        bail!("llama.cpp is being updated; try again when the update finishes");
+    }
 
     // If the model isn't resident, Ollama blocks the chat request while it loads
     // (tens of seconds for large models). Heartbeat a "loading" ping so the web

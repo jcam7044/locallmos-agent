@@ -20,7 +20,7 @@ use std::time::Duration;
 /// downloaded binary must carry a valid signature from this key before we run
 /// it — this is what makes swapping a privileged binary safe.
 ///
-const RELEASE_PUBLIC_KEY: &str =
+pub(crate) const RELEASE_PUBLIC_KEY: &str =
     "RWR+94+uka+PJB5Wbmak5GN2J+eZjIgoj3PGFH4dAoqhBuCfIFjBy6u7";
 
 /// Public GitHub repo that hosts agent releases (for the account-less local
@@ -266,14 +266,20 @@ async fn download_and_verify(artifact: &ReleaseArtifact) -> Result<Vec<u8>> {
         ));
     }
 
+    verify_release_signature(&bytes, &artifact.sig)?;
+
+    Ok(bytes)
+}
+
+/// Verify bytes signed by LocalLMOS release CI. Shared by the agent and
+/// llama.cpp updaters so privileged/runtime downloads have one trust root.
+pub(crate) fn verify_release_signature(bytes: &[u8], encoded: &str) -> Result<()> {
     use minisign_verify::{PublicKey, Signature};
     let pk = PublicKey::from_base64(RELEASE_PUBLIC_KEY)
         .map_err(|e| anyhow!("bad embedded public key: {e}"))?;
-    let sig = Signature::decode(&artifact.sig).map_err(|e| anyhow!("bad signature: {e}"))?;
-    pk.verify(&bytes, &sig, false)
-        .map_err(|e| anyhow!("signature verification failed: {e}"))?;
-
-    Ok(bytes)
+    let sig = Signature::decode(encoded).map_err(|e| anyhow!("bad signature: {e}"))?;
+    pk.verify(bytes, &sig, false)
+        .map_err(|e| anyhow!("signature verification failed: {e}"))
 }
 
 /// Stage the verified bytes and atomically replace our own running executable.

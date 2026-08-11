@@ -101,6 +101,15 @@ marker file (`/opt/locallmos/llama/.locallmos-llamacpp`, recording `backend=`/
 `tag=`) makes re-runs idempotent: an install is reused when the backend and tag
 match, and reprovisioned atomically otherwise (e.g. after `--llamacpp-version`).
 
+Desktop installs check LocalLMOS's signed llama.cpp stable channel at startup
+and once per day. When a newer supported build is available, the tray app shows
+a **Download and install** toast; it never downloads automatically. The updater
+keeps the installed backend, verifies the catalog signature and archive hash,
+smoke-tests in staging, then reloads the active model. A failed reload restores
+the previous runtime. Dismissing a tag suppresses that tag only. Headless
+`/opt` installs remain administrator-managed and are updated by rerunning this
+installer with a newer `--llamacpp-version`.
+
 **Force a specific backend** with `--llamacpp-backend cuda|rocm|vulkan|cpu`
 (or `LOCALLMOS_LLAMACPP_BACKEND`). Forcing is for debugging/known hardware and
 takes **no fallback** — if the forced backend can't be downloaded or fails its
@@ -111,6 +120,10 @@ To use an existing **Ollama** installation instead, pass `--runtime ollama` (or
 `install.ps1 -Runtime ollama` on Windows). Windows llama.cpp supports the
 `cuda|hip|vulkan|cpu` backends; use `-LlamaCppBackend` to force one. Windows
 CUDA/HIP prebuilts come from upstream, so no self-hosted repo is involved there.
+Windows desktop llama.cpp files live under `%LOCALAPPDATA%\LocalLMOS\llama` so
+the signed updater can replace them without elevation; SYSTEM service installs
+remain under `%ProgramFiles%\LocalLMOS\llama`. The first update migrates a legacy
+desktop runtime from Program Files without deleting the old copy.
 
 Model launch settings are configured per GGUF in the tray app's **Models** tab.
 Leaving them on **Recommended** lets llama.cpp auto-fit context and GPU offload

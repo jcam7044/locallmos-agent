@@ -25,7 +25,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, Signal, System, UpdateKind};
 use tokio::process::{Child, Command};
@@ -71,7 +71,9 @@ pub struct LlamaServerAdapter {
     base: String,
     host: String,
     port: u16,
-    bin: String,
+    /// Resolved executable path. The updater changes it after committing a new
+    /// archive because upstream release directories contain the build tag.
+    bin: RwLock<String>,
     models_dir: String,
     /// Active acceleration backend (cuda|rocm|vulkan|cpu|metal), from the installer
     /// env/marker. Surfaced in the snapshot; `None` when it can't be determined.
@@ -128,7 +130,7 @@ impl LlamaServerAdapter {
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(default_models_dir),
             backend,
-            bin,
+            bin: RwLock::new(bin),
             extra_args,
             thinking_override: !std::env::var("LOCALLMOS_LLAMACPP_THINKING")
                 .unwrap_or_default()
@@ -141,6 +143,14 @@ impl LlamaServerAdapter {
             device_cache: Mutex::new(None),
             metadata_cache: Mutex::new(HashMap::new()),
         }
+    }
+
+    pub(crate) fn bin_path(&self) -> String {
+        self.bin.read().expect("llama.cpp binary lock poisoned").clone()
+    }
+
+    pub(crate) fn set_bin_path(&self, bin: String) {
+        *self.bin.write().expect("llama.cpp binary lock poisoned") = bin;
     }
 
     /// The `--device` value to pass, auto-selecting discrete GPUs over a weak
@@ -174,7 +184,7 @@ impl LlamaServerAdapter {
 
     /// Ask llama-server to enumerate its compute devices (`token`, `name`).
     async fn list_devices(&self) -> Vec<(String, String)> {
-        let output = Command::new(&self.bin)
+        let output = Command::new(self.bin_path())
             .arg("--list-devices")
             .output()
             .await
@@ -366,7 +376,8 @@ impl LlamaServerAdapter {
                 let _ = p.child.wait().await;
                 *guard = None;
             }
-            let mut cmd = Command::new(&self.bin);
+            let bin = self.bin_path();
+            let mut cmd = Command::new(&bin);
             cmd.arg("-m")
                 .arg(&gguf)
                 .arg("--alias")
@@ -394,7 +405,7 @@ impl LlamaServerAdapter {
             cmd.kill_on_drop(true);
             let child = cmd
                 .spawn()
-                .map_err(|e| anyhow!("failed to spawn {}: {e}", self.bin))?;
+                .map_err(|e| anyhow!("failed to spawn {bin}: {e}"))?;
             *guard = Some(ChildProc {
                 child,
                 model: model.to_string(),
@@ -626,7 +637,7 @@ impl RuntimeAdapter for LlamaServerAdapter {
         };
         RuntimeSnapshot {
             kind: "llamacpp".into(),
-            version: None,
+            version: read_marker_value(&self.bin_path(), "tag"),
             backend: self.backend.clone(),
             state: state.into(),
             endpoint: Some(self.base.clone()),
@@ -674,7 +685,7 @@ impl RuntimeAdapter for LlamaServerAdapter {
         let gguf = self.resolve_gguf(model).ok_or_else(|| {
             anyhow!("no .gguf for model {model:?} in {:?}", self.models_dir)
         })?;
-        if stop_external_llama_server(&self.bin, &gguf) {
+        if stop_external_llama_server(&self.bin_path(), &gguf) {
             return Ok(());
         }
         // A crashed/hung server may keep GPU allocations even though its HTTP
@@ -1125,13 +1136,17 @@ pub(crate) fn default_models_dir() -> String {
 /// Default llama-server path when unset: the provisioned binary under the user
 /// (`~/.local/opt/locallmos/llama`) or system (`/opt/locallmos/llama`) install
 /// dir, else bare "llama-server" (resolved on PATH).
-fn default_bin() -> String {
+pub(crate) fn default_bin() -> String {
     let mut roots: Vec<PathBuf> = Vec::new();
     if let Some(home) = dirs::home_dir() {
         roots.push(home.join(".local/opt/locallmos/llama"));
     }
     roots.push(PathBuf::from("/opt/locallmos/llama"));
     // Windows install roots written by install.ps1 (§3).
+    #[cfg(windows)]
+    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        roots.push(PathBuf::from(local).join("LocalLMOS").join("llama"));
+    }
     #[cfg(windows)]
     for var in ["ProgramFiles", "ProgramData"] {
         if let Ok(pf) = std::env::var(var) {
@@ -1146,29 +1161,23 @@ fn default_bin() -> String {
     "llama-server".into()
 }
 
-/// Find `llama-server` directly under `root` or one level down (the release
-/// tarball extracts into a `llama-<tag>/` subdir). Matches the `.exe` on Windows.
+/// Find `llama-server` under a managed release tree. Windows archives sometimes
+/// add `build/bin` below the versioned top-level directory.
 fn find_llama_server(root: &Path) -> Option<PathBuf> {
     let names: &[&str] = if cfg!(windows) {
         &["llama-server.exe", "llama-server"]
     } else {
         &["llama-server"]
     };
-    for name in names {
-        let direct = root.join(name);
-        if direct.is_file() {
-            return Some(direct);
-        }
-    }
-    for entry in std::fs::read_dir(root).ok()?.flatten() {
-        for name in names {
-            let cand = entry.path().join(name);
-            if cand.is_file() {
-                return Some(cand);
-            }
-        }
-    }
-    None
+    walkdir::WalkDir::new(root)
+        .max_depth(5)
+        .into_iter()
+        .filter_map(|entry| entry.ok())
+        .find(|entry| {
+            entry.file_type().is_file()
+                && names.iter().any(|name| entry.file_name() == OsStr::new(name))
+        })
+        .map(|entry| entry.into_path())
 }
 
 /// The active backend label for llama.cpp: the installer-exported env var (the
@@ -1181,19 +1190,20 @@ fn resolve_backend(bin: &str) -> Option<String> {
             return Some(b.to_string());
         }
     }
-    read_marker_backend(bin)
+    read_marker_value(bin, "backend")
 }
 
-/// Read `backend=` from the `.locallmos-llamacpp` marker. The binary sits at
+/// Read a value from the `.locallmos-llamacpp` marker. The binary sits at
 /// `<root>/llama-server` or `<root>/llama-<tag>/llama-server`, and the marker is
-/// at `<root>/.locallmos-llamacpp`, so search up to three parents.
-fn read_marker_backend(bin: &str) -> Option<String> {
+/// at `<root>/.locallmos-llamacpp`, so search several parents for Windows
+/// archives that add `build/bin` below their versioned top-level directory.
+fn read_marker_value(bin: &str, key: &str) -> Option<String> {
     let mut dir = Path::new(bin).parent();
-    for _ in 0..3 {
+    for _ in 0..6 {
         let d = dir?;
         if let Ok(text) = std::fs::read_to_string(d.join(".locallmos-llamacpp")) {
             for line in text.lines() {
-                if let Some(rest) = line.strip_prefix("backend=") {
+                if let Some(rest) = line.strip_prefix(&format!("{key}=")) {
                     let rest = rest.trim();
                     if !rest.is_empty() {
                         return Some(rest.to_string());
@@ -1202,6 +1212,36 @@ fn read_marker_backend(bin: &str) -> Option<String> {
             }
         }
         dir = d.parent();
+    }
+    None
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ManagedInstallation {
+    pub root: PathBuf,
+    pub bin: PathBuf,
+    pub backend: String,
+    pub tag: Option<String>,
+}
+
+/// Resolve an installer-owned llama.cpp tree. A marker is the ownership
+/// boundary: PATH installations and package-manager copies are never mutated.
+pub(crate) fn managed_installation(bin: &str) -> Option<ManagedInstallation> {
+    let bin_path = PathBuf::from(bin);
+    let mut dir = bin_path.parent();
+    for _ in 0..6 {
+        let root = dir?;
+        let marker = root.join(".locallmos-llamacpp");
+        if marker.is_file() {
+            let backend = read_marker_value(bin, "backend")?;
+            return Some(ManagedInstallation {
+                root: root.to_path_buf(),
+                bin: bin_path,
+                backend,
+                tag: read_marker_value(bin, "tag"),
+            });
+        }
+        dir = root.parent();
     }
     None
 }

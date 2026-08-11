@@ -17,6 +17,7 @@ mod local_coding;
 mod hardware;
 mod hub;
 mod local_chat;
+mod llamacpp_updater;
 mod mcp;
 mod monitor;
 mod realtime;
@@ -57,6 +58,10 @@ pub struct AppState {
     pub realtime: Arc<realtime::RealtimeHandle>,
     /// In-flight chat turns → cancel flag, for stop-generation.
     pub cancels: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    /// True only while a signed llama.cpp update owns the runtime lifecycle.
+    pub llamacpp_update_running: AtomicBool,
+    /// Serializes model process lifecycle changes with install-tree swaps.
+    pub runtime_lifecycle: Mutex<()>,
     /// Pending local coding-tool approvals → decision sender. Resolved by the
     /// `coding_local_approve` command (in-process; no cloud round-trip).
     pub coding_approvals: Mutex<HashMap<String, tokio::sync::oneshot::Sender<bool>>>,
@@ -102,6 +107,13 @@ impl AppState {
         model: &str,
         force_reload: bool,
     ) -> anyhow::Result<()> {
+        let _lifecycle = self.runtime_lifecycle.lock().await;
+        if self
+            .llamacpp_update_running
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            anyhow::bail!("llama.cpp is being updated; try again when the update finishes");
+        }
         let (_, settings) = self.model_settings(model).await?;
         if force_reload && self.runtime.is_model_loaded(model).await {
             self.runtime.unload_model(model).await?;
@@ -111,6 +123,7 @@ impl AppState {
 }
 
 fn build_state() -> Arc<AppState> {
+    llamacpp_updater::recover_interrupted_update();
     let settings = Settings::from_env();
     // Use connect + idle-read timeouts rather than a single total-request
     // deadline: fast-fail the short polling/Supabase calls when a host is down,
@@ -165,6 +178,8 @@ fn build_state() -> Arc<AppState> {
         monitor: Mutex::new(Monitor::new()),
         realtime: Arc::new(realtime::RealtimeHandle::new()),
         cancels: Mutex::new(HashMap::new()),
+        llamacpp_update_running: AtomicBool::new(false),
+        runtime_lifecycle: Mutex::new(()),
         coding_approvals: Mutex::new(HashMap::new()),
         chat_lock: Mutex::new(()),
         http,
@@ -342,6 +357,7 @@ async fn load_model(state: State<'_, Arc<AppState>>, model: String) -> Result<()
 /// Eject a resident model from memory while retaining its local files.
 #[tauri::command]
 async fn unload_model(state: State<'_, Arc<AppState>>, model: String) -> Result<(), String> {
+    let _lifecycle = state.runtime_lifecycle.lock().await;
     state.runtime.unload_model(&model).await.map_err(|e| e.to_string())?;
     let mut config = state.config.lock().await;
     config.locally_ejected_model = Some(model);
@@ -754,6 +770,7 @@ async fn save_model_load_settings(
 /// Restart the local runtime service.
 #[tauri::command]
 async fn restart_runtime(state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    let _lifecycle = state.runtime_lifecycle.lock().await;
     state.runtime.restart().await.map_err(|e| e.to_string())
 }
 
@@ -1257,6 +1274,31 @@ async fn local_update() -> Result<Option<String>, String> {
         .map_err(|e| e.to_string())
 }
 
+/// Check the signed LocalLMOS llama.cpp stable channel without downloading a
+/// runtime artifact. Returns `None` when the managed install is current.
+#[tauri::command]
+async fn llamacpp_check_update(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Option<llamacpp_updater::LlamaCppUpdateInfo>, String> {
+    llamacpp_updater::check(state.inner())
+        .await
+        .map_err(|error| error.to_string())
+}
+
+/// Download and install the exact signed release the user accepted. The
+/// backend re-fetches the channel catalog so stale/tampered UI input cannot
+/// choose an arbitrary artifact URL.
+#[tauri::command]
+async fn llamacpp_install_update(
+    app: tauri::AppHandle,
+    state: State<'_, Arc<AppState>>,
+    tag: String,
+) -> Result<(), String> {
+    llamacpp_updater::install(app, state.inner().clone(), tag)
+        .await
+        .map_err(|error| error.to_string())
+}
+
 // ---------------------------------------------------------------------------
 // Entry point + mode dispatch
 // ---------------------------------------------------------------------------
@@ -1484,6 +1526,8 @@ fn run_gui() {
             local_chat_cancel,
             chat_context,
             local_update,
+            llamacpp_check_update,
+            llamacpp_install_update,
             chat_list_sessions,
             chat_create_session,
             chat_get_session,

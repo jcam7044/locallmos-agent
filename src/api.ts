@@ -21,6 +21,7 @@ import type {
   McpServerConfig,
   McpTrust,
   ChatContextInfo,
+  LlamaCppUpdateInfo,
 } from "./types";
 
 export const getLocalStatus = () => invoke<LocalStatus>("local_status");
@@ -54,6 +55,10 @@ export const hubStartDownload = (repoId: string, revision: string, variantId: st
 export const hubListDownloads = () => invoke<DownloadState[]>("hub_list_downloads");
 export const hubCancelDownload = (id: string) => invoke<DownloadState>("hub_cancel_download", { id });
 export const localUpdate = () => invoke<string | null>("local_update");
+export const llamaCppCheckUpdate = () =>
+  invoke<LlamaCppUpdateInfo | null>("llamacpp_check_update");
+export const llamaCppInstallUpdate = (tag: string) =>
+  invoke<void>("llamacpp_install_update", { tag });
 export const enroll = (code: string, name: string) => invoke("enroll", { code, name });
 export const localChatSend = (args: {
   sessionId: string;

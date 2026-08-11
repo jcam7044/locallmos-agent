@@ -17,10 +17,12 @@ export function Dashboard({
   local,
   running,
   onChanged,
+  onCheckLlamaCppUpdate,
 }: {
   local: LocalStatus | null;
   running: boolean;
   onChanged: () => void;
+  onCheckLlamaCppUpdate: () => Promise<string>;
 }) {
   const [busy, setBusy] = useState<string | null>(null);
   const [modelAction, setModelAction] = useState<{ id: string; type: ModelAction } | null>(null);
@@ -82,6 +84,18 @@ export function Dashboard({
       setUpdateMsg(v ? `Updating to ${v}… the agent will restart.` : "You're on the latest version.");
     } catch (e) {
       setUpdateMsg(`Update check failed: ${String(e)}`);
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const checkLlamaCppUpdate = async () => {
+    setBusy("__llamacpp_update");
+    setUpdateMsg(null);
+    try {
+      setUpdateMsg(await onCheckLlamaCppUpdate());
+    } catch (e) {
+      setUpdateMsg(`llama.cpp update check failed: ${String(e)}`);
     } finally {
       setBusy(null);
     }
@@ -169,13 +183,16 @@ export function Dashboard({
         <div style={{ marginTop: 10 }}>
           <RuntimeControl configured={configured} activeKind={kind} onChanged={onChanged} />
         </div>
-        <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+        <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
           <button onClick={restart} disabled={busy === "__restart"} style={secondaryButton}>
             {busy === "__restart" ? "Restarting…" : "Restart"}
           </button>
           <button onClick={checkUpdate} disabled={busy === "__update"} style={secondaryButton}>
-            {busy === "__update" ? "Checking…" : "Check for updates"}
+            {busy === "__update" ? "Checking…" : "Check agent update"}
           </button>
+          {isLlama && <button onClick={checkLlamaCppUpdate} disabled={busy === "__llamacpp_update"} style={secondaryButton}>
+            {busy === "__llamacpp_update" ? "Checking…" : "Check llama.cpp update"}
+          </button>}
         </div>
         {updateMsg && <p style={{ ...label, marginTop: 8 }}>{updateMsg}</p>}
       </div>

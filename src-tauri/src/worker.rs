@@ -276,7 +276,17 @@ async fn execute(state: &Arc<AppState>, kind: &str, payload: &Value) -> (bool, V
                 state.load_model_configured(model, false).await.map(|_| json!({ "model": model }))
             }
         }
-        "restart_runtime" => state.runtime.restart().await.map(|_| json!({})),
+        "restart_runtime" => {
+            if state
+                .llamacpp_update_running
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                Err(anyhow!("llama.cpp is being updated; restart is temporarily unavailable"))
+            } else {
+                let _lifecycle = state.runtime_lifecycle.lock().await;
+                state.runtime.restart().await.map(|_| json!({}))
+            }
+        }
         "reboot_machine" => {
             let delay = payload.get("delaySeconds").and_then(|v| v.as_u64()).unwrap_or(0);
             reboot(delay).map(|_| json!({ "scheduled": true }))

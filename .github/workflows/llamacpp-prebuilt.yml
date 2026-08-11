@@ -19,9 +19,14 @@ name: llama.cpp Linux prebuilts
 # workflow_dispatch is kept as a manual fallback (re-run a tag's build without
 # recreating the tag, and the only way to opt into mirror_backends).
 #
-# No extra secrets: publishing uses the built-in GITHUB_TOKEN (contents: write).
+# Publishing uses the built-in GITHUB_TOKEN (contents: write). Catalog signing
+# uses the same MINISIGN_SECRET_KEY secret as the agent release workflow.
 
 on:
+  schedule:
+    # llama.cpp commonly publishes several builds per day. Promote the newest
+    # complete upstream build once per day instead of rebuilding every tag.
+    - cron: "17 8 * * *"
   push:
     tags:
       - "b[0-9]*" # llama.cpp build tags, e.g. b10068 (the [0-9] avoids matching `beta` etc.)
@@ -41,7 +46,64 @@ permissions:
   contents: write
 
 jobs:
+  resolve:
+    runs-on: ubuntu-22.04
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      should_build: ${{ steps.release.outputs.should_build }}
+    steps:
+      - name: Resolve upstream release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          PUSH_TAG: ${{ github.ref_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          case "$EVENT_NAME" in
+            workflow_dispatch) TAG="$INPUT_TAG" ;;
+            push) TAG="$PUSH_TAG" ;;
+            schedule)
+              TAG="$(curl -fsSL \
+                -H 'Accept: application/vnd.github+json' \
+                -H 'User-Agent: locallmos-llamacpp-builder' \
+                https://api.github.com/repos/ggml-org/llama.cpp/releases/latest \
+                | jq -r '.tag_name')"
+              ;;
+            *) echo "unsupported event: $EVENT_NAME" >&2; exit 2 ;;
+          esac
+          [[ "$TAG" =~ ^b[0-9]+$ ]] || { echo "invalid llama.cpp tag: $TAG" >&2; exit 2; }
+
+          SHOULD_BUILD=true
+          if [[ "$EVENT_NAME" == schedule ]]; then
+            release="$(gh api "repos/$REPO/releases/tags/$TAG" 2>/dev/null || true)"
+            stable="$(gh api "repos/$REPO/releases/tags/llamacpp-stable" 2>/dev/null || true)"
+            stable_tag="$(curl -fsSL \
+              "https://github.com/$REPO/releases/download/llamacpp-stable/llamacpp-release.json?run=$GITHUB_RUN_ID" \
+              | jq -r '.tag' 2>/dev/null || true)"
+            if [[ -n "$release" ]] && jq -e --arg tag "$TAG" '
+              [.assets[].name] as $names
+              | ($names | index("llama-" + $tag + "-bin-ubuntu-cuda-12.4-x64.tar.gz")) != null
+              and ($names | index("llama-" + $tag + "-bin-ubuntu-cuda-13.3-x64.tar.gz")) != null
+              and ($names | index("llamacpp-release.json")) != null
+              and ($names | index("llamacpp-release.json.minisig")) != null
+            ' <<<"$release" >/dev/null \
+              && [[ -n "$stable" ]] \
+              && jq -e '[.assets[].name] as $names | ($names | index("llamacpp-release.json")) != null and ($names | index("llamacpp-release.json.minisig")) != null' \
+                <<<"$stable" >/dev/null \
+              && [[ "$stable_tag" == "$TAG" ]]; then
+              SHOULD_BUILD=false
+            fi
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "should_build=$SHOULD_BUILD" >> "$GITHUB_OUTPUT"
+          echo "Resolved $TAG (build=$SHOULD_BUILD)"
+
   build-cuda:
+    needs: resolve
+    if: needs.resolve.outputs.should_build == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -59,7 +121,7 @@ jobs:
     # The llama.cpp tag = the pushed git tag (ref_name) on a tag push, or the
     # dispatch input on a manual run. Used as $TAG in every step below.
     env:
-      TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+      TAG: ${{ needs.resolve.outputs.tag }}
     steps:
       # Build deps. The CUDA devel image ships nvcc + the host compiler but not
       # cmake/git/patchelf. Runs before checkout because we don't need this repo.
@@ -181,6 +243,7 @@ jobs:
   # (cuda -> vulkan -> cpu, and rocm) can be pinned to a single source. Off by
   # default — this workflow's job is the CUDA gap.
   mirror-upstream:
+    needs: resolve
     # Opt-in, manual only: tag pushes never mirror (there is no input to set).
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.mirror_backends }}
     runs-on: ubuntu-22.04
@@ -215,12 +278,12 @@ jobs:
             dist/*.tar.gz.sha256
 
   publish:
-    needs: [build-cuda, mirror-upstream]
+    needs: [resolve, build-cuda, mirror-upstream]
     # mirror-upstream is skipped when mirror_backends=false; don't let that block us.
     if: ${{ always() && needs.build-cuda.result == 'success' }}
     runs-on: ubuntu-22.04
     env:
-      TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+      TAG: ${{ needs.resolve.outputs.tag }}
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -252,3 +315,109 @@ jobs:
           make_latest: "false"
           prerelease: false
           files: staged/*
+
+      - name: Build signed desktop update catalog
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+        run: |
+          set -euo pipefail
+          command -v minisign >/dev/null || {
+            sudo apt-get update
+            sudo apt-get install -y minisign
+          }
+          upstream="$(curl -fsSL \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'User-Agent: locallmos-llamacpp-builder' \
+            "https://api.github.com/repos/ggml-org/llama.cpp/releases/tags/$TAG")"
+          entries='[]'
+
+          append_asset() {
+            os="$1" arch="$2" backend="$3" variant="$4" archive="$5" repo="$6" name="$7" companion="${8:-}"
+            if [[ "$repo" == "$REPO" ]]; then
+              path="staged/$name"
+              [[ -f "$path" ]] || { echo "missing built asset: $name" >&2; exit 1; }
+              sha="$(sha256sum "$path" | awk '{print $1}')"
+              size="$(stat -c '%s' "$path")"
+              url="https://github.com/$REPO/releases/download/$TAG/$name"
+            else
+              asset="$(jq -cer --arg name "$name" '.assets[] | select(.name == $name)' <<<"$upstream")" \
+                || { echo "upstream $TAG is missing $name" >&2; exit 1; }
+              url="$(jq -r '.browser_download_url' <<<"$asset")"
+              size="$(jq -r '.size' <<<"$asset")"
+              sha="$(jq -r '.digest // ""' <<<"$asset" | sed 's/^sha256://')"
+              if [[ -z "$sha" ]]; then
+                tmp="$(mktemp)"
+                curl -fsSL "$url" -o "$tmp"
+                sha="$(sha256sum "$tmp" | awk '{print $1}')"
+                rm -f "$tmp"
+              fi
+            fi
+
+            companions='[]'
+            if [[ -n "$companion" ]]; then
+              companion_asset="$(jq -cer --arg name "$companion" '.assets[] | select(.name == $name)' <<<"$upstream")" \
+                || { echo "upstream $TAG is missing $companion" >&2; exit 1; }
+              companion_url="$(jq -r '.browser_download_url' <<<"$companion_asset")"
+              companion_size="$(jq -r '.size' <<<"$companion_asset")"
+              companion_sha="$(jq -r '.digest // ""' <<<"$companion_asset" | sed 's/^sha256://')"
+              if [[ -z "$companion_sha" ]]; then
+                tmp="$(mktemp)"
+                curl -fsSL "$companion_url" -o "$tmp"
+                companion_sha="$(sha256sum "$tmp" | awk '{print $1}')"
+                rm -f "$tmp"
+              fi
+              companions="$(jq -n --arg name "$companion" --arg url "$companion_url" \
+                --arg sha "$companion_sha" --argjson size "$companion_size" \
+                '[{name:$name,url:$url,sha256:$sha,sizeBytes:$size}]')"
+            fi
+
+            entries="$(jq -n --argjson entries "$entries" --arg os "$os" --arg arch "$arch" \
+              --arg backend "$backend" --arg variant "$variant" --arg archive "$archive" \
+              --arg name "$name" --arg url "$url" --arg sha "$sha" --argjson size "$size" \
+              --argjson companions "$companions" '
+                $entries + [{os:$os,arch:$arch,backend:$backend,
+                  variant:(if $variant == "" then null else $variant end),
+                  archive:$archive,name:$name,url:$url,sha256:$sha,sizeBytes:$size,
+                  companions:$companions}]')"
+          }
+
+          append_asset linux x86_64 cuda 12.4 tar.gz "$REPO" "llama-$TAG-bin-ubuntu-cuda-12.4-x64.tar.gz"
+          append_asset linux x86_64 cuda 13.3 tar.gz "$REPO" "llama-$TAG-bin-ubuntu-cuda-13.3-x64.tar.gz"
+          append_asset linux x86_64 rocm '' tar.gz ggml-org/llama.cpp "llama-$TAG-bin-ubuntu-rocm-7.2-x64.tar.gz"
+          append_asset linux x86_64 vulkan '' tar.gz ggml-org/llama.cpp "llama-$TAG-bin-ubuntu-vulkan-x64.tar.gz"
+          append_asset linux x86_64 cpu '' tar.gz ggml-org/llama.cpp "llama-$TAG-bin-ubuntu-x64.tar.gz"
+          append_asset macos aarch64 metal '' tar.gz ggml-org/llama.cpp "llama-$TAG-bin-macos-arm64.tar.gz"
+          append_asset windows x86_64 cuda 12.4 zip ggml-org/llama.cpp "llama-$TAG-bin-win-cuda-12.4-x64.zip" "cudart-llama-bin-win-cuda-12.4-x64.zip"
+          append_asset windows x86_64 cuda 13.3 zip ggml-org/llama.cpp "llama-$TAG-bin-win-cuda-13.3-x64.zip" "cudart-llama-bin-win-cuda-13.3-x64.zip"
+          append_asset windows x86_64 hip '' zip ggml-org/llama.cpp "llama-$TAG-bin-win-hip-radeon-x64.zip"
+          append_asset windows x86_64 vulkan '' zip ggml-org/llama.cpp "llama-$TAG-bin-win-vulkan-x64.zip"
+          append_asset windows x86_64 cpu '' zip ggml-org/llama.cpp "llama-$TAG-bin-win-cpu-x64.zip"
+
+          jq -n --arg tag "$TAG" --arg publishedAt "$(date -u +%FT%TZ)" \
+            --argjson artifacts "$entries" \
+            '{schemaVersion:1,channel:"stable",tag:$tag,publishedAt:$publishedAt,artifacts:$artifacts}' \
+            > llamacpp-release.json
+          printf '%s' "$MINISIGN_SECRET_KEY" > minisign.key
+          minisign -S -s minisign.key -m llamacpp-release.json -x llamacpp-release.json.minisig
+          minisign -Vm llamacpp-release.json -P 'RWR+94+uka+PJB5Wbmak5GN2J+eZjIgoj3PGFH4dAoqhBuCfIFjBy6u7' \
+            -x llamacpp-release.json.minisig
+          jq -e --arg tag "$TAG" '
+            .schemaVersion == 1 and .tag == $tag and (.artifacts | length) == 11
+          ' llamacpp-release.json >/dev/null
+
+      - name: Publish versioned catalog, then promote stable channel
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release upload "$TAG" llamacpp-release.json llamacpp-release.json.minisig --clobber
+          if ! gh release view llamacpp-stable >/dev/null 2>&1; then
+            gh release create llamacpp-stable --title 'llama.cpp stable channel' \
+              --notes 'Machine-readable LocalLMOS-supported llama.cpp release channel.' \
+              --latest=false --target "$GITHUB_SHA"
+          fi
+          # The stable pointer is updated last, after every referenced asset and
+          # the immutable versioned catalog are available.
+          gh release upload llamacpp-stable llamacpp-release.json llamacpp-release.json.minisig --clobber

@@ -305,7 +305,10 @@ provision_llamacpp() {
     rm -rf "$_stage"
     LLAMA_BIN="$(find "$LLAMA_DIR" -type f -name llama-server 2>/dev/null | head -n1)"
     $SUDO chmod +x "$LLAMA_BIN"
-    printf 'backend=%s\ntag=%s\n' "$_b" "$_tag" | $SUDO tee "$_marker" >/dev/null
+    _installed_asset="$(llamacpp_asset_for "$_b" "$_tag")"
+    _installed_repo="$(_llx_asset_repo "$_b")"
+    printf 'schema=1\nbackend=%s\ntag=%s\nsource_repo=%s\nasset=%s\n' \
+      "$_b" "$_tag" "$_installed_repo" "$_installed_asset" | $SUDO tee "$_marker" >/dev/null
     LLAMA_BACKEND="$_b"
     _committed="yes"
     break

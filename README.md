@@ -46,6 +46,10 @@ provisions llama.cpp by default; pass `--runtime ollama` on Linux/macOS or
 `-Runtime ollama` on Windows to use an existing Ollama installation instead.
 Binaries are verified by SHA-256 and [minisign](https://jedisct1.github.io/minisign/)
 signature; the agent re-verifies every self-update against an embedded public key.
+Managed llama.cpp desktop installs also receive an opt-in update toast. LocalLMOS
+promotes one supported upstream build per day, builds the missing Linux CUDA
+artifacts, and verifies the signed runtime catalog plus archive checksum before
+staging and installing it.
 
 To install and enroll in one step (pairing code from the dashboard):
 ```sh

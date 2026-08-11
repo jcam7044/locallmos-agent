@@ -39,6 +39,9 @@ minisign-verify = "0.2"
 self-replace = "1"
 semver = "1"
 hex = "0.4"
+flate2 = "1"
+tar = "0.4"
+zip = { version = "2", default-features = false, features = ["deflate"] }
 dotenvy = "0.15"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

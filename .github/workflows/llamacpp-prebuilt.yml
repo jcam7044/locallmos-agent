@@ -281,7 +281,11 @@ jobs:
     needs: [resolve, build-cuda, mirror-upstream]
     # mirror-upstream is skipped when mirror_backends=false; don't let that block us.
     if: ${{ always() && needs.build-cuda.result == 'success' }}
-    runs-on: ubuntu-22.04
+    # Signing/publishing does not produce target binaries, so it need not share
+    # the CUDA build's Ubuntu 22.04 ABI baseline. ubuntu-latest has the minisign
+    # package used successfully by release.yml; jammy's configured repositories
+    # do not, which caused scheduled publish runs to fail at apt install.
+    runs-on: ubuntu-latest
     env:
       TAG: ${{ needs.resolve.outputs.tag }}
     steps:
@@ -332,6 +336,22 @@ jobs:
             -H 'User-Agent: locallmos-llamacpp-builder' \
             "https://api.github.com/repos/ggml-org/llama.cpp/releases/tags/$TAG")"
           entries='[]'
+
+          # Toolkit/runtime versions are part of upstream ROCm asset names and
+          # change independently of the llama.cpp tag (7.2 -> 7.14 in b10373).
+          # Resolve those names from the release instead of hard-coding them.
+          find_upstream_asset() {
+            pattern="$1"
+            jq -er --arg pattern "$pattern" '
+              [.assets[].name | select(test($pattern))]
+              | if length == 1 then .[0]
+                else error("expected exactly one asset matching " + $pattern
+                  + ", found " + (length | tostring))
+                end
+            ' <<<"$upstream"
+          }
+          linux_rocm="$(find_upstream_asset "^llama-${TAG}-bin-ubuntu-rocm-[0-9.]+-x64\\.tar\\.gz$")"
+          windows_amd="$(find_upstream_asset "^llama-${TAG}-bin-win-(hip-radeon|rocm-[0-9.]+)-x64\\.zip$")"
 
           append_asset() {
             os="$1" arch="$2" backend="$3" variant="$4" archive="$5" repo="$6" name="$7" companion="${8:-}"
@@ -385,13 +405,13 @@ jobs:
 
           append_asset linux x86_64 cuda 12.4 tar.gz "$REPO" "llama-$TAG-bin-ubuntu-cuda-12.4-x64.tar.gz"
           append_asset linux x86_64 cuda 13.3 tar.gz "$REPO" "llama-$TAG-bin-ubuntu-cuda-13.3-x64.tar.gz"
-          append_asset linux x86_64 rocm '' tar.gz ggml-org/llama.cpp "llama-$TAG-bin-ubuntu-rocm-7.2-x64.tar.gz"
+          append_asset linux x86_64 rocm '' tar.gz ggml-org/llama.cpp "$linux_rocm"
           append_asset linux x86_64 vulkan '' tar.gz ggml-org/llama.cpp "llama-$TAG-bin-ubuntu-vulkan-x64.tar.gz"
           append_asset linux x86_64 cpu '' tar.gz ggml-org/llama.cpp "llama-$TAG-bin-ubuntu-x64.tar.gz"
           append_asset macos aarch64 metal '' tar.gz ggml-org/llama.cpp "llama-$TAG-bin-macos-arm64.tar.gz"
           append_asset windows x86_64 cuda 12.4 zip ggml-org/llama.cpp "llama-$TAG-bin-win-cuda-12.4-x64.zip" "cudart-llama-bin-win-cuda-12.4-x64.zip"
           append_asset windows x86_64 cuda 13.3 zip ggml-org/llama.cpp "llama-$TAG-bin-win-cuda-13.3-x64.zip" "cudart-llama-bin-win-cuda-13.3-x64.zip"
-          append_asset windows x86_64 hip '' zip ggml-org/llama.cpp "llama-$TAG-bin-win-hip-radeon-x64.zip"
+          append_asset windows x86_64 hip '' zip ggml-org/llama.cpp "$windows_amd"
           append_asset windows x86_64 vulkan '' zip ggml-org/llama.cpp "llama-$TAG-bin-win-vulkan-x64.zip"
           append_asset windows x86_64 cpu '' zip ggml-org/llama.cpp "llama-$TAG-bin-win-cpu-x64.zip"
 

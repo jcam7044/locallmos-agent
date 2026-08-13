@@ -269,10 +269,9 @@ impl Monitor {
     #[cfg(not(target_os = "linux"))]
     fn collect_disks(&mut self, disks: &Disks, now: Instant) -> Vec<DiskStat> {
         // sysinfo surfaces capacity but no cumulative I/O counters on macOS or
-        // Windows, so rates start unset here; macOS fills them in below from the
-        // IORegistry block-storage statistics.
+        // Windows, so rates start unset here.
         let _ = now;
-        let out = disks
+        let mut out = disks
             .iter()
             .filter(|disk| disk.total_space() > 0)
             .map(|disk| {
@@ -296,9 +295,12 @@ impl Monitor {
                 }
             })
             .collect::<Vec<_>>();
-        let mut out = merge_container_volumes(out);
+        // macOS-only post-processing: collapse APFS container aliases and attach
+        // IORegistry I/O counters. Windows keeps sysinfo's per-volume list as-is,
+        // so its behavior is unchanged by these additions.
         #[cfg(target_os = "macos")]
         {
+            out = merge_container_volumes(out);
             let active = self.attach_macos_disk_io(&mut out, now);
             self.disk_counters.retain(|key, _| active.contains(key));
         }
@@ -494,7 +496,7 @@ impl Monitor {
 /// container capacity, so a single physical drive appears twice. Collapse
 /// volumes that share a (non-empty) drive name and capacity into one entry,
 /// merging their mount points, so each physical drive is listed once.
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
 fn merge_container_volumes(disks: Vec<DiskStat>) -> Vec<DiskStat> {
     let mut merged: Vec<DiskStat> = Vec::with_capacity(disks.len());
     for disk in disks {
@@ -1303,6 +1305,7 @@ mod tests {
 mod desktop_tests {
     use super::*;
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn container_volume_aliases_collapse_into_one_physical_drive() {
         let volume = |mount: &str, used: u64, read: Option<f64>| DiskStat {

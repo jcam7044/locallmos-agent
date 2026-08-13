@@ -1,4 +1,5 @@
 export type GpuStat = {
+  id: string;
   index: number;
   name: string | null;
   vendor: string;
@@ -7,6 +8,26 @@ export type GpuStat = {
   memoryTotalBytes: number | null;
   temperatureC: number | null;
   powerWatts: number | null;
+};
+
+export type DiskStat = {
+  id: string;
+  name: string;
+  mountPoint: string;
+  kind: "hdd" | "ssd" | "unknown";
+  usedBytes: number;
+  totalBytes: number;
+  readBytesPerSecond: number | null;
+  writeBytesPerSecond: number | null;
+};
+
+export type SystemMetricsSnapshot = {
+  sampledAtMs: number;
+  cpuUtilizationPct: number | null;
+  memoryUsedBytes: number | null;
+  memoryTotalBytes: number | null;
+  gpus: GpuStat[];
+  disks: DiskStat[];
 };
 
 export type AgentStatus = {

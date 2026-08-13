@@ -3,6 +3,7 @@ import {
   enroll as enrollRig,
   loadModel,
   localUpdate,
+  openResourcesWindow,
   openModelsDir,
   restartRuntime,
   setRuntime,
@@ -71,6 +72,14 @@ export function Dashboard({
     }
   };
 
+  const openResources = async () => {
+    try {
+      await openResourcesWindow();
+    } catch (e) {
+      setUpdateMsg(`Could not open Resources: ${String(e)}`);
+    }
+  };
+
   const kind = local?.runtime.kind ?? "ollama";
   const isLlama = kind === "llamacpp";
   const modelsDir = local?.runtime.modelsDir ?? null;
@@ -122,6 +131,7 @@ export function Dashboard({
                 <button onClick={restart} disabled={busy === "__restart"} style={secondaryButton}>
                   {busy === "__restart" ? "…" : "Refresh"}
                 </button>
+                <button onClick={openResources} style={secondaryButton}>Resources</button>
               </div>
             </>
           ) : (
@@ -133,9 +143,12 @@ export function Dashboard({
                 , then pull a model (e.g.{" "}
                 <span style={{ fontFamily: "monospace" }}>ollama pull llama3.2</span>).
               </p>
-              <button onClick={restart} disabled={busy === "__restart"} style={secondaryButton}>
-                {busy === "__restart" ? "Restarting…" : "Retry / restart Ollama"}
-              </button>
+              <div style={{ display: "flex", gap: 8 }}>
+                <button onClick={restart} disabled={busy === "__restart"} style={secondaryButton}>
+                  {busy === "__restart" ? "Restarting…" : "Retry / restart Ollama"}
+                </button>
+                <button onClick={openResources} style={secondaryButton}>Resources</button>
+              </div>
             </>
           )}
         </div>
@@ -151,7 +164,10 @@ export function Dashboard({
     <div style={{ marginTop: 12, display: "flex", flexDirection: "column", gap: 12 }}>
       {/* System */}
       <div style={card}>
-        <strong style={{ fontSize: 13 }}>System</strong>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <strong style={{ fontSize: 13 }}>System</strong>
+          <button onClick={openResources} style={secondaryButton}>Open Resources</button>
+        </div>
         <Row k="CPU" v={t?.cpuPct != null ? `${t.cpuPct.toFixed(0)}%` : "—"} />
         <Row k="Memory" v={`${formatGB(t?.memoryUsedBytes)} / ${formatGB(t?.memoryTotalBytes)}`} />
         {(t?.gpus ?? []).length === 0 ? (

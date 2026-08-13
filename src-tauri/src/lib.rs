@@ -199,6 +199,46 @@ async fn get_status(state: State<'_, Arc<AppState>>) -> Result<AgentStatus, Stri
     Ok(state.status.lock().await.clone())
 }
 
+/// Lightweight, local-only snapshot for the one-second Resources graphs.
+#[tauri::command]
+async fn system_metrics_snapshot(
+    state: State<'_, Arc<AppState>>,
+) -> Result<monitor::SystemMetricsSnapshot, String> {
+    let telemetry = {
+        let mut monitor = state.monitor.lock().await;
+        monitor.sample().await
+    };
+    Ok(monitor::SystemMetricsSnapshot::from(&telemetry))
+}
+
+fn show_resources_window(app: &tauri::AppHandle) -> Result<(), String> {
+    use tauri::{Manager, WebviewUrl};
+
+    if let Some(window) = app.get_webview_window("resources") {
+        window.show().map_err(|e| e.to_string())?;
+        window.set_focus().map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+
+    tauri::WebviewWindowBuilder::new(
+        app,
+        "resources",
+        WebviewUrl::App("index.html?view=resources".into()),
+    )
+    .title("System Resources — LocalLMOS")
+    .inner_size(980.0, 700.0)
+    .min_inner_size(760.0, 520.0)
+    .resizable(true)
+    .build()
+    .map(|_| ())
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn open_resources_window(app: tauri::AppHandle) -> Result<(), String> {
+    show_resources_window(&app)
+}
+
 #[tauri::command]
 async fn enroll(
     state: State<'_, Arc<AppState>>,
@@ -1449,8 +1489,10 @@ fn run_gui() {
 
             // Tray icon + menu built in code so we can wire menu events.
             let open = MenuItem::with_id(app, "open", "Open", true, None::<&str>)?;
+            let resources =
+                MenuItem::with_id(app, "resources", "Resources", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&open, &quit])?;
+            let menu = Menu::with_items(app, &[&open, &resources, &quit])?;
             TrayIconBuilder::with_id("main")
                 .icon(app.default_window_icon().unwrap().clone())
                 .tooltip("LocalLMOS Agent")
@@ -1460,6 +1502,11 @@ fn run_gui() {
                         if let Some(w) = app.get_webview_window("main") {
                             let _ = w.show();
                             let _ = w.set_focus();
+                        }
+                    }
+                    "resources" => {
+                        if let Err(error) = show_resources_window(app) {
+                            tracing::warn!("failed to open Resources window: {error}");
                         }
                     }
                     "quit" => app.exit(0),
@@ -1495,6 +1542,8 @@ fn run_gui() {
         })
         .invoke_handler(tauri::generate_handler![
             get_status,
+            system_metrics_snapshot,
+            open_resources_window,
             enroll,
             local_status,
             load_model,

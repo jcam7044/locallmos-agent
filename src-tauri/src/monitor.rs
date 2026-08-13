@@ -6,11 +6,18 @@ use nvml_wrapper::enum_wrappers::device::TemperatureSensor;
 use nvml_wrapper::Nvml;
 use serde::Serialize;
 use serde_json::{json, Value};
-use sysinfo::{Disks, System};
+use std::collections::HashMap;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use sysinfo::{Disk, DiskKind, Disks, System};
+
+const SAMPLE_CACHE_TTL: Duration = Duration::from_millis(750);
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GpuStat {
+    /// Stable within a machine, unlike the presentation index which can change
+    /// when a device is attached or a collector is unavailable.
+    pub id: String,
     pub index: u32,
     pub name: Option<String>,
     pub vendor: String,
@@ -21,8 +28,35 @@ pub struct GpuStat {
     pub power_watts: Option<f32>,
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiskStat {
+    pub id: String,
+    pub name: String,
+    pub mount_point: String,
+    pub kind: String,
+    pub used_bytes: u64,
+    pub total_bytes: u64,
+    pub read_bytes_per_second: Option<f64>,
+    pub write_bytes_per_second: Option<f64>,
+}
+
+/// Local IPC contract for the Resources window. This intentionally contains no
+/// runtime/model state and is safe to request frequently while offline.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SystemMetricsSnapshot {
+    pub sampled_at_ms: u64,
+    pub cpu_utilization_pct: Option<f32>,
+    pub memory_used_bytes: Option<u64>,
+    pub memory_total_bytes: Option<u64>,
+    pub gpus: Vec<GpuStat>,
+    pub disks: Vec<DiskStat>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Telemetry {
+    pub sampled_at_ms: u64,
     pub cpu_utilization_pct: Option<f32>,
     pub cpu_temperature_c: Option<f32>,
     pub memory_used_bytes: Option<u64>,
@@ -31,6 +65,7 @@ pub struct Telemetry {
     pub disk_total_bytes: Option<u64>,
     pub uptime_seconds: Option<u64>,
     pub gpus: Vec<GpuStat>,
+    pub disks: Vec<DiskStat>,
 }
 
 impl Telemetry {
@@ -51,9 +86,31 @@ impl Telemetry {
     }
 }
 
+impl From<&Telemetry> for SystemMetricsSnapshot {
+    fn from(value: &Telemetry) -> Self {
+        Self {
+            sampled_at_ms: value.sampled_at_ms,
+            cpu_utilization_pct: value.cpu_utilization_pct,
+            memory_used_bytes: value.memory_used_bytes,
+            memory_total_bytes: value.memory_total_bytes,
+            gpus: value.gpus.clone(),
+            disks: value.disks.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DiskCounters {
+    read_bytes: u64,
+    write_bytes: u64,
+}
+
 pub struct Monitor {
     sys: System,
     nvml: Option<Nvml>,
+    cpu_ready: bool,
+    last_sample: Option<(Instant, Telemetry)>,
+    disk_counters: HashMap<String, (Instant, DiskCounters)>,
     /// Apple Silicon GPU name, resolved once (the chip model never changes).
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     apple_chip: Option<String>,
@@ -69,30 +126,51 @@ impl Monitor {
         Self {
             sys: System::new_all(),
             nvml,
+            cpu_ready: false,
+            last_sample: None,
+            disk_counters: HashMap::new(),
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             apple_chip: apple_chip_name(),
         }
     }
 
     pub async fn sample(&mut self) -> Telemetry {
-        // CPU usage needs two refreshes spaced by a short interval.
-        self.sys.refresh_cpu_usage();
-        tokio::time::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL).await;
+        let now = Instant::now();
+        if let Some((sampled, telemetry)) = &self.last_sample {
+            if now.duration_since(*sampled) < SAMPLE_CACHE_TTL {
+                return telemetry.clone();
+            }
+        }
+
+        // Only the first sample needs two spaced refreshes. Subsequent callers
+        // arrive at graph/dashboard cadence and can use the previous baseline.
+        if !self.cpu_ready {
+            self.sys.refresh_cpu_usage();
+            tokio::time::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL).await;
+            self.cpu_ready = true;
+        }
         self.sys.refresh_cpu_usage();
         self.sys.refresh_memory();
 
         let disks = Disks::new_with_refreshed_list();
-        let (disk_total, disk_used) = disks.iter().fold((0u64, 0u64), |(t, u), d| {
+        let visible_disks: Vec<&Disk> = disks.iter().filter(|d| is_fixed_volume(d)).collect();
+        let (disk_total, disk_used) = visible_disks.iter().fold((0u64, 0u64), |(t, u), d| {
             (t + d.total_space(), u + (d.total_space() - d.available_space()))
         });
+        let disk_stats = self.collect_disks(&visible_disks, now);
 
         let mut t = Telemetry {
+            sampled_at_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
             cpu_utilization_pct: Some(self.sys.global_cpu_usage()),
             memory_used_bytes: Some(self.sys.used_memory()),
             memory_total_bytes: Some(self.sys.total_memory()),
             disk_used_bytes: Some(disk_used),
             disk_total_bytes: Some(disk_total),
             uptime_seconds: Some(System::uptime()),
+            disks: disk_stats,
             ..Default::default()
         };
 
@@ -120,7 +198,47 @@ impl Monitor {
             t.gpus.extend(extra);
         }
 
+        self.last_sample = Some((now, t.clone()));
         t
+    }
+
+    fn collect_disks(&mut self, disks: &[&Disk], now: Instant) -> Vec<DiskStat> {
+        let mut active_counter_keys = Vec::new();
+        let mut out = disks
+            .iter()
+            .map(|disk| {
+                let name = disk.name().to_string_lossy().into_owned();
+                let mount_point = disk.mount_point().to_string_lossy().into_owned();
+                let id = format!("{name}@{mount_point}");
+                let counter_key = disk_counter_key(&name);
+                let counters = counter_key.as_deref().and_then(read_disk_counters);
+                let rates = counters.and_then(|current| {
+                    let key = counter_key.as_ref()?;
+                    active_counter_keys.push(key.clone());
+                    let previous = self.disk_counters.insert(key.clone(), (now, current));
+                    let (sampled, old) = previous?;
+                    let elapsed = now.duration_since(sampled).as_secs_f64();
+                    Some((
+                        delta_rate(old.read_bytes, current.read_bytes, elapsed),
+                        delta_rate(old.write_bytes, current.write_bytes, elapsed),
+                    ))
+                });
+                DiskStat {
+                    id,
+                    name,
+                    mount_point,
+                    kind: disk_kind(disk.kind()).to_string(),
+                    used_bytes: disk.total_space().saturating_sub(disk.available_space()),
+                    total_bytes: disk.total_space(),
+                    read_bytes_per_second: rates.and_then(|r| r.0),
+                    write_bytes_per_second: rates.and_then(|r| r.1),
+                }
+            })
+            .collect::<Vec<_>>();
+        self.disk_counters
+            .retain(|key, _| active_counter_keys.iter().any(|active| active == key));
+        out.sort_by(|a, b| a.mount_point.cmp(&b.mount_point).then(a.name.cmp(&b.name)));
+        out
     }
 
     /// Apple Silicon integrated GPU: reports the chip name and unified-memory
@@ -129,6 +247,7 @@ impl Monitor {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn collect_apple(&self) -> Vec<GpuStat> {
         vec![GpuStat {
+            id: "apple:integrated".into(),
             index: 0, // re-indexed by the caller
             name: self.apple_chip.clone(),
             vendor: "apple".into(),
@@ -141,6 +260,70 @@ impl Monitor {
     }
 }
 
+fn disk_kind(kind: DiskKind) -> &'static str {
+    match kind {
+        DiskKind::HDD => "hdd",
+        DiskKind::SSD => "ssd",
+        DiskKind::Unknown(_) => "unknown",
+    }
+}
+
+fn is_fixed_volume(disk: &Disk) -> bool {
+    if disk.is_removable() || disk.total_space() == 0 {
+        return false;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // sysinfo already excludes tmpfs and network mounts. Requiring a real
+        // block-device path also filters container overlay/pseudo mounts.
+        return disk.name().to_string_lossy().starts_with("/dev/");
+    }
+    #[cfg(not(target_os = "linux"))]
+    true
+}
+
+fn delta_rate(previous: u64, current: u64, elapsed_seconds: f64) -> Option<f64> {
+    if elapsed_seconds <= 0.0 || current < previous {
+        return None;
+    }
+    Some((current - previous) as f64 / elapsed_seconds)
+}
+
+/// Linux exposes cumulative block counters without requiring elevated access.
+/// Other platforms retain capacity telemetry and explicitly report I/O as
+/// unavailable until an equally reliable native mapping exists.
+#[cfg(target_os = "linux")]
+fn disk_counter_key(name: &str) -> Option<String> {
+    let canonical = std::fs::canonicalize(name).unwrap_or_else(|_| name.into());
+    canonical.file_name()?.to_str().map(str::to_owned)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn disk_counter_key(_name: &str) -> Option<String> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn read_disk_counters(device: &str) -> Option<DiskCounters> {
+    // /sys block stats use 512-byte sectors for fields 3 and 7. Partition
+    // nodes expose the same layout, which lets mounted volumes remain distinct.
+    let raw = std::fs::read_to_string(format!("/sys/class/block/{device}/stat")).ok()?;
+    let values = raw
+        .split_whitespace()
+        .map(str::parse::<u64>)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    Some(DiskCounters {
+        read_bytes: values.get(2)?.saturating_mul(512),
+        write_bytes: values.get(6)?.saturating_mul(512),
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_disk_counters(_device: &str) -> Option<DiskCounters> {
+    None
+}
+
 fn collect_nvidia(nvml: &Nvml) -> Vec<GpuStat> {
     let mut out = Vec::new();
     let count = nvml.device_count().unwrap_or(0);
@@ -148,6 +331,7 @@ fn collect_nvidia(nvml: &Nvml) -> Vec<GpuStat> {
         let Ok(dev) = nvml.device_by_index(i) else { continue };
         let mem = dev.memory_info().ok();
         out.push(GpuStat {
+            id: dev.uuid().unwrap_or_else(|_| format!("nvidia:{i}")),
             index: i,
             name: dev.name().ok(),
             vendor: "nvidia".into(),
@@ -233,6 +417,7 @@ fn hwmon_read(dev: &str, file: &str) -> Option<f32> {
 #[cfg(target_os = "linux")]
 fn collect_amd(dev: &str) -> GpuStat {
     GpuStat {
+        id: gpu_sysfs_id("amd", dev),
         index: 0, // re-indexed by the caller
         // sysfs has no friendly name; the web falls back to the vendor string.
         name: None,
@@ -250,6 +435,7 @@ fn collect_amd(dev: &str) -> GpuStat {
 #[cfg(target_os = "linux")]
 fn collect_intel(dev: &str) -> GpuStat {
     GpuStat {
+        id: gpu_sysfs_id("intel", dev),
         index: 0, // re-indexed by the caller
         name: std::fs::read_to_string(format!("{dev}/label"))
             .ok()
@@ -263,6 +449,15 @@ fn collect_intel(dev: &str) -> GpuStat {
         temperature_c: None,
         power_watts: None,
     }
+}
+
+#[cfg(target_os = "linux")]
+fn gpu_sysfs_id(vendor: &str, dev: &str) -> String {
+    let suffix = std::fs::canonicalize(dev)
+        .ok()
+        .and_then(|path| path.file_name().map(|name| name.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| dev.to_string());
+    format!("{vendor}:{suffix}")
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -322,5 +517,39 @@ mod tests {
         assert_eq!(g.memory_used_bytes, None);
         assert_eq!(g.temperature_c, None);
         let _ = fs::remove_dir_all(&dev);
+    }
+
+    #[test]
+    fn disk_rate_handles_normal_reset_and_zero_elapsed_counters() {
+        assert_eq!(delta_rate(1_000, 4_000, 2.0), Some(1_500.0));
+        assert_eq!(delta_rate(4_000, 1_000, 2.0), None);
+        assert_eq!(delta_rate(1_000, 4_000, 0.0), None);
+    }
+
+    #[test]
+    fn system_snapshot_serializes_the_local_ipc_contract() {
+        let telemetry = Telemetry {
+            sampled_at_ms: 42,
+            cpu_utilization_pct: Some(12.5),
+            memory_used_bytes: Some(10),
+            memory_total_bytes: Some(20),
+            gpus: vec![GpuStat {
+                id: "nvidia:gpu-1".into(),
+                index: 0,
+                name: Some("GPU".into()),
+                vendor: "nvidia".into(),
+                utilization_pct: Some(25.0),
+                memory_used_bytes: Some(5),
+                memory_total_bytes: Some(10),
+                temperature_c: None,
+                power_watts: None,
+            }],
+            disks: vec![],
+            ..Default::default()
+        };
+        let value = serde_json::to_value(SystemMetricsSnapshot::from(&telemetry)).unwrap();
+        assert_eq!(value["sampledAtMs"], 42);
+        assert_eq!(value["gpus"][0]["id"], "nvidia:gpu-1");
+        assert!(value.get("uptimeSeconds").is_none());
     }
 }

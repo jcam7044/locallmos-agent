@@ -22,10 +22,14 @@ import type {
   McpTrust,
   ChatContextInfo,
   LlamaCppUpdateInfo,
+  SystemMetricsSnapshot,
 } from "./types";
 
 export const getLocalStatus = () => invoke<LocalStatus>("local_status");
 export const getAgentStatus = () => invoke<AgentStatus>("get_status");
+export const getSystemMetricsSnapshot = () =>
+  invoke<SystemMetricsSnapshot>("system_metrics_snapshot");
+export const openResourcesWindow = () => invoke<void>("open_resources_window");
 export const loadModel = (model: string) => invoke("load_model", { model });
 export const unloadModel = (model: string) => invoke("unload_model", { model });
 export const getModelLoadSettings = (modelId: string) =>

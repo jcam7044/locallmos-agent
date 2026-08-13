@@ -340,18 +340,19 @@ jobs:
           # Toolkit/runtime versions are part of upstream ROCm asset names and
           # change independently of the llama.cpp tag (7.2 -> 7.14 in b10373).
           # Resolve those names from the release instead of hard-coding them.
-          find_upstream_asset() {
+          find_optional_upstream_asset() {
             pattern="$1"
-            jq -er --arg pattern "$pattern" '
+            jq -r --arg pattern "$pattern" '
               [.assets[].name | select(test($pattern))]
               | if length == 1 then .[0]
-                else error("expected exactly one asset matching " + $pattern
+                elif length == 0 then empty
+                else error("expected at most one asset matching " + $pattern
                   + ", found " + (length | tostring))
                 end
             ' <<<"$upstream"
           }
-          linux_rocm="$(find_upstream_asset "^llama-${TAG}-bin-ubuntu-rocm-[0-9.]+-x64\\.tar\\.gz$")"
-          windows_amd="$(find_upstream_asset "^llama-${TAG}-bin-win-(hip-radeon|rocm-[0-9.]+)-x64\\.zip$")"
+          linux_rocm="$(find_optional_upstream_asset "^llama-${TAG}-bin-ubuntu-rocm-[0-9.]+-x64\\.tar\\.gz$")"
+          windows_amd="$(find_optional_upstream_asset "^llama-${TAG}-bin-win-(hip-radeon|rocm-[0-9.]+)-x64\\.zip$")"
 
           append_asset() {
             os="$1" arch="$2" backend="$3" variant="$4" archive="$5" repo="$6" name="$7" companion="${8:-}"
@@ -403,15 +404,24 @@ jobs:
                   companions:$companions}]')"
           }
 
+          append_optional_asset() {
+            name="$7"
+            if [[ -n "$name" ]]; then
+              append_asset "$@"
+            else
+              echo "Optional $3 artifact is unavailable for $1-$2 at $TAG; users on that backend keep their current build."
+            fi
+          }
+
           append_asset linux x86_64 cuda 12.4 tar.gz "$REPO" "llama-$TAG-bin-ubuntu-cuda-12.4-x64.tar.gz"
           append_asset linux x86_64 cuda 13.3 tar.gz "$REPO" "llama-$TAG-bin-ubuntu-cuda-13.3-x64.tar.gz"
-          append_asset linux x86_64 rocm '' tar.gz ggml-org/llama.cpp "$linux_rocm"
+          append_optional_asset linux x86_64 rocm '' tar.gz ggml-org/llama.cpp "$linux_rocm"
           append_asset linux x86_64 vulkan '' tar.gz ggml-org/llama.cpp "llama-$TAG-bin-ubuntu-vulkan-x64.tar.gz"
           append_asset linux x86_64 cpu '' tar.gz ggml-org/llama.cpp "llama-$TAG-bin-ubuntu-x64.tar.gz"
           append_asset macos aarch64 metal '' tar.gz ggml-org/llama.cpp "llama-$TAG-bin-macos-arm64.tar.gz"
           append_asset windows x86_64 cuda 12.4 zip ggml-org/llama.cpp "llama-$TAG-bin-win-cuda-12.4-x64.zip" "cudart-llama-bin-win-cuda-12.4-x64.zip"
           append_asset windows x86_64 cuda 13.3 zip ggml-org/llama.cpp "llama-$TAG-bin-win-cuda-13.3-x64.zip" "cudart-llama-bin-win-cuda-13.3-x64.zip"
-          append_asset windows x86_64 hip '' zip ggml-org/llama.cpp "$windows_amd"
+          append_optional_asset windows x86_64 hip '' zip ggml-org/llama.cpp "$windows_amd"
           append_asset windows x86_64 vulkan '' zip ggml-org/llama.cpp "llama-$TAG-bin-win-vulkan-x64.zip"
           append_asset windows x86_64 cpu '' zip ggml-org/llama.cpp "llama-$TAG-bin-win-cpu-x64.zip"
 
@@ -424,7 +434,10 @@ jobs:
           minisign -Vm llamacpp-release.json -P 'RWR+94+uka+PJB5Wbmak5GN2J+eZjIgoj3PGFH4dAoqhBuCfIFjBy6u7' \
             -x llamacpp-release.json.minisig
           jq -e --arg tag "$TAG" '
-            .schemaVersion == 1 and .tag == $tag and (.artifacts | length) == 11
+            .schemaVersion == 1 and .tag == $tag
+            and (.artifacts | length) >= 9
+            and ([.artifacts[] | "\(.os)/\(.arch)/\(.backend)/\(.variant // "")"] | unique | length)
+              == (.artifacts | length)
           ' llamacpp-release.json >/dev/null
 
       - name: Publish versioned catalog, then promote stable channel

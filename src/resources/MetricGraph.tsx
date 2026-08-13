@@ -27,6 +27,14 @@ export function polylineSegments(
   return segments;
 }
 
+export function areaPoints(points: string, height: number) {
+  const coordinates = points.split(" ");
+  const firstX = coordinates[0]?.split(",")[0];
+  const lastX = coordinates.at(-1)?.split(",")[0];
+  if (firstX == null || lastX == null) return "";
+  return `${firstX},${height} ${points} ${lastX},${height}`;
+}
+
 export function MetricGraph({
   label,
   series,
@@ -65,8 +73,20 @@ export function MetricGraph({
         ))}
         {series.flatMap((item) =>
           polylineSegments(item.values, width, height, ceiling).map((points, index) => (
+            <polygon
+              key={`${item.label}-area-${index}`}
+              points={areaPoints(points, height)}
+              fill={item.color}
+              fillOpacity="0.2"
+              stroke="none"
+              aria-hidden="true"
+            />
+          )),
+        )}
+        {series.flatMap((item) =>
+          polylineSegments(item.values, width, height, ceiling).map((points, index) => (
             <polyline
-              key={`${item.label}-${index}`}
+              key={`${item.label}-line-${index}`}
               points={points}
               fill="none"
               stroke={item.color}

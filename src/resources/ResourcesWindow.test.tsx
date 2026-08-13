@@ -1,7 +1,7 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import type { SystemMetricsSnapshot } from "../types";
-import { polylineSegments } from "./MetricGraph";
+import { areaPoints, MetricGraph, polylineSegments } from "./MetricGraph";
 import { ResourcesView } from "./ResourcesWindow";
 import { appendSample, availableDeviceKeys, diskValues, gpuValues } from "./history";
 
@@ -60,6 +60,22 @@ describe("metric graph", () => {
     expect(segments).toHaveLength(2);
     expect(segments[0]).toContain("90.00");
     expect(segments[1]).toContain("60.00");
+  });
+
+  it("closes each line segment against the graph baseline for area fill", () => {
+    expect(areaPoints("10.00,80.00 20.00,60.00", 100)).toBe(
+      "10.00,100 10.00,80.00 20.00,60.00 20.00,100",
+    );
+    const html = renderToStaticMarkup(
+      <MetricGraph
+        label="Filled metric"
+        series={[{ label: "Usage", color: "#38bdf8", values: [10, 20] }]}
+        max={100}
+      />,
+    );
+    expect(html).toContain("<polygon");
+    expect(html).toContain('fill-opacity="0.2"');
+    expect(html).toContain("<polyline");
   });
 });
 

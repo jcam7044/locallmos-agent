@@ -269,7 +269,7 @@ impl Monitor {
     #[cfg(not(target_os = "linux"))]
     fn collect_disks(&mut self, disks: &Disks, now: Instant) -> Vec<DiskStat> {
         let mut active_counter_keys = Vec::new();
-        let mut out = disks
+        let out = disks
             .iter()
             .filter(|disk| disk.total_space() > 0)
             .map(|disk| {
@@ -308,6 +308,7 @@ impl Monitor {
             .collect::<Vec<_>>();
         self.disk_counters
             .retain(|key, _| active_counter_keys.iter().any(|active| active == key));
+        let mut out = merge_container_volumes(out);
         out.sort_by(|a, b| a.display_name.cmp(&b.display_name).then(a.name.cmp(&b.name)));
         out
     }
@@ -454,6 +455,42 @@ impl Monitor {
             power_watts: None,
         }]
     }
+}
+
+/// macOS surfaces every mounted volume of an APFS container as its own disk:
+/// the read-only System volume at `/` and the writable Data volume at
+/// `/System/Volumes/Data` both report the name "Macintosh HD" and the shared
+/// container capacity, so a single physical drive appears twice. Collapse
+/// volumes that share a (non-empty) drive name and capacity into one entry,
+/// merging their mount points, so each physical drive is listed once.
+#[cfg(not(target_os = "linux"))]
+fn merge_container_volumes(disks: Vec<DiskStat>) -> Vec<DiskStat> {
+    let mut merged: Vec<DiskStat> = Vec::with_capacity(disks.len());
+    for disk in disks {
+        let alias = merged.iter_mut().find(|existing| {
+            !existing.name.is_empty()
+                && existing.name == disk.name
+                && existing.total_bytes == disk.total_bytes
+        });
+        let Some(existing) = alias else {
+            merged.push(disk);
+            continue;
+        };
+        for mount in disk.mount_points {
+            if !existing.mount_points.contains(&mount) {
+                existing.mount_points.push(mount);
+            }
+        }
+        existing.mount_points.sort();
+        existing.used_bytes = existing.used_bytes.max(disk.used_bytes);
+        existing.read_bytes_per_second = existing
+            .read_bytes_per_second
+            .or(disk.read_bytes_per_second);
+        existing.write_bytes_per_second = existing
+            .write_bytes_per_second
+            .or(disk.write_bytes_per_second);
+    }
+    merged
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -682,16 +719,46 @@ fn detect_network_metadata(name: &str) -> Option<NetworkMetadata> {
         else {
             continue;
         };
-        if device == name {
-            let wireless = port.to_ascii_lowercase().contains("wi-fi");
-            return Some(NetworkMetadata {
-                display_name: format!("{port} Connection"),
-                hardware_name: None,
-                interface_type: if wireless { "wifi" } else { "ethernet" }.into(),
-            });
+        if device != name {
+            continue;
         }
+        let wireless = port.to_ascii_lowercase().contains("wi-fi");
+        // macOS lists Thunderbolt bus ports ("Thunderbolt 1/2"), the Thunderbolt
+        // Bridge, and other synthetic interfaces as "hardware ports" too. Those
+        // carry a locally-administered MAC (the 0x02 bit of the first octet is
+        // set), whereas real NICs — built-in Wi-Fi/Ethernet and physical
+        // USB/Thunderbolt adapters — have a burned-in universally-administered
+        // MAC. Keep Wi-Fi always, and otherwise only genuine wired hardware, so
+        // the panel shows physical adapters rather than virtual bus interfaces.
+        let mac = block
+            .lines()
+            .find_map(|line| line.strip_prefix("Ethernet Address: "));
+        if !wireless && !is_universally_administered_mac(mac) {
+            return None;
+        }
+        return Some(NetworkMetadata {
+            display_name: format!("{port} Connection"),
+            hardware_name: None,
+            interface_type: if wireless { "wifi" } else { "ethernet" }.into(),
+        });
     }
     None
+}
+
+/// A MAC is universally administered (burned into real hardware) when the
+/// second-least-significant bit of the first octet is clear; a set bit marks a
+/// locally-administered address, which macOS assigns to synthetic interfaces
+/// such as Thunderbolt bus ports and the Thunderbolt Bridge. When the address
+/// is unreadable, assume real hardware rather than hide a possibly valid NIC.
+#[cfg(target_os = "macos")]
+fn is_universally_administered_mac(mac: Option<&str>) -> bool {
+    match mac
+        .and_then(|mac| mac.split(':').next())
+        .and_then(|octet| u8::from_str_radix(octet.trim(), 16).ok())
+    {
+        Some(first_octet) => first_octet & 0x02 == 0,
+        None => true,
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -1063,5 +1130,64 @@ mod tests {
             "TS32GSSD370"
         );
         let _ = fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(all(test, not(target_os = "linux")))]
+mod desktop_tests {
+    use super::*;
+
+    #[test]
+    fn container_volume_aliases_collapse_into_one_physical_drive() {
+        let volume = |mount: &str, used: u64, read: Option<f64>| DiskStat {
+            id: format!("Macintosh HD@{mount}"),
+            name: "Macintosh HD".into(),
+            display_name: "Macintosh HD".into(),
+            mount_points: vec![mount.into()],
+            kind: "ssd".into(),
+            transport: None,
+            removable: false,
+            used_bytes: Some(used),
+            total_bytes: 460_000,
+            read_bytes_per_second: read,
+            write_bytes_per_second: None,
+            total_read_bytes: None,
+            total_written_bytes: None,
+        };
+        let external = DiskStat {
+            total_bytes: 999_000,
+            ..volume("/Volumes/Backup", 5, None)
+        };
+        let merged = merge_container_volumes(vec![
+            volume("/System/Volumes/Data", 333_000, None),
+            volume("/", 12_000, Some(2.0)),
+            external,
+        ]);
+        // The two APFS aliases collapse; the unrelated external drive stays.
+        assert_eq!(merged.len(), 2);
+        let macintosh = merged
+            .iter()
+            .find(|disk| disk.total_bytes == 460_000)
+            .unwrap();
+        assert_eq!(
+            macintosh.mount_points,
+            vec!["/".to_string(), "/System/Volumes/Data".to_string()]
+        );
+        assert_eq!(macintosh.used_bytes, Some(333_000));
+        assert_eq!(macintosh.read_bytes_per_second, Some(2.0));
+        assert!(merged.iter().any(|disk| disk.total_bytes == 999_000));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn universally_administered_mac_flags_physical_versus_synthetic_interfaces() {
+        // Burned-in NIC addresses (Wi-Fi, a real USB/Thunderbolt adapter).
+        assert!(is_universally_administered_mac(Some("1c:f6:4c:b8:62:38")));
+        // Locally-administered: Thunderbolt bus ports and the Thunderbolt Bridge.
+        assert!(!is_universally_administered_mac(Some("36:57:3c:bb:9f:40")));
+        assert!(!is_universally_administered_mac(Some("3e:5b:01:1e:cc:46")));
+        // Unreadable/absent MAC keeps the interface rather than hiding it.
+        assert!(is_universally_administered_mac(None));
+        assert!(is_universally_administered_mac(Some("")));
     }
 }

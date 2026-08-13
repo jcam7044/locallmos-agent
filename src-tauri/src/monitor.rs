@@ -268,7 +268,10 @@ impl Monitor {
 
     #[cfg(not(target_os = "linux"))]
     fn collect_disks(&mut self, disks: &Disks, now: Instant) -> Vec<DiskStat> {
-        let mut active_counter_keys = Vec::new();
+        // sysinfo surfaces capacity but no cumulative I/O counters on macOS or
+        // Windows, so rates start unset here; macOS fills them in below from the
+        // IORegistry block-storage statistics.
+        let _ = now;
         let out = disks
             .iter()
             .filter(|disk| disk.total_space() > 0)
@@ -276,19 +279,6 @@ impl Monitor {
                 let name = disk.name().to_string_lossy().into_owned();
                 let mount_point = disk.mount_point().to_string_lossy().into_owned();
                 let id = format!("{name}@{mount_point}");
-                let counter_key = disk_counter_key(&name);
-                let counters = counter_key.as_deref().and_then(read_disk_counters);
-                let rates = counters.and_then(|current| {
-                    let key = counter_key.as_ref()?;
-                    active_counter_keys.push(key.clone());
-                    let previous = self.disk_counters.insert(key.clone(), (now, current));
-                    let (sampled, old) = previous?;
-                    let elapsed = now.duration_since(sampled).as_secs_f64();
-                    Some((
-                        delta_rate(old.read_bytes, current.read_bytes, elapsed),
-                        delta_rate(old.write_bytes, current.write_bytes, elapsed),
-                    ))
-                });
                 DiskStat {
                     id,
                     display_name: if name.is_empty() { mount_point.clone() } else { name.clone() },
@@ -299,18 +289,57 @@ impl Monitor {
                     removable: disk.is_removable(),
                     used_bytes: Some(disk.total_space().saturating_sub(disk.available_space())),
                     total_bytes: disk.total_space(),
-                    read_bytes_per_second: rates.and_then(|r| r.0),
-                    write_bytes_per_second: rates.and_then(|r| r.1),
+                    read_bytes_per_second: None,
+                    write_bytes_per_second: None,
                     total_read_bytes: None,
                     total_written_bytes: None,
                 }
             })
             .collect::<Vec<_>>();
-        self.disk_counters
-            .retain(|key, _| active_counter_keys.iter().any(|active| active == key));
         let mut out = merge_container_volumes(out);
+        #[cfg(target_os = "macos")]
+        {
+            let active = self.attach_macos_disk_io(&mut out, now);
+            self.disk_counters.retain(|key, _| active.contains(key));
+        }
         out.sort_by(|a, b| a.display_name.cmp(&b.display_name).then(a.name.cmp(&b.name)));
         out
+    }
+
+    /// Attach live and cumulative read/write byte counters to each disk from the
+    /// IORegistry. macOS reports I/O only on the physical `IOBlockStorageDriver`,
+    /// so a volume's mount point is resolved to its whole physical disk and that
+    /// device's counters are applied. Returns the physical disks seen this sample
+    /// so stale rate baselines can be pruned.
+    #[cfg(target_os = "macos")]
+    fn attach_macos_disk_io(&mut self, disks: &mut [DiskStat], now: Instant) -> Vec<String> {
+        let counters = macos_disk_io();
+        let mut active = Vec::new();
+        for disk in disks.iter_mut() {
+            let Some(device) = disk
+                .mount_points
+                .iter()
+                .find_map(|mount| mount_whole_disk(mount))
+            else {
+                continue;
+            };
+            let Some(current) = counters.get(&device).copied() else {
+                continue;
+            };
+            disk.total_read_bytes = Some(current.read_bytes);
+            disk.total_written_bytes = Some(current.write_bytes);
+            if let Some((sampled, previous)) =
+                self.disk_counters.insert(device.clone(), (now, current))
+            {
+                let elapsed = now.duration_since(sampled).as_secs_f64();
+                disk.read_bytes_per_second =
+                    delta_rate(previous.read_bytes, current.read_bytes, elapsed);
+                disk.write_bytes_per_second =
+                    delta_rate(previous.write_bytes, current.write_bytes, elapsed);
+            }
+            active.push(device);
+        }
+        active
     }
 
     #[cfg(target_os = "linux")]
@@ -438,18 +467,20 @@ impl Monitor {
         out
     }
 
-    /// Apple Silicon integrated GPU: reports the chip name and unified-memory
-    /// total (== system RAM). Utilization/power are `None` — accurate figures
-    /// need root `powermetrics --samplers gpu_power`, deferred for now.
+    /// Apple Silicon integrated GPU: chip name, unified-memory total (== system
+    /// RAM), plus live utilization and in-use memory read from the accelerator's
+    /// IORegistry `PerformanceStatistics` (no elevated access). Temperature and
+    /// power still need root `powermetrics --samplers gpu_power`, so stay `None`.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn collect_apple(&self) -> Vec<GpuStat> {
+        let performance = apple_gpu_performance();
         vec![GpuStat {
             id: "apple:integrated".into(),
             index: 0, // re-indexed by the caller
             name: self.apple_chip.clone(),
             vendor: "apple".into(),
-            utilization_pct: None,
-            memory_used_bytes: None,
+            utilization_pct: performance.utilization_pct,
+            memory_used_bytes: performance.memory_used_bytes,
             memory_total_bytes: Some(self.sys.total_memory()),
             temperature_c: None,
             power_watts: None,
@@ -800,13 +831,6 @@ fn connection_metadata(wireless: bool, hardware_name: Option<String>) -> Network
 }
 
 /// Linux exposes cumulative block counters without requiring elevated access.
-/// Other platforms retain capacity telemetry and explicitly report I/O as
-/// unavailable until an equally reliable native mapping exists.
-#[cfg(not(target_os = "linux"))]
-fn disk_counter_key(_name: &str) -> Option<String> {
-    None
-}
-
 #[cfg(target_os = "linux")]
 fn read_disk_counters(device: &str) -> Option<DiskCounters> {
     // /sys block stats use 512-byte sectors for fields 3 and 7. Partition
@@ -823,9 +847,151 @@ fn read_disk_counters(device: &str) -> Option<DiskCounters> {
     })
 }
 
-#[cfg(not(target_os = "linux"))]
-fn read_disk_counters(_device: &str) -> Option<DiskCounters> {
-    None
+/// macOS reports cumulative read/write bytes per physical drive on each
+/// `IOBlockStorageDriver`. Every volume, container, and partition that lives on
+/// a drive appears as a `BSD Name` in that driver's IORegistry subtree, so the
+/// driver's counters are mapped onto each whole physical disk (`disk0`,
+/// `disk3`, …) found beneath it. No elevated access is required.
+#[cfg(target_os = "macos")]
+fn macos_disk_io() -> HashMap<String, DiskCounters> {
+    let Some(output) = std::process::Command::new("ioreg")
+        // `-l` is required so child IOMedia nodes expose their `BSD Name`; the
+        // driver's `Statistics` (with the byte counters) is on the root either
+        // way. `-w 0` disables line wrapping so each dictionary stays on one line.
+        .args(["-r", "-l", "-w", "0", "-c", "IOBlockStorageDriver"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+    else {
+        return HashMap::new();
+    };
+    parse_block_storage_io(&String::from_utf8_lossy(&output.stdout))
+}
+
+#[cfg(target_os = "macos")]
+fn parse_block_storage_io(text: &str) -> HashMap<String, DiskCounters> {
+    let mut map = HashMap::new();
+    let mut stats: Option<DiskCounters> = None;
+    let mut disks_in_group: Vec<String> = Vec::new();
+    let flush = |map: &mut HashMap<String, DiskCounters>,
+                 stats: Option<DiskCounters>,
+                 group: &[String]| {
+        if let Some(stats) = stats {
+            for device in group {
+                map.entry(device.clone()).or_insert(stats);
+            }
+        }
+    };
+    for line in text.lines() {
+        // Each matched driver is printed as its own subtree root, so a new driver
+        // line closes the previous group before its statistics/devices are read.
+        if line.contains("+-o IOBlockStorageDriver") {
+            flush(&mut map, stats.take(), &disks_in_group);
+            disks_in_group.clear();
+        } else if stats.is_none() && line.contains("\"Statistics\" = {") {
+            // A driver subtree also lists unrelated `Statistics` dicts (latency,
+            // I/O reporting); keep the first that carries byte counters — the
+            // driver's own, printed before any child node's properties.
+            let dict = &line[line.find("\"Statistics\" = {").unwrap()..];
+            if let (Some(read_bytes), Some(write_bytes)) = (
+                ioreg_dict_number(dict, "Bytes (Read)"),
+                ioreg_dict_number(dict, "Bytes (Write)"),
+            ) {
+                stats = Some(DiskCounters {
+                    read_bytes,
+                    write_bytes,
+                });
+            }
+        } else if let Some(device) = line
+            .split_once("\"BSD Name\" = \"")
+            .and_then(|(_, rest)| rest.split('"').next())
+            .and_then(whole_disk_token)
+        {
+            if !disks_in_group.contains(&device) {
+                disks_in_group.push(device);
+            }
+        }
+    }
+    flush(&mut map, stats.take(), &disks_in_group);
+    map
+}
+
+/// Resolve a mount point to its whole physical disk (for example `/` →
+/// `disk0`), following APFS synthesized devices back to the backing hardware via
+/// `statfs`. The IORegistry places both the synthesized and physical disk BSD
+/// names in the same driver subtree, so either resolves to that drive's I/O.
+#[cfg(target_os = "macos")]
+fn mount_whole_disk(mount: &str) -> Option<String> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(std::path::Path::new(mount).as_os_str().as_bytes()).ok()?;
+    let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statfs(path.as_ptr(), &mut stat) } != 0 {
+        return None;
+    }
+    let device = unsafe { std::ffi::CStr::from_ptr(stat.f_mntfromname.as_ptr()) }
+        .to_str()
+        .ok()?;
+    whole_disk_token(device.strip_prefix("/dev/").unwrap_or(device))
+}
+
+/// Reduce any BSD disk identifier to its whole-disk form: `disk3s1s1` → `disk3`.
+#[cfg(target_os = "macos")]
+fn whole_disk_token(bsd: &str) -> Option<String> {
+    let number: String = bsd
+        .strip_prefix("disk")?
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    (!number.is_empty()).then(|| format!("disk{number}"))
+}
+
+/// Parse an unsigned integer value from an `ioreg` inline dictionary, matched as
+/// `"<key>"=<digits>`. Used for both block-storage and GPU statistics.
+#[cfg(target_os = "macos")]
+fn ioreg_dict_number(dict: &str, key: &str) -> Option<u64> {
+    let needle = format!("\"{key}\"=");
+    let rest = &dict[dict.find(&needle)? + needle.len()..];
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    rest[..end].parse().ok()
+}
+
+/// Live Apple Silicon GPU figures from the accelerator's IORegistry
+/// `PerformanceStatistics` dictionary — readable without elevated access.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Default)]
+struct AppleGpuPerformance {
+    utilization_pct: Option<f32>,
+    memory_used_bytes: Option<u64>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn apple_gpu_performance() -> AppleGpuPerformance {
+    let Some(output) = std::process::Command::new("ioreg")
+        .args(["-r", "-d", "1", "-w", "0", "-c", "IOAccelerator"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+    else {
+        return AppleGpuPerformance::default();
+    };
+    parse_gpu_performance(&String::from_utf8_lossy(&output.stdout))
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn parse_gpu_performance(text: &str) -> AppleGpuPerformance {
+    let Some(stats) = text
+        .find("\"PerformanceStatistics\" = {")
+        .map(|start| &text[start..])
+        .and_then(|rest| rest.split_once('}').map(|(dict, _)| dict))
+    else {
+        return AppleGpuPerformance::default();
+    };
+    AppleGpuPerformance {
+        utilization_pct: ioreg_dict_number(stats, "Device Utilization %").map(|value| value as f32),
+        memory_used_bytes: ioreg_dict_number(stats, "In use system memory"),
+    }
 }
 
 fn collect_nvidia(nvml: &Nvml) -> Vec<GpuStat> {
@@ -1189,5 +1355,70 @@ mod desktop_tests {
         // Unreadable/absent MAC keeps the interface rather than hiding it.
         assert!(is_universally_administered_mac(None));
         assert!(is_universally_administered_mac(Some("")));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn whole_disk_token_reduces_partitions_and_snapshots_to_the_drive() {
+        assert_eq!(whole_disk_token("disk0"), Some("disk0".into()));
+        assert_eq!(whole_disk_token("disk3s5"), Some("disk3".into()));
+        assert_eq!(whole_disk_token("disk3s1s1"), Some("disk3".into()));
+        assert_eq!(whole_disk_token("disk10s2"), Some("disk10".into()));
+        assert_eq!(whole_disk_token("diskX"), None);
+        assert_eq!(whole_disk_token("nvme0"), None);
+        assert_eq!(whole_disk_token(""), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ioreg_dict_number_reads_named_integer_fields() {
+        let dict = "\"Bytes (Read)\"=690286075904,\"Bytes (Write)\"=206206304256,\"Errors\"=0";
+        assert_eq!(ioreg_dict_number(dict, "Bytes (Read)"), Some(690_286_075_904));
+        assert_eq!(ioreg_dict_number(dict, "Bytes (Write)"), Some(206_206_304_256));
+        assert_eq!(ioreg_dict_number(dict, "Missing"), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn block_storage_io_attributes_driver_counters_to_every_disk_in_its_subtree() {
+        // Two physical drivers; the internal one backs an APFS container whose
+        // synthesized (disk3) and partition (disk3s5) BSD names share its I/O.
+        let text = "\
++-o IOBlockStorageDriver  <class IOBlockStorageDriver>
+  |   \"Statistics\" = {\"Bytes (Read)\"=690286075904,\"Bytes (Write)\"=206206304256}
+  +-o APPLE SSD Media  <class IOMedia>
+      \"BSD Name\" = \"disk0\"
+      +-o Container  <class IOMedia>
+          \"BSD Name\" = \"disk3\"
+          +-o Macintosh HD  <class AppleAPFSVolume>
+              \"BSD Name\" = \"disk3s5\"
++-o IOBlockStorageDriver  <class IOBlockStorageDriver>
+  |   \"Statistics\" = {\"Bytes (Read)\"=22411688960,\"Bytes (Write)\"=512}
+    +-o External  <class IOMedia>
+        \"BSD Name\" = \"disk8\"
+";
+        let io = parse_block_storage_io(text);
+        let internal = io.get("disk0").expect("internal driver mapped");
+        assert_eq!(internal.read_bytes, 690_286_075_904);
+        assert_eq!(internal.write_bytes, 206_206_304_256);
+        // The synthesized APFS disk resolves to the same physical counters, and
+        // the partition collapses onto disk3 rather than becoming its own key.
+        assert_eq!(io.get("disk3").copied().map(|c| c.read_bytes), Some(690_286_075_904));
+        assert!(!io.contains_key("disk3s5"));
+        assert_eq!(io.get("disk8").map(|c| c.write_bytes), Some(512));
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn gpu_performance_reads_utilization_and_in_use_memory() {
+        let text = "\
+  +-o AGXAcceleratorG16G  <class AGXAcceleratorG16G>
+    {
+      \"PerformanceStatistics\" = {\"Alloc system memory\"=7847952384,\"Renderer Utilization %\"=19,\"Device Utilization %\"=23,\"In use system memory\"=432635904}
+    }
+";
+        let performance = parse_gpu_performance(text);
+        assert_eq!(performance.utilization_pct, Some(23.0));
+        assert_eq!(performance.memory_used_bytes, Some(432_635_904));
     }
 }

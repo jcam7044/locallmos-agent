@@ -8,7 +8,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use sysinfo::{Disk, DiskKind, Disks, System};
+use sysinfo::{Disk, DiskKind, Disks, MacAddr, Networks, System};
 
 const SAMPLE_CACHE_TTL: Duration = Duration::from_millis(750);
 
@@ -41,6 +41,25 @@ pub struct DiskStat {
     pub write_bytes_per_second: Option<f64>,
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkStat {
+    pub id: String,
+    /// OS interface identifier (for example `enp7s0`).
+    pub name: String,
+    /// Human-facing connection label such as "Ethernet Connection".
+    pub display_name: String,
+    /// Best-effort controller model supplied by the operating system.
+    pub hardware_name: Option<String>,
+    pub interface_type: String,
+    pub mac_address: Option<String>,
+    pub ip_addresses: Vec<String>,
+    pub received_bytes_per_second: Option<f64>,
+    pub transmitted_bytes_per_second: Option<f64>,
+    pub total_received_bytes: u64,
+    pub total_transmitted_bytes: u64,
+}
+
 /// Local IPC contract for the Resources window. This intentionally contains no
 /// runtime/model state and is safe to request frequently while offline.
 #[derive(Clone, Debug, Serialize)]
@@ -52,6 +71,7 @@ pub struct SystemMetricsSnapshot {
     pub memory_total_bytes: Option<u64>,
     pub gpus: Vec<GpuStat>,
     pub disks: Vec<DiskStat>,
+    pub networks: Vec<NetworkStat>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -66,6 +86,7 @@ pub struct Telemetry {
     pub uptime_seconds: Option<u64>,
     pub gpus: Vec<GpuStat>,
     pub disks: Vec<DiskStat>,
+    pub networks: Vec<NetworkStat>,
 }
 
 impl Telemetry {
@@ -95,6 +116,7 @@ impl From<&Telemetry> for SystemMetricsSnapshot {
             memory_total_bytes: value.memory_total_bytes,
             gpus: value.gpus.clone(),
             disks: value.disks.clone(),
+            networks: value.networks.clone(),
         }
     }
 }
@@ -105,12 +127,22 @@ struct DiskCounters {
     write_bytes: u64,
 }
 
+#[derive(Clone, Debug)]
+struct NetworkMetadata {
+    display_name: String,
+    hardware_name: Option<String>,
+    interface_type: String,
+}
+
 pub struct Monitor {
     sys: System,
     nvml: Option<Nvml>,
     cpu_ready: bool,
     last_sample: Option<(Instant, Telemetry)>,
     disk_counters: HashMap<String, (Instant, DiskCounters)>,
+    networks: Networks,
+    last_network_refresh: Option<Instant>,
+    network_metadata: HashMap<String, Option<NetworkMetadata>>,
     /// Apple Silicon GPU name, resolved once (the chip model never changes).
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     apple_chip: Option<String>,
@@ -129,6 +161,9 @@ impl Monitor {
             cpu_ready: false,
             last_sample: None,
             disk_counters: HashMap::new(),
+            networks: Networks::new_with_refreshed_list(),
+            last_network_refresh: Some(Instant::now()),
+            network_metadata: HashMap::new(),
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             apple_chip: apple_chip_name(),
         }
@@ -158,6 +193,7 @@ impl Monitor {
             (t + d.total_space(), u + (d.total_space() - d.available_space()))
         });
         let disk_stats = self.collect_disks(&visible_disks, now);
+        let network_stats = self.collect_networks(now);
 
         let mut t = Telemetry {
             sampled_at_ms: SystemTime::now()
@@ -171,6 +207,7 @@ impl Monitor {
             disk_total_bytes: Some(disk_total),
             uptime_seconds: Some(System::uptime()),
             disks: disk_stats,
+            networks: network_stats,
             ..Default::default()
         };
 
@@ -241,6 +278,61 @@ impl Monitor {
         out
     }
 
+    fn collect_networks(&mut self, now: Instant) -> Vec<NetworkStat> {
+        // refresh_list both discovers adapters and advances sysinfo's cumulative
+        // counter baseline on every supported desktop platform.
+        self.networks.refresh_list();
+        let elapsed = self
+            .last_network_refresh
+            .replace(now)
+            .map(|sampled| now.duration_since(sampled).as_secs_f64());
+        let names = self.networks.keys().cloned().collect::<Vec<_>>();
+        for name in names {
+            self.network_metadata
+                .entry(name.clone())
+                .or_insert_with(|| detect_network_metadata(&name));
+        }
+        self.network_metadata
+            .retain(|name, _| self.networks.contains_key(name));
+
+        let mut out = self
+            .networks
+            .iter()
+            .filter_map(|(name, network)| {
+                let metadata = self.network_metadata.get(name)?.as_ref()?;
+                let mac = network.mac_address();
+                Some(NetworkStat {
+                    id: network_id(name, mac),
+                    name: name.clone(),
+                    display_name: metadata.display_name.clone(),
+                    hardware_name: metadata.hardware_name.clone(),
+                    interface_type: metadata.interface_type.clone(),
+                    mac_address: (!mac.is_unspecified()).then(|| mac.to_string()),
+                    ip_addresses: network
+                        .ip_networks()
+                        .iter()
+                        .map(|network| network.addr.to_string())
+                        .collect(),
+                    received_bytes_per_second: elapsed.and_then(|seconds| {
+                        bytes_per_second(network.received(), seconds)
+                    }),
+                    transmitted_bytes_per_second: elapsed.and_then(|seconds| {
+                        bytes_per_second(network.transmitted(), seconds)
+                    }),
+                    total_received_bytes: network.total_received(),
+                    total_transmitted_bytes: network.total_transmitted(),
+                })
+            })
+            .collect::<Vec<_>>();
+        out.sort_by(|a, b| {
+            a.interface_type
+                .cmp(&b.interface_type)
+                .then(a.display_name.cmp(&b.display_name))
+                .then(a.name.cmp(&b.name))
+        });
+        out
+    }
+
     /// Apple Silicon integrated GPU: reports the chip name and unified-memory
     /// total (== system RAM). Utilization/power are `None` — accurate figures
     /// need root `powermetrics --samplers gpu_power`, deferred for now.
@@ -287,6 +379,129 @@ fn delta_rate(previous: u64, current: u64, elapsed_seconds: f64) -> Option<f64> 
         return None;
     }
     Some((current - previous) as f64 / elapsed_seconds)
+}
+
+fn bytes_per_second(bytes: u64, elapsed_seconds: f64) -> Option<f64> {
+    (elapsed_seconds > 0.0).then(|| bytes as f64 / elapsed_seconds)
+}
+
+fn network_id(name: &str, mac: MacAddr) -> String {
+    if mac.is_unspecified() {
+        format!("interface:{name}")
+    } else {
+        format!("mac:{mac}")
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn detect_network_metadata(name: &str) -> Option<NetworkMetadata> {
+    let base = std::path::PathBuf::from("/sys/class/net").join(name);
+    // Kernel-created bridges, Docker devices, loopback, tunnels, and veth
+    // endpoints live under devices/virtual and do not expose a backing device.
+    if !linux_has_backing_device(&base) {
+        return None;
+    }
+    let properties = std::process::Command::new("udevadm")
+        .args(["info", "--query=property"])
+        .arg(format!("--path={}", base.display()))
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+        .unwrap_or_default();
+    let wireless = udev_property(&properties, "DEVTYPE").as_deref() == Some("wlan")
+        || base.join("wireless").exists()
+        || name.starts_with("wl");
+    let hardware_name = udev_property(&properties, "ID_MODEL_FROM_DATABASE")
+        .or_else(|| udev_property(&properties, "ID_MODEL").map(|value| value.replace('_', " ")));
+    Some(connection_metadata(wireless, hardware_name))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_has_backing_device(base: &std::path::Path) -> bool {
+    base.join("device").exists()
+}
+
+#[cfg(target_os = "linux")]
+fn udev_property(properties: &str, key: &str) -> Option<String> {
+    properties.lines().find_map(|line| {
+        line.strip_prefix(key)
+            .and_then(|value| value.strip_prefix('='))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn detect_network_metadata(name: &str) -> Option<NetworkMetadata> {
+    let output = std::process::Command::new("networksetup")
+        .arg("-listallhardwareports")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    for block in text.split("\n\n") {
+        let Some(port) = block
+            .lines()
+            .find_map(|line| line.strip_prefix("Hardware Port: "))
+        else {
+            continue;
+        };
+        let Some(device) = block
+            .lines()
+            .find_map(|line| line.strip_prefix("Device: "))
+        else {
+            continue;
+        };
+        if device == name {
+            let wireless = port.to_ascii_lowercase().contains("wi-fi");
+            return Some(NetworkMetadata {
+                display_name: format!("{port} Connection"),
+                hardware_name: None,
+                interface_type: if wireless { "wifi" } else { "ethernet" }.into(),
+            });
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "windows")]
+fn detect_network_metadata(name: &str) -> Option<NetworkMetadata> {
+    // sysinfo's Windows collector already rejects disconnected and software
+    // interfaces using the native MIB physical-interface table.
+    let normalized = name.to_ascii_lowercase();
+    let wireless = normalized.contains("wi-fi")
+        || normalized.contains("wifi")
+        || normalized.contains("wireless");
+    let suffix = if normalized.ends_with("connection") {
+        name.to_string()
+    } else {
+        format!("{name} Connection")
+    };
+    Some(NetworkMetadata {
+        display_name: suffix,
+        hardware_name: None,
+        interface_type: if wireless { "wifi" } else { "ethernet" }.into(),
+    })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+fn detect_network_metadata(_name: &str) -> Option<NetworkMetadata> {
+    None
+}
+
+fn connection_metadata(wireless: bool, hardware_name: Option<String>) -> NetworkMetadata {
+    NetworkMetadata {
+        display_name: if wireless {
+            "Wi-Fi Connection"
+        } else {
+            "Ethernet Connection"
+        }
+        .into(),
+        hardware_name,
+        interface_type: if wireless { "wifi" } else { "ethernet" }.into(),
+    }
 }
 
 /// Linux exposes cumulative block counters without requiring elevated access.
@@ -545,11 +760,61 @@ mod tests {
                 power_watts: None,
             }],
             disks: vec![],
+            networks: vec![NetworkStat {
+                id: "mac:00:11:22:33:44:55".into(),
+                name: "Ethernet".into(),
+                display_name: "Ethernet Connection".into(),
+                hardware_name: Some("Test Controller".into()),
+                interface_type: "ethernet".into(),
+                mac_address: Some("00:11:22:33:44:55".into()),
+                ip_addresses: vec!["192.0.2.10".into()],
+                received_bytes_per_second: Some(100.0),
+                transmitted_bytes_per_second: Some(50.0),
+                total_received_bytes: 1_000,
+                total_transmitted_bytes: 500,
+            }],
             ..Default::default()
         };
         let value = serde_json::to_value(SystemMetricsSnapshot::from(&telemetry)).unwrap();
         assert_eq!(value["sampledAtMs"], 42);
         assert_eq!(value["gpus"][0]["id"], "nvidia:gpu-1");
+        assert_eq!(value["networks"][0]["receivedBytesPerSecond"], 100.0);
         assert!(value.get("uptimeSeconds").is_none());
+    }
+
+    #[test]
+    fn network_rate_and_ids_handle_first_party_and_fallback_adapters() {
+        assert_eq!(bytes_per_second(4_000, 2.0), Some(2_000.0));
+        assert_eq!(bytes_per_second(4_000, 0.0), None);
+        assert_eq!(
+            network_id("eth0", MacAddr([0, 1, 2, 3, 4, 5])),
+            "mac:00:01:02:03:04:05"
+        );
+        assert_eq!(network_id("tun0", MacAddr::UNSPECIFIED), "interface:tun0");
+        let ethernet = connection_metadata(false, Some("RTL8126 5GbE Controller".into()));
+        assert_eq!(ethernet.display_name, "Ethernet Connection");
+        assert_eq!(ethernet.interface_type, "ethernet");
+        assert_eq!(
+            ethernet.hardware_name.as_deref(),
+            Some("RTL8126 5GbE Controller")
+        );
+        let wifi = connection_metadata(true, None);
+        assert_eq!(wifi.display_name, "Wi-Fi Connection");
+        assert_eq!(wifi.interface_type, "wifi");
+    }
+
+    #[test]
+    fn linux_physical_filter_requires_a_backing_device_and_parses_friendly_model() {
+        let root = fake_dev("network-physical-filter");
+        assert!(!linux_has_backing_device(&root));
+        fs::create_dir(root.join("device")).unwrap();
+        assert!(linux_has_backing_device(&root));
+        let properties = "DEVTYPE=wlan\nID_MODEL_FROM_DATABASE=RTL8922AE Wireless Adapter\n";
+        assert_eq!(udev_property(properties, "DEVTYPE").as_deref(), Some("wlan"));
+        assert_eq!(
+            udev_property(properties, "ID_MODEL_FROM_DATABASE").as_deref(),
+            Some("RTL8922AE Wireless Adapter")
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 }

@@ -2,7 +2,12 @@ import type { SystemMetricsSnapshot } from "../types";
 
 export const HISTORY_SAMPLES = 60;
 
-export type DeviceKey = "cpu" | "memory" | `gpu:${string}` | `disk:${string}`;
+export type DeviceKey =
+  | "cpu"
+  | "memory"
+  | `gpu:${string}`
+  | `disk:${string}`
+  | `network:${string}`;
 
 export function appendSample(
   history: SystemMetricsSnapshot[],
@@ -19,6 +24,7 @@ export function availableDeviceKeys(snapshot: SystemMetricsSnapshot | undefined)
     "memory",
     ...snapshot.gpus.map((gpu) => `gpu:${gpu.id}` as const),
     ...snapshot.disks.map((disk) => `disk:${disk.id}` as const),
+    ...snapshot.networks.map((network) => `network:${network.id}` as const),
   ];
 }
 
@@ -48,5 +54,16 @@ export function diskValues(
   return history.map((sample) => {
     const disk = sample.disks.find((candidate) => candidate.id === id);
     return disk ? read(disk) : null;
+  });
+}
+
+export function networkValues(
+  history: SystemMetricsSnapshot[],
+  id: string,
+  read: (network: SystemMetricsSnapshot["networks"][number]) => number | null,
+) {
+  return history.map((sample) => {
+    const network = sample.networks.find((candidate) => candidate.id === id);
+    return network ? read(network) : null;
   });
 }

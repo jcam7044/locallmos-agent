@@ -32,6 +32,19 @@ function snapshot(sampledAtMs = 1): SystemMetricsSnapshot {
       readBytesPerSecond: 2_000,
       writeBytesPerSecond: 1_000,
     }],
+    networks: [{
+      id: "mac:00:11:22:33:44:55",
+      name: "enp7s0",
+      displayName: "Ethernet Connection",
+      hardwareName: "RTL8126 5GbE Controller",
+      interfaceType: "ethernet",
+      macAddress: "00:11:22:33:44:55",
+      ipAddresses: ["192.0.2.10"],
+      receivedBytesPerSecond: 8_000,
+      transmittedBytesPerSecond: 2_000,
+      totalReceivedBytes: 80_000,
+      totalTransmittedBytes: 20_000,
+    }],
   };
 }
 
@@ -45,9 +58,9 @@ describe("resource history", () => {
   });
 
   it("tracks stable devices and leaves gaps when a device disappears", () => {
-    const missing = { ...snapshot(2), gpus: [], disks: [] };
+    const missing = { ...snapshot(2), gpus: [], disks: [], networks: [] };
     expect(availableDeviceKeys(snapshot())).toEqual([
-      "cpu", "memory", "gpu:GPU-abc", "disk:/dev/test@/",
+      "cpu", "memory", "gpu:GPU-abc", "disk:/dev/test@/", "network:mac:00:11:22:33:44:55",
     ]);
     expect(gpuValues([snapshot(), missing], "GPU-abc", (gpu) => gpu.utilizationPct)).toEqual([40, null]);
     expect(diskValues([snapshot(), missing], "/dev/test@/", (disk) => disk.readBytesPerSecond)).toEqual([2_000, null]);
@@ -80,7 +93,7 @@ describe("metric graph", () => {
 });
 
 describe("ResourcesView", () => {
-  it("renders CPU, RAM, every GPU, and every drive in the device list", () => {
+  it("renders CPU, RAM, every GPU, drive, and network adapter in the device list", () => {
     const html = renderToStaticMarkup(
       <ResourcesView history={[snapshot()]} selected="gpu:GPU-abc" onSelect={() => undefined} />,
     );
@@ -90,6 +103,7 @@ describe("ResourcesView", () => {
     expect(html).toContain("GPU utilization");
     expect(html).toContain("Video memory");
     expect(html).toContain("SSD");
+    expect(html).toContain("Ethernet Connection");
   });
 
   it("labels unavailable drive I/O instead of displaying zero", () => {
@@ -100,5 +114,22 @@ describe("ResourcesView", () => {
     );
     expect(html).toContain("Live I/O counters are not reported");
     expect(html).toContain("Not reported");
+  });
+
+  it("renders network download and upload graphs and adapter details", () => {
+    const html = renderToStaticMarkup(
+      <ResourcesView
+        history={[snapshot()]}
+        selected="network:mac:00:11:22:33:44:55"
+        onSelect={() => undefined}
+      />,
+    );
+    expect(html).toContain("Network activity");
+    expect(html).toContain("RTL8126 5GbE Controller");
+    expect(html).toContain("enp7s0");
+    expect(html).toContain("Download");
+    expect(html).toContain("Upload");
+    expect(html).toContain("192.0.2.10");
+    expect(html).toContain("00:11:22:33:44:55");
   });
 });

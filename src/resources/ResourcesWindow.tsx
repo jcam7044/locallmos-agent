@@ -1,12 +1,13 @@
 import { useEffect, useMemo, useState } from "react";
 import { getSystemMetricsSnapshot } from "../api";
-import type { DiskStat, GpuStat, SystemMetricsSnapshot } from "../types";
+import type { DiskStat, GpuStat, NetworkStat, SystemMetricsSnapshot } from "../types";
 import { MetricGraph, type GraphSeries } from "./MetricGraph";
 import {
   appendSample,
   availableDeviceKeys,
   diskValues,
   gpuValues,
+  networkValues,
   type DeviceKey,
   valuesFor,
 } from "./history";
@@ -18,6 +19,8 @@ const COLORS = {
   gpu: "#fb7185",
   disk: "#fb923c",
   write: "#facc15",
+  network: "#2dd4bf",
+  upload: "#60a5fa",
 };
 
 export function ResourcesWindow() {
@@ -188,6 +191,22 @@ function deviceCards(history: SystemMetricsSnapshot[]): DeviceCard[] {
         sumNullable(item.readBytesPerSecond, item.writeBytesPerSecond)),
     });
   }
+  for (const network of latest?.networks ?? []) {
+    const activity = sumNullable(
+      network.receivedBytesPerSecond,
+      network.transmittedBytesPerSecond,
+    );
+    cards.push({
+      key: `network:${network.id}`,
+      kind: network.interfaceType === "wifi" ? "WI-FI" : "ETHERNET",
+      title: network.displayName,
+      value: `↓ ${formatRate(network.receivedBytesPerSecond)} · ↑ ${formatRate(network.transmittedBytesPerSecond)}`,
+      color: COLORS.network,
+      values: networkValues(history, network.id, (item) =>
+        sumNullable(item.receivedBytesPerSecond, item.transmittedBytesPerSecond)),
+      max: activity === 0 ? 1 : undefined,
+    });
+  }
   return cards;
 }
 
@@ -241,6 +260,12 @@ function DetailPanel({
     const id = selected.slice(4);
     const gpu = latest.gpus.find((item) => item.id === id);
     return gpu ? <GpuDetail gpu={gpu} history={history} /> : null;
+  }
+
+  if (selected.startsWith("network:")) {
+    const id = selected.slice("network:".length);
+    const network = latest.networks.find((item) => item.id === id);
+    return network ? <NetworkDetail network={network} history={history} /> : null;
   }
 
   const id = selected.slice(5);
@@ -319,6 +344,60 @@ function DiskDetail({ disk, history }: { disk: DiskStat; history: SystemMetricsS
       ["Write", formatRate(disk.writeBytesPerSecond)],
       ["Available", formatBytes(disk.totalBytes - disk.usedBytes)],
       ["Mount point", disk.mountPoint],
+    ]} />
+  </DeviceDetail>;
+}
+
+function NetworkDetail({
+  network,
+  history,
+}: {
+  network: NetworkStat;
+  history: SystemMetricsSnapshot[];
+}) {
+  const received = networkValues(
+    history,
+    network.id,
+    (item) => item.receivedBytesPerSecond,
+  );
+  const transmitted = networkValues(
+    history,
+    network.id,
+    (item) => item.transmittedBytesPerSecond,
+  );
+  const activity = sumNullable(
+    network.receivedBytesPerSecond,
+    network.transmittedBytesPerSecond,
+  );
+  return <DeviceDetail
+    eyebrow={`${network.displayName} · ${network.name}`}
+    title={network.hardwareName ?? network.displayName}
+    summary={formatRate(activity)}
+  >
+    <GraphCard
+      title="Network activity"
+      value={`↓ ${formatRate(network.receivedBytesPerSecond)} · ↑ ${formatRate(network.transmittedBytesPerSecond)}`}
+    >
+      <MetricGraph
+        label="Network receive and transmit throughput"
+        series={[
+          series("Download", COLORS.network, received),
+          series("Upload", COLORS.upload, transmitted),
+        ]}
+      />
+      <div className="graph-legend">
+        <span><i style={{ background: COLORS.network }} />Download</span>
+        <span><i style={{ background: COLORS.upload }} />Upload</span>
+      </div>
+    </GraphCard>
+    <StatGrid stats={[
+      ["Download", formatRate(network.receivedBytesPerSecond)],
+      ["Upload", formatRate(network.transmittedBytesPerSecond)],
+      ["Total received", formatBytes(network.totalReceivedBytes)],
+      ["Total sent", formatBytes(network.totalTransmittedBytes)],
+      ["Interface", network.name],
+      ["IP addresses", network.ipAddresses.join(", ") || "Not reported"],
+      ["MAC address", network.macAddress ?? "Not reported"],
     ]} />
   </DeviceDetail>;
 }
@@ -480,6 +559,34 @@ function previewSnapshot(): SystemMetricsSnapshot {
         totalBytes: 2 * 1024 ** 4,
         readBytesPerSecond: null,
         writeBytesPerSecond: null,
+      },
+    ],
+    networks: [
+      {
+        id: "preview:ethernet",
+        name: "enp7s0",
+        displayName: "Ethernet Connection",
+        hardwareName: "RTL8126 5GbE Controller",
+        interfaceType: "ethernet",
+        macAddress: "00:11:22:33:44:55",
+        ipAddresses: ["192.168.1.42", "fe80::1234"],
+        receivedBytesPerSecond: wave(8, 30, 210) * 1024 ** 2,
+        transmittedBytesPerSecond: wave(9, 4, 72) * 1024 ** 2,
+        totalReceivedBytes: 184 * 1024 ** 3,
+        totalTransmittedBytes: 37 * 1024 ** 3,
+      },
+      {
+        id: "preview:wifi",
+        name: "wlp10s0",
+        displayName: "Wi-Fi Connection",
+        hardwareName: "RTL8922AE 802.11be Wireless Network Adapter",
+        interfaceType: "wifi",
+        macAddress: "66:77:88:99:aa:bb",
+        ipAddresses: ["192.168.1.51"],
+        receivedBytesPerSecond: 0,
+        transmittedBytesPerSecond: 0,
+        totalReceivedBytes: 12 * 1024 ** 3,
+        totalTransmittedBytes: 3 * 1024 ** 3,
       },
     ],
   };

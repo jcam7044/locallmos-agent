@@ -23,14 +23,19 @@ function snapshot(sampledAtMs = 1): SystemMetricsSnapshot {
       powerWatts: 80,
     }],
     disks: [{
-      id: "/dev/test@/",
-      name: "/dev/test",
-      mountPoint: "/",
-      kind: "ssd",
+      id: "linux-disk:test",
+      name: "nvme0n1",
+      displayName: "Example NVMe Controller",
+      mountPoints: ["/"],
+      kind: "nvme",
+      transport: "nvme",
+      removable: false,
       usedBytes: 100,
       totalBytes: 400,
       readBytesPerSecond: 2_000,
       writeBytesPerSecond: 1_000,
+      totalReadBytes: 20_000,
+      totalWrittenBytes: 10_000,
     }],
     networks: [{
       id: "mac:00:11:22:33:44:55",
@@ -60,10 +65,10 @@ describe("resource history", () => {
   it("tracks stable devices and leaves gaps when a device disappears", () => {
     const missing = { ...snapshot(2), gpus: [], disks: [], networks: [] };
     expect(availableDeviceKeys(snapshot())).toEqual([
-      "cpu", "memory", "gpu:GPU-abc", "disk:/dev/test@/", "network:mac:00:11:22:33:44:55",
+      "cpu", "memory", "gpu:GPU-abc", "disk:linux-disk:test", "network:mac:00:11:22:33:44:55",
     ]);
     expect(gpuValues([snapshot(), missing], "GPU-abc", (gpu) => gpu.utilizationPct)).toEqual([40, null]);
-    expect(diskValues([snapshot(), missing], "/dev/test@/", (disk) => disk.readBytesPerSecond)).toEqual([2_000, null]);
+    expect(diskValues([snapshot(), missing], "linux-disk:test", (disk) => disk.readBytesPerSecond)).toEqual([2_000, null]);
   });
 });
 
@@ -102,7 +107,8 @@ describe("ResourcesView", () => {
     expect(html).toContain("RTX Test");
     expect(html).toContain("GPU utilization");
     expect(html).toContain("Video memory");
-    expect(html).toContain("SSD");
+    expect(html).toContain("NVMe");
+    expect(html).toContain("Example NVMe Controller");
     expect(html).toContain("Ethernet Connection");
   });
 
@@ -114,6 +120,29 @@ describe("ResourcesView", () => {
     );
     expect(html).toContain("Live I/O counters are not reported");
     expect(html).toContain("Not reported");
+  });
+
+  it("labels unmounted and removable physical drives without showing partition usage", () => {
+    const usb = {
+      ...snapshot().disks[0]!,
+      id: "linux-disk:usb",
+      name: "sdb",
+      displayName: "SanDisk Extreme",
+      mountPoints: [],
+      kind: "ssd" as const,
+      transport: "usb",
+      removable: true,
+      usedBytes: null,
+      totalBytes: 32 * 1024 ** 3,
+    };
+    const sample = { ...snapshot(), disks: [snapshot().disks[0]!, usb] };
+    const html = renderToStaticMarkup(
+      <ResourcesView history={[sample]} selected={`disk:${usb.id}`} onSelect={() => undefined} />,
+    );
+    expect(html).toContain("SanDisk Extreme");
+    expect(html).toContain("USB Drive");
+    expect(html).toContain("Not mounted");
+    expect(html).not.toContain("0% used");
   });
 
   it("renders network download and upload graphs and adapter details", () => {

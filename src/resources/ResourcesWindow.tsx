@@ -181,10 +181,12 @@ function deviceCards(history: SystemMetricsSnapshot[]): DeviceCard[] {
     const activity = sumNullable(disk.readBytesPerSecond, disk.writeBytesPerSecond);
     cards.push({
       key: `disk:${disk.id}`,
-      kind: disk.kind.toUpperCase(),
+      kind: diskCardKind(disk),
       title: driveTitle(disk),
       value: activity == null
-        ? `${formatPercent(percent(disk.usedBytes, disk.totalBytes))} used`
+        ? disk.usedBytes == null
+          ? `${formatBytes(disk.totalBytes)} drive`
+          : `${formatPercent(percent(disk.usedBytes, disk.totalBytes))} used`
         : `${formatRate(activity)} total I/O`,
       color: COLORS.disk,
       values: diskValues(history, disk.id, (item) =>
@@ -316,9 +318,9 @@ function DiskDetail({ disk, history }: { disk: DiskStat; history: SystemMetricsS
   const write = diskValues(history, disk.id, (item) => item.writeBytesPerSecond);
   const usedPct = percent(disk.usedBytes, disk.totalBytes);
   return <DeviceDetail
-    eyebrow={disk.kind.toUpperCase()}
+    eyebrow={`${disk.removable ? "Removable" : diskType(disk)} · ${formatBytes(disk.totalBytes)}`}
     title={driveTitle(disk)}
-    summary={`${formatPercent(usedPct)} used`}
+    summary={usedPct == null ? formatBytes(disk.totalBytes) : `${formatPercent(usedPct)} used`}
   >
     <GraphCard title="Disk activity" value={`${formatRate(disk.readBytesPerSecond)} read · ${formatRate(disk.writeBytesPerSecond)} write`}>
       <MetricGraph
@@ -335,15 +337,19 @@ function DiskDetail({ disk, history }: { disk: DiskStat; history: SystemMetricsS
         <span><i style={{ background: COLORS.write }} />Write</span>
       </div>
     </GraphCard>
-    <div className="capacity-card">
-      <div><span>Storage used</span><strong>{formatBytes(disk.usedBytes)} / {formatBytes(disk.totalBytes)}</strong></div>
+    {disk.usedBytes != null && <div className="capacity-card">
+      <div><span>Mounted storage used</span><strong>{formatBytes(disk.usedBytes)} / {formatBytes(disk.totalBytes)}</strong></div>
       <div className="capacity-track"><i style={{ width: `${usedPct ?? 0}%` }} /></div>
-    </div>
+    </div>}
     <StatGrid stats={[
       ["Read", formatRate(disk.readBytesPerSecond)],
       ["Write", formatRate(disk.writeBytesPerSecond)],
-      ["Available", formatBytes(disk.totalBytes - disk.usedBytes)],
-      ["Mount point", disk.mountPoint],
+      ["Total read", formatBytes(disk.totalReadBytes)],
+      ["Total written", formatBytes(disk.totalWrittenBytes)],
+      ["Device", disk.name],
+      ["Type", diskType(disk)],
+      ["Capacity", formatBytes(disk.totalBytes)],
+      ["Mounted at", disk.mountPoints.join(", ") || "Not mounted"],
     ]} />
   </DeviceDetail>;
 }
@@ -490,7 +496,21 @@ function subtractBytes(total: number | null, used: number | null) {
 }
 
 function driveTitle(disk: DiskStat) {
-  return disk.mountPoint || disk.name;
+  return disk.displayName || disk.name;
+}
+
+function diskType(disk: DiskStat) {
+  if (disk.transport === "usb") return "USB Drive";
+  if (disk.kind === "nvme") return "NVMe Drive";
+  if (disk.kind === "hdd") return "Hard Disk Drive";
+  if (disk.kind === "ssd") return "Solid State Drive";
+  return "Storage Drive";
+}
+
+function diskCardKind(disk: DiskStat) {
+  if (disk.removable || disk.transport === "usb") return "USB";
+  if (disk.kind === "nvme") return "NVMe";
+  return disk.kind.toUpperCase();
 }
 
 function titleCase(value: string) {
@@ -542,23 +562,33 @@ function previewSnapshot(): SystemMetricsSnapshot {
     disks: [
       {
         id: "preview:root",
-        name: "NVMe SSD",
-        mountPoint: "/",
-        kind: "ssd",
+        name: "nvme1n1",
+        displayName: "WD PC SN5000S SDEQNSJ-512G-1002",
+        mountPoints: ["/"],
+        kind: "nvme",
+        transport: "nvme",
+        removable: false,
         usedBytes: 307 * 1024 ** 3,
         totalBytes: 512 * 1024 ** 3,
         readBytesPerSecond: wave(6, 0, 180) * 1024 ** 2,
         writeBytesPerSecond: wave(7, 0, 95) * 1024 ** 2,
+        totalReadBytes: 136 * 1024 ** 3,
+        totalWrittenBytes: 87 * 1024 ** 3,
       },
       {
         id: "preview:data",
-        name: "Data",
-        mountPoint: "/mnt/data",
-        kind: "hdd",
-        usedBytes: 1.4 * 1024 ** 4,
-        totalBytes: 2 * 1024 ** 4,
-        readBytesPerSecond: null,
-        writeBytesPerSecond: null,
+        name: "nvme0n1",
+        displayName: "ADATA SX6000LNP",
+        mountPoints: [],
+        kind: "nvme",
+        transport: "nvme",
+        removable: false,
+        usedBytes: null,
+        totalBytes: 512 * 1024 ** 3,
+        readBytesPerSecond: wave(10, 0, 8) * 1024 ** 2,
+        writeBytesPerSecond: wave(11, 0, 4) * 1024 ** 2,
+        totalReadBytes: 20 * 1024 ** 3,
+        totalWrittenBytes: 9 * 1024 ** 3,
       },
     ],
     networks: [

@@ -13,12 +13,17 @@ export type GpuStat = {
 export type DiskStat = {
   id: string;
   name: string;
-  mountPoint: string;
-  kind: "hdd" | "ssd" | "unknown";
-  usedBytes: number;
+  displayName: string;
+  mountPoints: string[];
+  kind: "nvme" | "hdd" | "ssd" | "unknown";
+  transport: string | null;
+  removable: boolean;
+  usedBytes: number | null;
   totalBytes: number;
   readBytesPerSecond: number | null;
   writeBytesPerSecond: number | null;
+  totalReadBytes: number | null;
+  totalWrittenBytes: number | null;
 };
 
 export type NetworkStat = {

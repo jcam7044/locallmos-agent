@@ -8,7 +8,13 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use sysinfo::{Disk, DiskKind, Disks, MacAddr, Networks, System};
+use sysinfo::{Disk, Disks, MacAddr, Networks, System};
+
+#[cfg(target_os = "linux")]
+use std::collections::HashSet;
+
+#[cfg(not(target_os = "linux"))]
+use sysinfo::DiskKind;
 
 const SAMPLE_CACHE_TTL: Duration = Duration::from_millis(750);
 
@@ -32,13 +38,21 @@ pub struct GpuStat {
 #[serde(rename_all = "camelCase")]
 pub struct DiskStat {
     pub id: String,
+    /// Raw OS device identifier (`nvme0n1`, `/dev/disk0`, `C:\\`, etc.).
     pub name: String,
-    pub mount_point: String,
+    pub display_name: String,
+    pub mount_points: Vec<String>,
     pub kind: String,
-    pub used_bytes: u64,
+    pub transport: Option<String>,
+    pub removable: bool,
+    /// Filesystem usage aggregated across mounted partitions. Unmounted drives
+    /// intentionally report `None` rather than a misleading zero.
+    pub used_bytes: Option<u64>,
     pub total_bytes: u64,
     pub read_bytes_per_second: Option<f64>,
     pub write_bytes_per_second: Option<f64>,
+    pub total_read_bytes: Option<u64>,
+    pub total_written_bytes: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -127,6 +141,16 @@ struct DiskCounters {
     write_bytes: u64,
 }
 
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, Default)]
+struct MountedDiskUsage {
+    used_bytes: u64,
+    mount_points: Vec<String>,
+    /// Prevent bind mounts/subvolume aliases from counting one filesystem more
+    /// than once when sysinfo returns duplicate mount records.
+    sources: HashSet<String>,
+}
+
 #[derive(Clone, Debug)]
 struct NetworkMetadata {
     display_name: String,
@@ -188,11 +212,14 @@ impl Monitor {
         self.sys.refresh_memory();
 
         let disks = Disks::new_with_refreshed_list();
-        let visible_disks: Vec<&Disk> = disks.iter().filter(|d| is_fixed_volume(d)).collect();
-        let (disk_total, disk_used) = visible_disks.iter().fold((0u64, 0u64), |(t, u), d| {
+        // Preserve the existing cloud telemetry semantics: aggregate mounted,
+        // fixed filesystems. The local Resources window independently models
+        // physical hardware so unmounted and removable drives can appear.
+        let telemetry_disks: Vec<&Disk> = disks.iter().filter(|d| is_fixed_volume(d)).collect();
+        let (disk_total, disk_used) = telemetry_disks.iter().fold((0u64, 0u64), |(t, u), d| {
             (t + d.total_space(), u + (d.total_space() - d.available_space()))
         });
-        let disk_stats = self.collect_disks(&visible_disks, now);
+        let disk_stats = self.collect_disks(&disks, now);
         let network_stats = self.collect_networks(now);
 
         let mut t = Telemetry {
@@ -239,10 +266,12 @@ impl Monitor {
         t
     }
 
-    fn collect_disks(&mut self, disks: &[&Disk], now: Instant) -> Vec<DiskStat> {
+    #[cfg(not(target_os = "linux"))]
+    fn collect_disks(&mut self, disks: &Disks, now: Instant) -> Vec<DiskStat> {
         let mut active_counter_keys = Vec::new();
         let mut out = disks
             .iter()
+            .filter(|disk| disk.total_space() > 0)
             .map(|disk| {
                 let name = disk.name().to_string_lossy().into_owned();
                 let mount_point = disk.mount_point().to_string_lossy().into_owned();
@@ -262,19 +291,94 @@ impl Monitor {
                 });
                 DiskStat {
                     id,
+                    display_name: if name.is_empty() { mount_point.clone() } else { name.clone() },
                     name,
-                    mount_point,
+                    mount_points: vec![mount_point],
                     kind: disk_kind(disk.kind()).to_string(),
-                    used_bytes: disk.total_space().saturating_sub(disk.available_space()),
+                    transport: None,
+                    removable: disk.is_removable(),
+                    used_bytes: Some(disk.total_space().saturating_sub(disk.available_space())),
                     total_bytes: disk.total_space(),
                     read_bytes_per_second: rates.and_then(|r| r.0),
                     write_bytes_per_second: rates.and_then(|r| r.1),
+                    total_read_bytes: None,
+                    total_written_bytes: None,
                 }
             })
             .collect::<Vec<_>>();
         self.disk_counters
             .retain(|key, _| active_counter_keys.iter().any(|active| active == key));
-        out.sort_by(|a, b| a.mount_point.cmp(&b.mount_point).then(a.name.cmp(&b.name)));
+        out.sort_by(|a, b| a.display_name.cmp(&b.display_name).then(a.name.cmp(&b.name)));
+        out
+    }
+
+    #[cfg(target_os = "linux")]
+    fn collect_disks(&mut self, disks: &Disks, now: Instant) -> Vec<DiskStat> {
+        let mounted = linux_mounted_usage(disks);
+        let Ok(entries) = std::fs::read_dir("/sys/block") else {
+            return Vec::new();
+        };
+        let mut active_counter_keys = Vec::new();
+        let mut out = entries
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|name| linux_is_physical_block_device(name))
+            .filter_map(|name| {
+                let base = std::path::PathBuf::from("/sys/block").join(&name);
+                let total_bytes = read_trim_u64(&base.join("size"))?.saturating_mul(512);
+                if total_bytes == 0 {
+                    return None;
+                }
+                let counters = read_disk_counters(&name);
+                let rates = counters.and_then(|current| {
+                    active_counter_keys.push(name.clone());
+                    let previous = self.disk_counters.insert(name.clone(), (now, current));
+                    let (sampled, old) = previous?;
+                    let elapsed = now.duration_since(sampled).as_secs_f64();
+                    Some((
+                        delta_rate(old.read_bytes, current.read_bytes, elapsed),
+                        delta_rate(old.write_bytes, current.write_bytes, elapsed),
+                    ))
+                });
+                let model = read_trim_string(&base.join("device/model"));
+                let vendor = read_trim_string(&base.join("device/vendor"));
+                let serial = read_trim_string(&base.join("device/serial"));
+                let transport = linux_disk_transport(&name, &base);
+                let removable = read_trim_u64(&base.join("removable")) == Some(1)
+                    || transport.as_deref() == Some("usb");
+                let rotational = read_trim_u64(&base.join("queue/rotational")) == Some(1);
+                let kind = if name.starts_with("nvme") {
+                    "nvme"
+                } else if rotational {
+                    "hdd"
+                } else {
+                    "ssd"
+                };
+                let display_name = disk_display_name(model.as_deref(), vendor.as_deref(), total_bytes);
+                let usage = mounted.get(&name);
+                Some(DiskStat {
+                    id: serial
+                        .filter(|serial| !serial.is_empty())
+                        .map(|serial| format!("linux-disk:{serial}"))
+                        .unwrap_or_else(|| format!("linux-disk:{name}")),
+                    name: name.clone(),
+                    display_name,
+                    mount_points: usage.map(|usage| usage.mount_points.clone()).unwrap_or_default(),
+                    kind: kind.into(),
+                    transport,
+                    removable,
+                    used_bytes: usage.map(|usage| usage.used_bytes.min(total_bytes)),
+                    total_bytes,
+                    read_bytes_per_second: rates.and_then(|rates| rates.0),
+                    write_bytes_per_second: rates.and_then(|rates| rates.1),
+                    total_read_bytes: counters.map(|counter| counter.read_bytes),
+                    total_written_bytes: counters.map(|counter| counter.write_bytes),
+                })
+            })
+            .collect::<Vec<_>>();
+        self.disk_counters
+            .retain(|key, _| active_counter_keys.iter().any(|active| active == key));
+        out.sort_by(|a, b| a.removable.cmp(&b.removable).then(a.name.cmp(&b.name)));
         out
     }
 
@@ -352,6 +456,7 @@ impl Monitor {
     }
 }
 
+#[cfg(not(target_os = "linux"))]
 fn disk_kind(kind: DiskKind) -> &'static str {
     match kind {
         DiskKind::HDD => "hdd",
@@ -372,6 +477,129 @@ fn is_fixed_volume(disk: &Disk) -> bool {
     }
     #[cfg(not(target_os = "linux"))]
     true
+}
+
+#[cfg(target_os = "linux")]
+fn linux_mounted_usage(disks: &Disks) -> HashMap<String, MountedDiskUsage> {
+    let mut out: HashMap<String, MountedDiskUsage> = HashMap::new();
+    for disk in disks.iter() {
+        let source = disk.name().to_string_lossy().into_owned();
+        if !source.starts_with("/dev/") {
+            continue;
+        }
+        let Some(parent) = linux_parent_block_name(&source) else {
+            continue;
+        };
+        let usage = out.entry(parent).or_default();
+        if usage.sources.insert(source) {
+            usage.used_bytes = usage.used_bytes.saturating_add(
+                disk.total_space().saturating_sub(disk.available_space()),
+            );
+        }
+        let mount = disk.mount_point().to_string_lossy().into_owned();
+        if !usage.mount_points.contains(&mount) {
+            usage.mount_points.push(mount);
+        }
+    }
+    for usage in out.values_mut() {
+        usage.mount_points.sort();
+    }
+    out
+}
+
+#[cfg(target_os = "linux")]
+fn linux_parent_block_name(source: &str) -> Option<String> {
+    let canonical = std::fs::canonicalize(source).unwrap_or_else(|_| source.into());
+    let partition = canonical.file_name()?.to_str()?;
+    let base = std::path::PathBuf::from("/sys/class/block").join(partition);
+    if base.join("partition").exists() {
+        std::fs::canonicalize(&base)
+            .ok()?
+            .parent()?
+            .file_name()?
+            .to_str()
+            .map(str::to_owned)
+    } else {
+        Some(partition.to_owned())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_is_physical_block_device(name: &str) -> bool {
+    linux_is_physical_block_device_at(std::path::Path::new("/sys/block"), name)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_is_physical_block_device_at(root: &std::path::Path, name: &str) -> bool {
+    if name.starts_with("loop") || name.starts_with("ram") || name.starts_with("zram") {
+        return false;
+    }
+    let base = root.join(name);
+    base.exists()
+        && !base.join("partition").exists()
+        && (base.join("device").exists() || name.starts_with("nvme") || name.starts_with("mmcblk"))
+}
+
+#[cfg(target_os = "linux")]
+fn read_trim_string(path: &std::path::Path) -> Option<String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+#[cfg(target_os = "linux")]
+fn read_trim_u64(path: &std::path::Path) -> Option<u64> {
+    read_trim_string(path)?.parse().ok()
+}
+
+#[cfg(target_os = "linux")]
+fn linux_disk_transport(name: &str, base: &std::path::Path) -> Option<String> {
+    let canonical = std::fs::canonicalize(base).ok()?;
+    let path = canonical.to_string_lossy();
+    if path.contains("/usb") {
+        Some("usb".into())
+    } else if name.starts_with("nvme") || path.contains("/nvme/") {
+        Some("nvme".into())
+    } else if name.starts_with("mmcblk") {
+        Some("mmc".into())
+    } else if name.starts_with("sd") {
+        Some("sata".into())
+    } else {
+        None
+    }
+}
+
+fn disk_display_name(model: Option<&str>, vendor: Option<&str>, total_bytes: u64) -> String {
+    let model = model.unwrap_or("").trim();
+    let vendor = vendor.unwrap_or("").trim();
+    let vendor = if matches!(vendor.to_ascii_lowercase().as_str(), "ata" | "nvme" | "scsi") {
+        ""
+    } else {
+        vendor
+    };
+    let hardware = if model.is_empty() {
+        vendor.to_string()
+    } else if vendor.is_empty() || model.to_ascii_lowercase().starts_with(&vendor.to_ascii_lowercase()) {
+        model.to_string()
+    } else {
+        format!("{vendor} {model}")
+    };
+    if hardware.is_empty() {
+        format!("{} Drive", human_capacity(total_bytes))
+    } else {
+        hardware
+    }
+}
+
+fn human_capacity(bytes: u64) -> String {
+    const GB: f64 = 1_000_000_000.0;
+    const TB: f64 = 1_000_000_000_000.0;
+    if bytes as f64 >= TB {
+        format!("{:.1} TB", bytes as f64 / TB)
+    } else {
+        format!("{:.0} GB", bytes as f64 / GB)
+    }
 }
 
 fn delta_rate(previous: u64, current: u64, elapsed_seconds: f64) -> Option<f64> {
@@ -507,12 +735,6 @@ fn connection_metadata(wireless: bool, hardware_name: Option<String>) -> Network
 /// Linux exposes cumulative block counters without requiring elevated access.
 /// Other platforms retain capacity telemetry and explicitly report I/O as
 /// unavailable until an equally reliable native mapping exists.
-#[cfg(target_os = "linux")]
-fn disk_counter_key(name: &str) -> Option<String> {
-    let canonical = std::fs::canonicalize(name).unwrap_or_else(|_| name.into());
-    canonical.file_name()?.to_str().map(str::to_owned)
-}
-
 #[cfg(not(target_os = "linux"))]
 fn disk_counter_key(_name: &str) -> Option<String> {
     None
@@ -814,6 +1036,31 @@ mod tests {
         assert_eq!(
             udev_property(properties, "ID_MODEL_FROM_DATABASE").as_deref(),
             Some("RTL8922AE Wireless Adapter")
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn physical_disk_filter_keeps_nvme_sata_and_usb_but_not_partitions_or_loops() {
+        let root = fake_dev("block-filter");
+        for name in ["nvme0n1", "sda", "sdb"] {
+            fs::create_dir_all(root.join(name).join("device")).unwrap();
+        }
+        fs::create_dir_all(root.join("sda1/partition")).unwrap();
+        fs::create_dir_all(root.join("loop0/device")).unwrap();
+        assert!(linux_is_physical_block_device_at(&root, "nvme0n1"));
+        assert!(linux_is_physical_block_device_at(&root, "sda"));
+        assert!(linux_is_physical_block_device_at(&root, "sdb"));
+        assert!(!linux_is_physical_block_device_at(&root, "sda1"));
+        assert!(!linux_is_physical_block_device_at(&root, "loop0"));
+        assert_eq!(
+            disk_display_name(Some("PC SN5000S"), Some("WD"), 512_000_000_000),
+            "WD PC SN5000S"
+        );
+        assert_eq!(disk_display_name(None, None, 32_000_000_000), "32 GB Drive");
+        assert_eq!(
+            disk_display_name(Some("TS32GSSD370"), Some("ATA"), 32_000_000_000),
+            "TS32GSSD370"
         );
         let _ = fs::remove_dir_all(&root);
     }

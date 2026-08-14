@@ -205,16 +205,28 @@ impl Supabase {
             .json(&json!({ "rigId": rig_id, "refreshSecret": refresh_secret }))
             .send()
             .await?;
-        // A 401 means the stored refresh secret is no longer valid — the rig
-        // was deleted/revoked. Surface it as a typed error so the worker can
-        // wipe local credentials and drop back to pairing.
-        if resp.status() == StatusCode::UNAUTHORIZED {
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(resp.json().await?);
+        }
+        // Only wipe enrollment on an *unambiguous* revocation: a 401 whose body
+        // carries the server's `code: "device_revoked"` marker. The device-token
+        // function now returns 503 for transient backend faults (DB blip, a lost
+        // service_role grant, a function-redeploy window) and reserves this 401
+        // for a genuinely deleted/revoked rig. Anything else — 5xx, a bare
+        // gateway 401 without the marker, timeouts — is transient and must leave
+        // credentials intact, so a single backend hiccup can no longer de-enroll
+        // the whole fleet at once. (See locallmOS device-token/index.ts.)
+        let body = resp.text().await.unwrap_or_default();
+        let revoked = status == StatusCode::UNAUTHORIZED
+            && serde_json::from_str::<Value>(&body)
+                .ok()
+                .and_then(|v| v.get("code").and_then(Value::as_str).map(|c| c == "device_revoked"))
+                .unwrap_or(false);
+        if revoked {
             return Err(CredentialsRevoked.into());
         }
-        if !resp.status().is_success() {
-            return Err(anyhow!("token refresh failed: HTTP {}", resp.status()));
-        }
-        Ok(resp.json().await?)
+        Err(anyhow!("token refresh failed: HTTP {status}: {body}"))
     }
 
     // ---- PostgREST (device JWT) ----------------------------------------

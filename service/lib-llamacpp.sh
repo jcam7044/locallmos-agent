@@ -239,7 +239,7 @@ provision_llamacpp() {
     SUDO="sudo"
   else
     LLAMA_DIR="$HOME/.local/opt/locallmos/llama"
-    MODELS_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/locallmos/models"
+    MODELS_DIR="$HOME/.locallmos/models"
     SUDO=""
   fi
   _marker="$LLAMA_DIR/.locallmos-llamacpp"

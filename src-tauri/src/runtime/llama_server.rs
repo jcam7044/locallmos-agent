@@ -1125,9 +1125,18 @@ fn to_openai_messages(messages: &Value) -> Value {
 }
 
 /// Default models dir when unset — matches the installer's desktop provisioning
-/// path (`$XDG_DATA_HOME/locallmos/models`), so a GUI-switched rig finds models
-/// with no env configuration.
+/// path, so a GUI-switched rig finds models with no env configuration. On Linux
+/// this is `~/.locallmos/models` (a hidden home-dir folder, mirroring
+/// `service/lib-llamacpp.sh`); on macOS/Windows it stays under the platform data
+/// dir (`$XDG_DATA_HOME/locallmos/models`-style), where a dotfolder is unidiomatic.
 pub(crate) fn default_models_dir() -> String {
+    #[cfg(target_os = "linux")]
+    {
+        return dirs::home_dir()
+            .map(|p| p.join(".locallmos").join("models").to_string_lossy().into_owned())
+            .unwrap_or_default();
+    }
+    #[cfg(not(target_os = "linux"))]
     dirs::data_dir()
         .map(|p| p.join("locallmos").join("models").to_string_lossy().into_owned())
         .unwrap_or_default()

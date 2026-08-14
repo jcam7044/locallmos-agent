@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { getSystemMetricsSnapshot } from "../api";
 import type { DiskStat, GpuStat, NetworkStat, SystemMetricsSnapshot } from "../types";
 import { MetricGraph, type GraphSeries } from "./MetricGraph";
@@ -31,10 +32,24 @@ export function ResourcesWindow() {
   useEffect(() => {
     let disposed = false;
     let busy = false;
+    // The window is pre-created hidden and hides (rather than closes) on the tray
+    // toggle, so skip the (comparatively expensive) system sample while it is not
+    // on screen. WebView2 keeps `document.hidden` false for a hidden native
+    // window, so gate on the actual window visibility; the interval resumes
+    // sampling within a second of it being shown again.
+    const onScreen = async () => {
+      if (isWebPreview()) return !document.hidden;
+      try {
+        return await getCurrentWindow().isVisible();
+      } catch {
+        return true; // if visibility can't be read, keep sampling
+      }
+    };
     const poll = async () => {
       if (busy) return;
       busy = true;
       try {
+        if (!(await onScreen())) return;
         const snapshot = isWebPreview()
           ? previewSnapshot()
           : await getSystemMetricsSnapshot();

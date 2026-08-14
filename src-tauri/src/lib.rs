@@ -211,14 +211,13 @@ async fn system_metrics_snapshot(
     Ok(monitor::SystemMetricsSnapshot::from(&telemetry))
 }
 
-fn show_resources_window(app: &tauri::AppHandle) -> Result<(), String> {
-    use tauri::{Manager, WebviewUrl};
-
-    if let Some(window) = app.get_webview_window("resources") {
-        window.show().map_err(|e| e.to_string())?;
-        window.set_focus().map_err(|e| e.to_string())?;
-        return Ok(());
-    }
+/// Build the Resources window hidden. Creating it once at startup (rather than
+/// lazily on the tray click) sidesteps a WebView2 race that can leave a
+/// freshly-created window blank, and lets it live alongside the main window:
+/// closing it only hides it (see the window-close handler), so reopening is an
+/// instant `show()`. The webview pauses its metric polling while hidden.
+fn build_resources_window(app: &tauri::AppHandle) -> Result<tauri::WebviewWindow, String> {
+    use tauri::WebviewUrl;
 
     tauri::WebviewWindowBuilder::new(
         app,
@@ -229,9 +228,23 @@ fn show_resources_window(app: &tauri::AppHandle) -> Result<(), String> {
     .inner_size(980.0, 700.0)
     .min_inner_size(760.0, 520.0)
     .resizable(true)
+    .visible(false)
     .build()
-    .map(|_| ())
     .map_err(|e| e.to_string())
+}
+
+fn show_resources_window(app: &tauri::AppHandle) -> Result<(), String> {
+    use tauri::Manager;
+
+    // Normally the window was pre-created at startup; rebuild it if it is somehow
+    // missing (e.g. it failed to build then).
+    let window = match app.get_webview_window("resources") {
+        Some(window) => window,
+        None => build_resources_window(app)?,
+    };
+    window.show().map_err(|e| e.to_string())?;
+    window.set_focus().map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -1519,13 +1532,21 @@ fn run_gui() {
                     let _ = w.hide();
                 }
             }
+
+            // Pre-create the Resources window (hidden) so the tray just shows it
+            // and it can sit open next to the main window. Best-effort: if it
+            // fails, `show_resources_window` will build it on demand instead.
+            if let Err(error) = build_resources_window(app.handle()) {
+                tracing::warn!("failed to pre-create Resources window: {error}");
+            }
             Ok(())
         })
-        // The main control window hides to tray. Preview windows really close,
-        // which also tears down their managed development server.
         .on_window_event(move |window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
-                if window.label() == "main" {
+                // The main and Resources windows hide to the tray so they persist
+                // and reopen instantly; preview windows really close, tearing down
+                // their managed development server.
+                if matches!(window.label(), "main" | "resources") {
                     let _ = window.hide();
                     api.prevent_close();
                 } else {

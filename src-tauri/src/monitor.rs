@@ -296,12 +296,18 @@ impl Monitor {
             })
             .collect::<Vec<_>>();
         // macOS-only post-processing: collapse APFS container aliases and attach
-        // IORegistry I/O counters. Windows keeps sysinfo's per-volume list as-is,
-        // so its behavior is unchanged by these additions.
+        // IORegistry I/O counters. Windows keeps sysinfo's per-volume list but
+        // gains live per-volume I/O from IOCTL_DISK_PERFORMANCE. Both are added
+        // behind their own `cfg`, so no other platform is affected.
         #[cfg(target_os = "macos")]
         {
             out = merge_container_volumes(out);
             let active = self.attach_macos_disk_io(&mut out, now);
+            self.disk_counters.retain(|key, _| active.contains(key));
+        }
+        #[cfg(target_os = "windows")]
+        {
+            let active = self.attach_windows_disk_io(&mut out, now);
             self.disk_counters.retain(|key, _| active.contains(key));
         }
         out.sort_by(|a, b| a.display_name.cmp(&b.display_name).then(a.name.cmp(&b.name)));
@@ -340,6 +346,37 @@ impl Monitor {
                     delta_rate(previous.write_bytes, current.write_bytes, elapsed);
             }
             active.push(device);
+        }
+        active
+    }
+
+    /// Attach live and cumulative read/write byte counters to each Windows volume
+    /// via `IOCTL_DISK_PERFORMANCE`. The IOCTL is `FILE_ANY_ACCESS`, so the volume
+    /// handle is opened with zero desired access and needs no elevation. Returns
+    /// the counter keys touched this sample so stale rate baselines can be pruned.
+    #[cfg(target_os = "windows")]
+    fn attach_windows_disk_io(&mut self, disks: &mut [DiskStat], now: Instant) -> Vec<String> {
+        let mut active = Vec::new();
+        for disk in disks.iter_mut() {
+            let Some(mount) = disk.mount_points.first() else {
+                continue;
+            };
+            let Some(current) = windows_volume_io(mount) else {
+                continue;
+            };
+            disk.total_read_bytes = Some(current.read_bytes);
+            disk.total_written_bytes = Some(current.write_bytes);
+            let key = format!("win-vol:{}", disk.id);
+            if let Some((sampled, previous)) =
+                self.disk_counters.insert(key.clone(), (now, current))
+            {
+                let elapsed = now.duration_since(sampled).as_secs_f64();
+                disk.read_bytes_per_second =
+                    delta_rate(previous.read_bytes, current.read_bytes, elapsed);
+                disk.write_bytes_per_second =
+                    delta_rate(previous.write_bytes, current.write_bytes, elapsed);
+            }
+            active.push(key);
         }
         active
     }
@@ -796,22 +833,126 @@ fn is_universally_administered_mac(mac: Option<&str>) -> bool {
 
 #[cfg(target_os = "windows")]
 fn detect_network_metadata(name: &str) -> Option<NetworkMetadata> {
-    // sysinfo's Windows collector already rejects disconnected and software
-    // interfaces using the native MIB physical-interface table.
-    let normalized = name.to_ascii_lowercase();
-    let wireless = normalized.contains("wi-fi")
-        || normalized.contains("wifi")
-        || normalized.contains("wireless");
-    let suffix = if normalized.ends_with("connection") {
-        name.to_string()
-    } else {
-        format!("{name} Connection")
+    // sysinfo keys Windows interfaces on the adapter's `Alias`, so we look the
+    // same adapter up in the interface table and keep only physical NICs. Hyper-V
+    // "vEthernet" switch adapters, VirtualBox/VMware host-only adapters, VPN,
+    // loopback and other software interfaces report HardwareInterface = 0 and are
+    // dropped, leaving the panel showing real hardware.
+    let info = windows_interface_info(name)?;
+    if !info.hardware_interface {
+        return None;
+    }
+    // IF_TYPE_IEEE80211 (802.11) marks a wireless NIC; everything else physical is
+    // treated as wired. `Description` is the OS-supplied controller model.
+    let wireless = info.if_type == 71;
+    Some(connection_metadata(wireless, info.description))
+}
+
+#[cfg(target_os = "windows")]
+struct WindowsIfInfo {
+    hardware_interface: bool,
+    if_type: u32,
+    description: Option<String>,
+}
+
+/// Look up a network adapter by its `Alias` (the field sysinfo names interfaces
+/// on) in the native interface table, returning its hardware/type classification.
+#[cfg(target_os = "windows")]
+fn windows_interface_info(name: &str) -> Option<WindowsIfInfo> {
+    use windows_sys::Win32::Foundation::NO_ERROR;
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        FreeMibTable, GetIfTable2, MIB_IF_TABLE2,
     };
-    Some(NetworkMetadata {
-        display_name: suffix,
-        hardware_name: None,
-        interface_type: if wireless { "wifi" } else { "ethernet" }.into(),
-    })
+
+    unsafe {
+        let mut table: *mut MIB_IF_TABLE2 = std::ptr::null_mut();
+        if GetIfTable2(&mut table) != NO_ERROR || table.is_null() {
+            return None;
+        }
+        let count = (*table).NumEntries as usize;
+        // `Table` is a C flexible array of `NumEntries` rows past its declared [_; 1].
+        let rows = (*table).Table.as_ptr();
+        let mut result = None;
+        for i in 0..count {
+            let row = &*rows.add(i);
+            if utf16_to_string(&row.Alias) != name {
+                continue;
+            }
+            let description = utf16_to_string(&row.Description);
+            result = Some(WindowsIfInfo {
+                // HardwareInterface is the first 1-bit field of the flags byte.
+                hardware_interface: row.InterfaceAndOperStatusFlags._bitfield & 0x01 != 0,
+                if_type: row.Type,
+                description: (!description.is_empty()).then_some(description),
+            });
+            break;
+        }
+        FreeMibTable(table as *const core::ffi::c_void);
+        result
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn utf16_to_string(buffer: &[u16]) -> String {
+    let len = buffer.iter().position(|&c| c == 0).unwrap_or(buffer.len());
+    String::from_utf16_lossy(&buffer[..len])
+}
+
+/// Cumulative read/written bytes for a mounted Windows volume (for example the
+/// `"C:\\"` mount point) via `IOCTL_DISK_PERFORMANCE`. Returns `None` when the
+/// volume cannot be opened or the counters are unavailable, so callers fall back
+/// to "not reported" rather than surfacing a misleading zero.
+#[cfg(target_os = "windows")]
+fn windows_volume_io(mount_point: &str) -> Option<DiskCounters> {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+    use windows_sys::Win32::System::Ioctl::{DISK_PERFORMANCE, IOCTL_DISK_PERFORMANCE};
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+
+    // "C:\\" -> `\\.\C:` (the volume device path, without a trailing separator).
+    let letter = mount_point.trim_end_matches(|c| c == '\\' || c == '/');
+    if letter.is_empty() {
+        return None;
+    }
+    let device = format!("\\\\.\\{letter}");
+    let wide: Vec<u16> = device.encode_utf16().chain(std::iter::once(0)).collect();
+
+    unsafe {
+        let handle = CreateFileW(
+            wide.as_ptr(),
+            0, // no read/write access needed: IOCTL_DISK_PERFORMANCE is FILE_ANY_ACCESS
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            0,
+            std::ptr::null_mut(),
+        );
+        if handle == INVALID_HANDLE_VALUE || handle.is_null() {
+            return None;
+        }
+        let mut perf: DISK_PERFORMANCE = std::mem::zeroed();
+        let mut returned: u32 = 0;
+        let ok = DeviceIoControl(
+            handle,
+            IOCTL_DISK_PERFORMANCE,
+            std::ptr::null(),
+            0,
+            &mut perf as *mut DISK_PERFORMANCE as *mut core::ffi::c_void,
+            std::mem::size_of::<DISK_PERFORMANCE>() as u32,
+            &mut returned,
+            std::ptr::null_mut(),
+        );
+        CloseHandle(handle);
+        if ok == 0 {
+            return None;
+        }
+        Some(DiskCounters {
+            read_bytes: perf.BytesRead.max(0) as u64,
+            write_bytes: perf.BytesWritten.max(0) as u64,
+        })
+    }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]

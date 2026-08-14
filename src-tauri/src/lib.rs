@@ -199,6 +199,59 @@ async fn get_status(state: State<'_, Arc<AppState>>) -> Result<AgentStatus, Stri
     Ok(state.status.lock().await.clone())
 }
 
+/// Lightweight, local-only snapshot for the one-second Resources graphs.
+#[tauri::command]
+async fn system_metrics_snapshot(
+    state: State<'_, Arc<AppState>>,
+) -> Result<monitor::SystemMetricsSnapshot, String> {
+    let telemetry = {
+        let mut monitor = state.monitor.lock().await;
+        monitor.sample().await
+    };
+    Ok(monitor::SystemMetricsSnapshot::from(&telemetry))
+}
+
+/// Build the Resources window hidden. Creating it once at startup (rather than
+/// lazily on the tray click) sidesteps a WebView2 race that can leave a
+/// freshly-created window blank, and lets it live alongside the main window:
+/// closing it only hides it (see the window-close handler), so reopening is an
+/// instant `show()`. The webview pauses its metric polling while hidden.
+fn build_resources_window(app: &tauri::AppHandle) -> Result<tauri::WebviewWindow, String> {
+    use tauri::WebviewUrl;
+
+    tauri::WebviewWindowBuilder::new(
+        app,
+        "resources",
+        WebviewUrl::App("index.html?view=resources".into()),
+    )
+    .title("System Resources — LocalLMOS")
+    .inner_size(980.0, 700.0)
+    .min_inner_size(760.0, 520.0)
+    .resizable(true)
+    .visible(false)
+    .build()
+    .map_err(|e| e.to_string())
+}
+
+fn show_resources_window(app: &tauri::AppHandle) -> Result<(), String> {
+    use tauri::Manager;
+
+    // Normally the window was pre-created at startup; rebuild it if it is somehow
+    // missing (e.g. it failed to build then).
+    let window = match app.get_webview_window("resources") {
+        Some(window) => window,
+        None => build_resources_window(app)?,
+    };
+    window.show().map_err(|e| e.to_string())?;
+    window.set_focus().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn open_resources_window(app: tauri::AppHandle) -> Result<(), String> {
+    show_resources_window(&app)
+}
+
 #[tauri::command]
 async fn enroll(
     state: State<'_, Arc<AppState>>,
@@ -1307,6 +1360,7 @@ pub fn run() {
     // Load apps/agent/.env if present (searches CWD upward); real env wins.
     let _ = dotenvy::dotenv();
     init_tracing();
+    prefer_x11_backend();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
@@ -1315,6 +1369,25 @@ pub fn run() {
         Some("--help") | Some("-h") => print_help(),
         // Includes the no-args GUI launch and the autostart `--minimized` case.
         _ => run_gui(),
+    }
+}
+
+/// On Linux, run GTK on X11 (via XWayland) rather than the native Wayland
+/// backend. tao 0.35's Wayland client-side decorations have a bug where the
+/// titlebar minimize/maximize/close buttons go unresponsive — most visibly with
+/// more than one window open (see tauri-apps/tauri#13440, fixed upstream in tao
+/// 0.36, which no released Tauri ships yet). The X11 decoration path is
+/// unaffected. Must run before any GTK init (i.e. before the Tauri builder).
+///
+/// We only set the backend when the user hasn't chosen one, so anyone who
+/// deliberately forces `GDK_BACKEND=wayland` keeps control. Remove this once we
+/// upgrade to a Tauri that bundles tao >= 0.36.
+fn prefer_x11_backend() {
+    #[cfg(target_os = "linux")]
+    {
+        if std::env::var_os("GDK_BACKEND").is_none() {
+            std::env::set_var("GDK_BACKEND", "x11");
+        }
     }
 }
 
@@ -1449,8 +1522,10 @@ fn run_gui() {
 
             // Tray icon + menu built in code so we can wire menu events.
             let open = MenuItem::with_id(app, "open", "Open", true, None::<&str>)?;
+            let resources =
+                MenuItem::with_id(app, "resources", "Resources", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&open, &quit])?;
+            let menu = Menu::with_items(app, &[&open, &resources, &quit])?;
             TrayIconBuilder::with_id("main")
                 .icon(app.default_window_icon().unwrap().clone())
                 .tooltip("LocalLMOS Agent")
@@ -1460,6 +1535,11 @@ fn run_gui() {
                         if let Some(w) = app.get_webview_window("main") {
                             let _ = w.show();
                             let _ = w.set_focus();
+                        }
+                    }
+                    "resources" => {
+                        if let Err(error) = show_resources_window(app) {
+                            tracing::warn!("failed to open Resources window: {error}");
                         }
                     }
                     "quit" => app.exit(0),
@@ -1472,13 +1552,21 @@ fn run_gui() {
                     let _ = w.hide();
                 }
             }
+
+            // Pre-create the Resources window (hidden) so the tray just shows it
+            // and it can sit open next to the main window. Best-effort: if it
+            // fails, `show_resources_window` will build it on demand instead.
+            if let Err(error) = build_resources_window(app.handle()) {
+                tracing::warn!("failed to pre-create Resources window: {error}");
+            }
             Ok(())
         })
-        // The main control window hides to tray. Preview windows really close,
-        // which also tears down their managed development server.
         .on_window_event(move |window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
-                if window.label() == "main" {
+                // The main and Resources windows hide to the tray so they persist
+                // and reopen instantly; preview windows really close, tearing down
+                // their managed development server.
+                if matches!(window.label(), "main" | "resources") {
                     let _ = window.hide();
                     api.prevent_close();
                 } else {
@@ -1495,6 +1583,8 @@ fn run_gui() {
         })
         .invoke_handler(tauri::generate_handler![
             get_status,
+            system_metrics_snapshot,
+            open_resources_window,
             enroll,
             local_status,
             load_model,

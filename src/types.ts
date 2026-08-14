@@ -1,4 +1,5 @@
 export type GpuStat = {
+  id: string;
   index: number;
   name: string | null;
   vendor: string;
@@ -7,6 +8,46 @@ export type GpuStat = {
   memoryTotalBytes: number | null;
   temperatureC: number | null;
   powerWatts: number | null;
+};
+
+export type DiskStat = {
+  id: string;
+  name: string;
+  displayName: string;
+  mountPoints: string[];
+  kind: "nvme" | "hdd" | "ssd" | "unknown";
+  transport: string | null;
+  removable: boolean;
+  usedBytes: number | null;
+  totalBytes: number;
+  readBytesPerSecond: number | null;
+  writeBytesPerSecond: number | null;
+  totalReadBytes: number | null;
+  totalWrittenBytes: number | null;
+};
+
+export type NetworkStat = {
+  id: string;
+  name: string;
+  displayName: string;
+  hardwareName: string | null;
+  interfaceType: "ethernet" | "wifi" | "network";
+  macAddress: string | null;
+  ipAddresses: string[];
+  receivedBytesPerSecond: number | null;
+  transmittedBytesPerSecond: number | null;
+  totalReceivedBytes: number;
+  totalTransmittedBytes: number;
+};
+
+export type SystemMetricsSnapshot = {
+  sampledAtMs: number;
+  cpuUtilizationPct: number | null;
+  memoryUsedBytes: number | null;
+  memoryTotalBytes: number | null;
+  gpus: GpuStat[];
+  disks: DiskStat[];
+  networks: NetworkStat[];
 };
 
 export type AgentStatus = {

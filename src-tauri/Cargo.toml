@@ -51,7 +51,19 @@ tauri-plugin-dialog = "2"
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+    # Per-volume disk I/O counters via IOCTL_DISK_PERFORMANCE.
+    "Win32_Storage_FileSystem",
+    "Win32_System_Ioctl",
+    "Win32_System_IO",
+    # Physical-vs-virtual adapter classification via GetIfTable2 / MIB_IF_ROW2.
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+] }
 
 [features]
 # By default the agent refuses free-form shell commands; opt in per build.

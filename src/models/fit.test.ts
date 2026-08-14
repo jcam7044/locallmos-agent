@@ -31,7 +31,7 @@ function hardware(ramGb: number, gpuGb = 0, vendor = "nvidia"): LocalStatus {
       cpuPct: 0,
       memoryUsedBytes: 2 * GB,
       memoryTotalBytes: ramGb * GB,
-      gpus: gpuGb ? [{ index: 0, name: vendor === "apple" ? "Apple M4" : "GPU", vendor, utilizationPct: 0, memoryUsedBytes: GB, memoryTotalBytes: gpuGb * GB, temperatureC: null, powerWatts: null }] : [],
+      gpus: gpuGb ? [{ id: `${vendor}:0`, index: 0, name: vendor === "apple" ? "Apple M4" : "GPU", vendor, utilizationPct: 0, memoryUsedBytes: GB, memoryTotalBytes: gpuGb * GB, temperatureC: null, powerWatts: null }] : [],
     },
   };
 }

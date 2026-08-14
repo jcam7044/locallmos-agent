@@ -443,6 +443,10 @@ jobs:
       - name: Publish versioned catalog, then promote stable channel
         env:
           GH_TOKEN: ${{ github.token }}
+          # This job intentionally does not check out the repository. Tell the
+          # GitHub CLI which repository to use instead of making it infer one
+          # from a local .git directory.
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           gh release upload "$TAG" llamacpp-release.json llamacpp-release.json.minisig --clobber

@@ -1360,6 +1360,7 @@ pub fn run() {
     // Load apps/agent/.env if present (searches CWD upward); real env wins.
     let _ = dotenvy::dotenv();
     init_tracing();
+    prefer_x11_backend();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
@@ -1368,6 +1369,25 @@ pub fn run() {
         Some("--help") | Some("-h") => print_help(),
         // Includes the no-args GUI launch and the autostart `--minimized` case.
         _ => run_gui(),
+    }
+}
+
+/// On Linux, run GTK on X11 (via XWayland) rather than the native Wayland
+/// backend. tao 0.35's Wayland client-side decorations have a bug where the
+/// titlebar minimize/maximize/close buttons go unresponsive — most visibly with
+/// more than one window open (see tauri-apps/tauri#13440, fixed upstream in tao
+/// 0.36, which no released Tauri ships yet). The X11 decoration path is
+/// unaffected. Must run before any GTK init (i.e. before the Tauri builder).
+///
+/// We only set the backend when the user hasn't chosen one, so anyone who
+/// deliberately forces `GDK_BACKEND=wayland` keeps control. Remove this once we
+/// upgrade to a Tauri that bundles tao >= 0.36.
+fn prefer_x11_backend() {
+    #[cfg(target_os = "linux")]
+    {
+        if std::env::var_os("GDK_BACKEND").is_none() {
+            std::env::set_var("GDK_BACKEND", "x11");
+        }
     }
 }
 

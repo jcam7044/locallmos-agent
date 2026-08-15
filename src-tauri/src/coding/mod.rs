@@ -12,7 +12,9 @@ pub mod preview;
 mod tools;
 mod workspace;
 
-pub use agents::{discover_agents, AgentDef};
+pub use agents::{
+    delete_agent, discover_agents, list_agents, save_agent, AgentDef, AgentScope,
+};
 pub use context_files::load_project_context;
 pub use prompt::system_prompt;
 pub use workspace::Workspace;
@@ -287,8 +289,8 @@ pub fn tool_defs() -> Vec<Value> {
         ),
         def(
             "create_agent",
-            "Save a reusable read-only sub-agent to .agents/<name>.md so it can be dispatched with run_agent later. Write `prompt` as the agent's own system prompt (its role and how to report). `tools` is an optional subset of read_file/list_dir/search/git. Use this when the user asks to create or save an agent. Requires approval.",
-            serde_json::json!({"type":"object","properties":{"name":s("string"),"description":s("string"),"prompt":s("string"),"tools":{"type":"array","items":s("string")}},"required":["name","description","prompt"]}),
+            "Save a reusable read-only sub-agent so it can be dispatched with run_agent later. Write `prompt` as the agent's own system prompt (its role and how to report). `tools` is an optional subset of read_file/list_dir/search/git. Set `global` to true to make it available in every project on this machine; otherwise it is saved to this project's .agents/. Use this when the user asks to create or save an agent. Requires approval.",
+            serde_json::json!({"type":"object","properties":{"name":s("string"),"description":s("string"),"prompt":s("string"),"tools":{"type":"array","items":s("string")},"global":s("boolean")},"required":["name","description","prompt"]}),
         ),
     ]
 }

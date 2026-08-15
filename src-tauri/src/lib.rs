@@ -1248,6 +1248,71 @@ async fn coding_local_delete_session(state: State<'_, Arc<AppState>>, id: String
     Ok(())
 }
 
+/// A sub-agent as shown in the Code tab's Agents panel.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentView {
+    name: String,
+    description: String,
+    tools: Vec<String>,
+    prompt: String,
+    /// "builtin" | "project" | "global".
+    scope: String,
+    editable: bool,
+}
+
+/// List the sub-agents available to a session's workspace: built-in `explore`
+/// plus project (`.agents/`) and global (`<config>/agents/`) files.
+#[tauri::command]
+async fn coding_list_agents(workspace_root: String) -> Result<Vec<AgentView>, String> {
+    let ws = coding::Workspace::new(&workspace_root).map_err(|e| e.to_string())?;
+    Ok(coding::list_agents(&ws)
+        .into_iter()
+        .map(|a| AgentView {
+            name: a.def.name,
+            description: a.def.description,
+            tools: a.def.tools,
+            prompt: a.def.system_prompt,
+            scope: a.scope,
+            editable: a.editable,
+        })
+        .collect())
+}
+
+/// Create or overwrite a custom agent file (project or global). `tools` is
+/// normalized to the read-only set; the built-in `explore` name is rejected.
+#[tauri::command]
+async fn coding_save_agent(
+    workspace_root: String,
+    scope: String,
+    name: String,
+    description: String,
+    prompt: String,
+    tools: Vec<String>,
+) -> Result<(), String> {
+    coding::save_agent(
+        coding::AgentScope::parse(&scope),
+        std::path::Path::new(&workspace_root),
+        &name,
+        &description,
+        &prompt,
+        &tools,
+    )
+    .map(|_| ())
+    .map_err(|e| e.to_string())
+}
+
+/// Delete a custom agent file (project or global).
+#[tauri::command]
+async fn coding_delete_agent(workspace_root: String, scope: String, name: String) -> Result<(), String> {
+    coding::delete_agent(
+        coding::AgentScope::parse(&scope),
+        std::path::Path::new(&workspace_root),
+        &name,
+    )
+    .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 async fn coding_preview_status(
     app: tauri::AppHandle,
@@ -1650,6 +1715,9 @@ fn run_gui() {
             coding_local_send,
             coding_local_approve,
             coding_local_cancel,
+            coding_list_agents,
+            coding_save_agent,
+            coding_delete_agent,
             coding_preview_status,
             coding_preview_focus,
             coding_preview_reload,

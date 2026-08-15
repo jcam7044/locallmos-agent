@@ -11,6 +11,8 @@
 //! a malformed file is skipped rather than failing discovery.
 
 use super::Workspace;
+use anyhow::{anyhow, Result};
+use std::path::{Path, PathBuf};
 
 /// The only tools a sub-agent may use in this version. Sub-agents cannot mutate
 /// the workspace, so they never need the approval gate — which is what keeps the
@@ -20,6 +22,35 @@ pub const READONLY_TOOLS: &[&str] = &["read_file", "list_dir", "search", "git"];
 
 /// The built-in agent's reserved name; a custom file cannot shadow it.
 pub const EXPLORE_AGENT: &str = "explore";
+
+/// Where a custom agent file lives. `Project` travels with the repo (shareable
+/// via git); `Global` applies to every session on this machine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentScope {
+    Project,
+    Global,
+}
+
+impl AgentScope {
+    pub fn parse(s: &str) -> Self {
+        if s == "global" { Self::Global } else { Self::Project }
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Project => "project",
+            Self::Global => "global",
+        }
+    }
+    /// The directory this scope's agent files live in. `Project` is confined to
+    /// the workspace root; `Global` is the app config dir (a deliberate, bounded
+    /// write outside any workspace — app config, not user project files).
+    pub fn dir(self, workspace_root: &Path) -> Result<PathBuf> {
+        match self {
+            Self::Project => Ok(workspace_root.join(".agents")),
+            Self::Global => Ok(crate::config::config_dir()?.join("agents")),
+        }
+    }
+}
 
 /// A resolved sub-agent the orchestrator can dispatch with `run_agent`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -57,44 +88,142 @@ changes — you cannot. Be thorough in searching but terse in reporting."
     }
 }
 
-/// All sub-agents available for a session: the built-in `explore` first, then
-/// project-local (`<workspace>/.agents`) and global (`<config_dir>/agents`)
-/// custom agents. Names are unique — the built-in and earlier sources win, so a
-/// project agent shadows a global one of the same name but nothing shadows
-/// `explore`.
-pub fn discover_agents(ws: &Workspace) -> Vec<AgentDef> {
-    let mut agents = vec![AgentDef::built_in_explore()];
+/// A discovered agent with its provenance, for the management UI.
+#[derive(Clone, Debug)]
+pub struct AgentInfo {
+    pub def: AgentDef,
+    /// "builtin" | "project" | "global".
+    pub scope: String,
+    /// Built-in agents can't be edited or deleted; file-based ones can.
+    pub editable: bool,
+}
 
-    let mut dirs: Vec<std::path::PathBuf> = Vec::new();
-    if let Ok(local) = ws.resolve(".agents") {
-        dirs.push(local);
-    }
-    if let Ok(config) = crate::config::config_dir() {
-        dirs.push(config.join("agents"));
-    }
-
-    for dir in dirs {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        let mut files: Vec<std::path::PathBuf> = entries
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("md"))
-            .collect();
-        files.sort(); // stable order across runs
-        for path in files {
-            let Ok(text) = std::fs::read_to_string(&path) else {
-                continue;
-            };
+/// Parse every `*.md` in `dir` into agents, paired with their path, in a stable
+/// order. Missing dir or unreadable/malformed files are skipped.
+fn scan_agent_dir(dir: &Path) -> Vec<(AgentDef, PathBuf)> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut files: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("md"))
+        .collect();
+    files.sort(); // stable order across runs
+    files
+        .into_iter()
+        .filter_map(|path| {
+            let text = std::fs::read_to_string(&path).ok()?;
             let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("agent");
-            if let Some(agent) = parse_agent(stem, &text) {
-                if !agents.iter().any(|a| a.name == agent.name) {
-                    agents.push(agent);
-                }
+            parse_agent(stem, &text).map(|def| (def, path))
+        })
+        .collect()
+}
+
+/// All sub-agents available for a session, with provenance: the built-in
+/// `explore` first, then project-local (`<workspace>/.agents`) and global
+/// (`<config_dir>/agents`) custom agents. Names are unique — the built-in and
+/// earlier sources win, so a project agent shadows a global one of the same
+/// name but nothing shadows `explore`.
+pub fn list_agents(ws: &Workspace) -> Vec<AgentInfo> {
+    let mut out = vec![AgentInfo {
+        def: AgentDef::built_in_explore(),
+        scope: "builtin".to_string(),
+        editable: false,
+    }];
+    let project = ws.root().join(".agents");
+    let global = AgentScope::Global.dir(ws.root()).ok();
+    let sources = std::iter::once(("project", project))
+        .chain(global.map(|g| ("global", g)));
+    for (scope, dir) in sources {
+        for (def, _path) in scan_agent_dir(&dir) {
+            if !out.iter().any(|a| a.def.name == def.name) {
+                out.push(AgentInfo { def, scope: scope.to_string(), editable: true });
             }
         }
     }
-    agents
+    out
+}
+
+/// The runtime view: just the dispatchable [`AgentDef`]s, same precedence as
+/// [`list_agents`]. This is what the turn engine and tool-def builder use.
+pub fn discover_agents(ws: &Workspace) -> Vec<AgentDef> {
+    list_agents(ws).into_iter().map(|a| a.def).collect()
+}
+
+/// Validate a user/model-supplied agent name: it doubles as a filename, so keep
+/// it to a safe charset, and never let it claim the reserved built-in.
+pub fn validate_name(name: &str) -> Result<String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(anyhow!("agent name is empty"));
+    }
+    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+        return Err(anyhow!("agent name must use only letters, digits, '-' or '_'"));
+    }
+    if name == EXPLORE_AGENT {
+        return Err(anyhow!("'{EXPLORE_AGENT}' is a reserved built-in agent"));
+    }
+    Ok(name.to_string())
+}
+
+/// Intersect a requested tool list with the read-only set. Empty/all-invalid
+/// falls back to the full read-only set (a usable default).
+pub fn normalize_tools(raw: &[String]) -> Vec<String> {
+    let filtered: Vec<String> = raw
+        .iter()
+        .map(|t| t.trim().to_string())
+        .filter(|t| READONLY_TOOLS.contains(&t.as_str()))
+        .collect();
+    if filtered.is_empty() {
+        READONLY_TOOLS.iter().map(|s| s.to_string()).collect()
+    } else {
+        filtered
+    }
+}
+
+/// Render the `.md` file for an agent: frontmatter (name/description/tools) plus
+/// the system prompt as the body. Shared by the model tool and the UI.
+pub fn render_agent_file(name: &str, description: &str, prompt: &str, tools: &[String]) -> String {
+    let description = description.trim().replace(['\n', '\r'], " ");
+    let mut out = String::from("---\n");
+    out.push_str(&format!("name: {name}\n"));
+    out.push_str(&format!("description: {description}\n"));
+    out.push_str(&format!("tools: {}\n", tools.join(", ")));
+    out.push_str("---\n\n");
+    out.push_str(prompt.trim());
+    out.push('\n');
+    out
+}
+
+/// Write an agent file for `scope`, creating the directory if needed. Returns
+/// the written path. `tools` is normalized to the read-only set.
+pub fn save_agent(
+    scope: AgentScope,
+    workspace_root: &Path,
+    name: &str,
+    description: &str,
+    prompt: &str,
+    tools: &[String],
+) -> Result<PathBuf> {
+    let name = validate_name(name)?;
+    if prompt.trim().is_empty() {
+        return Err(anyhow!("agent prompt is empty"));
+    }
+    let dir = scope.dir(workspace_root)?;
+    std::fs::create_dir_all(&dir).map_err(|e| anyhow!("could not create {}: {e}", dir.display()))?;
+    let path = dir.join(format!("{name}.md"));
+    let tools = normalize_tools(tools);
+    std::fs::write(&path, render_agent_file(&name, description, prompt, &tools))
+        .map_err(|e| anyhow!("could not write {}: {e}", path.display()))?;
+    Ok(path)
+}
+
+/// Delete an agent file for `scope`. Missing file is a no-op error.
+pub fn delete_agent(scope: AgentScope, workspace_root: &Path, name: &str) -> Result<()> {
+    let name = validate_name(name)?;
+    let path = scope.dir(workspace_root)?.join(format!("{name}.md"));
+    std::fs::remove_file(&path).map_err(|e| anyhow!("could not delete {}: {e}", path.display()))?;
+    Ok(())
 }
 
 /// Parse one agent file. Returns `None` for content that can't yield a usable
@@ -232,6 +361,47 @@ mod tests {
     fn invalid_tools_fall_back_to_all_readonly() {
         let a = parse_agent("x", "---\ntools: nonsense, danger\n---\nbody").unwrap();
         assert_eq!(a.tools.len(), READONLY_TOOLS.len());
+    }
+
+    #[test]
+    fn save_delete_and_list_round_trip_with_scope() {
+        let dir = std::env::temp_dir().join(format!("locallmos-crud-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = std::fs::canonicalize(&dir).unwrap();
+        let ws = Workspace::new(dir.to_str().unwrap()).unwrap();
+
+        // Save a project agent; write_file is dropped from the tool list.
+        let path = save_agent(
+            AgentScope::Project, ws.root(), "reviewer",
+            "Reviews code.", "You review code.", &["read_file".into(), "write_file".into()],
+        )
+        .unwrap();
+        assert!(path.starts_with(ws.root().join(".agents")));
+
+        let listed = list_agents(&ws);
+        let reviewer = listed.iter().find(|a| a.def.name == "reviewer").unwrap();
+        assert_eq!(reviewer.scope, "project");
+        assert!(reviewer.editable);
+        assert_eq!(reviewer.def.tools, vec!["read_file"]);
+        // The built-in is present and not editable.
+        assert!(listed.iter().any(|a| a.def.name == EXPLORE_AGENT && !a.editable));
+
+        // Delete it and confirm it's gone from the listing.
+        delete_agent(AgentScope::Project, ws.root(), "reviewer").unwrap();
+        assert!(!list_agents(&ws).iter().any(|a| a.def.name == "reviewer"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn save_agent_rejects_reserved_and_empty_prompt() {
+        let dir = std::env::temp_dir().join(format!("locallmos-crud-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = std::fs::canonicalize(&dir).unwrap();
+        let ws = Workspace::new(dir.to_str().unwrap()).unwrap();
+        assert!(save_agent(AgentScope::Project, ws.root(), "explore", "d", "p", &[]).is_err());
+        assert!(save_agent(AgentScope::Project, ws.root(), "ok", "d", "   ", &[]).is_err());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

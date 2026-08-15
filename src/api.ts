@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   AgentStatus,
+  AgentView,
   ApprovalPolicy,
   Attachment,
   ChatSession,
@@ -140,6 +141,24 @@ export const codingApprove = (invocationId: string, approved: boolean) =>
 
 export const codingCancel = (requestId: string) =>
   invoke("coding_local_cancel", { requestId });
+
+export const codingListAgents = (workspaceRoot: string) =>
+  invoke<AgentView[]>("coding_list_agents", { workspaceRoot });
+
+export const codingSaveAgent = (
+  workspaceRoot: string,
+  scope: "project" | "global",
+  name: string,
+  description: string,
+  prompt: string,
+  tools: string[],
+) => invoke("coding_save_agent", { workspaceRoot, scope, name, description, prompt, tools });
+
+export const codingDeleteAgent = (
+  workspaceRoot: string,
+  scope: "project" | "global",
+  name: string,
+) => invoke("coding_delete_agent", { workspaceRoot, scope, name });
 
 export const codingPreviewStatus = (sessionId: string) =>
   invoke<CodingPreviewStatus>("coding_preview_status", { sessionId });

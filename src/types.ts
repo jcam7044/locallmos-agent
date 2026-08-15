@@ -300,6 +300,18 @@ export type CodingSession = {
   contextState: CodingContextState;
 };
 
+export type AgentScope = "builtin" | "project" | "global";
+
+/** A sub-agent shown in the Code tab's Agents panel (mirror lib.rs AgentView). */
+export type AgentView = {
+  name: string;
+  description: string;
+  tools: string[];
+  prompt: string;
+  scope: AgentScope;
+  editable: boolean;
+};
+
 // ---- MCP servers (mirrors src-tauri/src/mcp + the mcp_* Tauri commands) ----
 
 export type McpTrust = "untrusted" | "trusted";

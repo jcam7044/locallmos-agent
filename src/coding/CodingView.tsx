@@ -21,6 +21,7 @@ import {
 } from "../api";
 import type { ApprovalPolicy, CodingContextInfo, CodingEvent, CodingPreviewStatus, CodingSessionMeta, CodingStoredMessage, ModelOption } from "../types";
 import { Markdown } from "../chat/Markdown";
+import { AgentsPanel } from "./AgentsPanel";
 import { Composer, MODES } from "./Composer";
 import { C } from "./tokens";
 import { useCodingStream, type CodingLive, type CodingTrace } from "./useCodingStream";
@@ -44,6 +45,7 @@ export function CodingView({ models }: { models: ModelOption[] }) {
   const [preview, setPreview] = useState<CodingPreviewStatus | null>(null);
   const [contextInfo, setContextInfo] = useState<CodingContextInfo | null>(null);
   const [compacting, setCompacting] = useState(false);
+  const [agentsOpen, setAgentsOpen] = useState(false);
   const requestIdRef = useRef<string | null>(null);
   const { live, reset } = useCodingStream(activeId);
 
@@ -337,7 +339,11 @@ export function CodingView({ models }: { models: ModelOption[] }) {
           />
         ) : (
           <>
-            <SessionHeader meta={sessions.find((s) => s.id === activeId)} onDelete={() => onDelete(activeId)} />
+            <SessionHeader
+              meta={sessions.find((s) => s.id === activeId)}
+              onOpenAgents={() => setAgentsOpen(true)}
+              onDelete={() => onDelete(activeId)}
+            />
             {preview && (preview.windowOpen || preview.serverState !== "stopped") && (
               <PreviewStrip
                 status={preview}
@@ -382,6 +388,13 @@ export function CodingView({ models }: { models: ModelOption[] }) {
           </>
         )}
       </main>
+      {agentsOpen && activeId !== null && (
+        <AgentsPanel
+          workspaceRoot={sessions.find((s) => s.id === activeId)?.workspaceRoot ?? ""}
+          onClose={() => setAgentsOpen(false)}
+          onError={setError}
+        />
+      )}
     </div>
   );
 }
@@ -516,7 +529,15 @@ function NewSession({
   );
 }
 
-function SessionHeader({ meta, onDelete }: { meta?: CodingSessionMeta; onDelete: () => void }) {
+function SessionHeader({
+  meta,
+  onOpenAgents,
+  onDelete,
+}: {
+  meta?: CodingSessionMeta;
+  onOpenAgents: () => void;
+  onDelete: () => void;
+}) {
   return (
     <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", borderBottom: C.border, paddingBottom: 8, marginBottom: 8 }}>
       <div style={{ minWidth: 0 }}>
@@ -529,9 +550,12 @@ function SessionHeader({ meta, onDelete }: { meta?: CodingSessionMeta; onDelete:
           {meta?.workspaceRoot}
         </div>
       </div>
-      <button onClick={onDelete} style={{ ...btn(false), color: "#f87171" }}>
-        Delete
-      </button>
+      <div style={{ display: "flex", gap: 8, flexShrink: 0 }}>
+        <button onClick={onOpenAgents} style={btn(false)}>Agents</button>
+        <button onClick={onDelete} style={{ ...btn(false), color: "#f87171" }}>
+          Delete
+        </button>
+      </div>
     </div>
   );
 }

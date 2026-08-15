@@ -1,17 +1,19 @@
 import { useCallback, useEffect, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { getAgentStatus, getLocalStatus, hubCancelDownload, hubListDownloads, llamaCppCheckUpdate, llamaCppInstallUpdate } from "./api";
+import { agentCheckUpdate, getAgentStatus, getLocalStatus, hubCancelDownload, hubListDownloads, llamaCppCheckUpdate, llamaCppInstallUpdate } from "./api";
 import { ChatView } from "./chat/ChatView";
 import { CodingView } from "./coding/CodingView";
 import { ConnectCloud, Dashboard } from "./dashboard/Dashboard";
 import { DownloadBanner } from "./downloads/DownloadBanner";
-import type { AgentStatus, DownloadState, LlamaCppUpdateInfo, LlamaCppUpdateProgress, LocalStatus } from "./types";
+import type { AgentStatus, AgentUpdateInfo, DownloadState, LlamaCppUpdateInfo, LlamaCppUpdateProgress, LocalStatus } from "./types";
 import { useTabWindowSize, type Tab } from "./useTabWindowSize";
 import { ModelsView } from "./models/ModelsView";
 import { ToolsView } from "./tools/ToolsView";
+import { AgentUpdateToast } from "./updates/AgentUpdateToast";
 import { LlamaCppUpdateToast } from "./updates/LlamaCppUpdateToast";
 
 const DISMISSED_LLAMA_UPDATE = "locallmos.dismissedLlamaCppUpdate";
+const DISMISSED_AGENT_UPDATE = "locallmos.dismissedAgentUpdate";
 
 export function App() {
   const [tab, setTab] = useState<Tab>("dashboard");
@@ -23,6 +25,7 @@ export function App() {
   const [dismissedDownloads, setDismissedDownloads] = useState<Set<string>>(() => new Set());
   const [llamaUpdate, setLlamaUpdate] = useState<LlamaCppUpdateInfo | null>(null);
   const [llamaProgress, setLlamaProgress] = useState<LlamaCppUpdateProgress | null>(null);
+  const [agentUpdate, setAgentUpdate] = useState<AgentUpdateInfo | null>(null);
 
   const refresh = useCallback(async () => {
     try {
@@ -62,6 +65,32 @@ export function App() {
     const timer = setInterval(() => { void checkLlamaUpdate().catch(() => undefined); }, 24 * 60 * 60 * 1000);
     return () => clearInterval(timer);
   }, [checkLlamaUpdate, local?.runtime.kind]);
+
+  // The desktop app can't overwrite its own (often privileged) binary in place,
+  // so a newer agent release surfaces a copy-command toast instead of a
+  // self-update. Manual checks always pop the toast; the periodic check respects
+  // a per-version dismissal.
+  const checkAgentUpdate = useCallback(async (manual = false) => {
+    const update = await agentCheckUpdate();
+    if (!update) {
+      if (manual) setAgentUpdate(null);
+      return "You're on the latest version.";
+    }
+    const dismissed = localStorage.getItem(DISMISSED_AGENT_UPDATE);
+    if (manual || dismissed !== update.latestVersion) setAgentUpdate(update);
+    return `Agent ${update.latestVersion} is available.`;
+  }, []);
+
+  useEffect(() => {
+    void checkAgentUpdate().catch(() => undefined);
+    const timer = setInterval(() => { void checkAgentUpdate().catch(() => undefined); }, 24 * 60 * 60 * 1000);
+    return () => clearInterval(timer);
+  }, [checkAgentUpdate]);
+
+  const dismissAgentUpdate = useCallback(() => {
+    if (agentUpdate) localStorage.setItem(DISMISSED_AGENT_UPDATE, agentUpdate.latestVersion);
+    setAgentUpdate(null);
+  }, [agentUpdate]);
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
@@ -146,7 +175,7 @@ export function App() {
 
       {tab === "dashboard" ? (
         <>
-          <Dashboard local={local} running={running} onChanged={refresh} onCheckLlamaCppUpdate={() => checkLlamaUpdate(true)} />
+          <Dashboard local={local} running={running} onChanged={refresh} onCheckAgentUpdate={() => checkAgentUpdate(true)} onCheckLlamaCppUpdate={() => checkLlamaUpdate(true)} />
           <ConnectCloud status={status} onEnrolled={refresh} />
         </>
       ) : tab === "chat" ? (
@@ -175,6 +204,11 @@ export function App() {
         progress={llamaProgress}
         onInstall={installLlamaUpdate}
         onDismiss={dismissLlamaUpdate}
+      />
+      <AgentUpdateToast
+        info={agentUpdate}
+        raised={Boolean(llamaUpdate || llamaProgress)}
+        onDismiss={dismissAgentUpdate}
       />
     </div>
   );

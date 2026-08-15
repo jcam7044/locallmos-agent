@@ -143,6 +143,13 @@ export type DownloadState = {
   error: string | null;
 };
 
+export type AgentUpdateInfo = {
+  currentVersion: string;
+  latestVersion: string;
+  os: string;
+  installCommand: string;
+};
+
 export type LlamaCppUpdateInfo = {
   currentTag: string | null;
   latestTag: string;

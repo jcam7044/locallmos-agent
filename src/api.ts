@@ -21,6 +21,7 @@ import type {
   McpServerConfig,
   McpTrust,
   ChatContextInfo,
+  AgentUpdateInfo,
   LlamaCppUpdateInfo,
   SystemMetricsSnapshot,
 } from "./types";
@@ -58,7 +59,7 @@ export const hubStartDownload = (repoId: string, revision: string, variantId: st
   invoke<DownloadState>("hub_start_download", { repoId, revision, variantId });
 export const hubListDownloads = () => invoke<DownloadState[]>("hub_list_downloads");
 export const hubCancelDownload = (id: string) => invoke<DownloadState>("hub_cancel_download", { id });
-export const localUpdate = () => invoke<string | null>("local_update");
+export const agentCheckUpdate = () => invoke<AgentUpdateInfo | null>("agent_check_update");
 export const llamaCppCheckUpdate = () =>
   invoke<LlamaCppUpdateInfo | null>("llamacpp_check_update");
 export const llamaCppInstallUpdate = (tag: string) =>

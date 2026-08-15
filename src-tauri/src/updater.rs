@@ -33,25 +33,40 @@ fn platform_key() -> String {
     format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
 }
 
-/// Release asset name for this platform (matches the CI staging step).
-fn asset_name() -> String {
-    let base = format!("locallmos-agent-{}", platform_key());
+/// Update availability for the desktop app: the version delta plus a
+/// ready-to-paste terminal command. The GUI surfaces this (a copy-command toast)
+/// rather than self-updating, because overwriting the installed — often
+/// privileged — binary in place needs elevation the running app doesn't have.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentUpdateInfo {
+    pub current_version: String,
+    pub latest_version: String,
+    /// Target OS, e.g. "linux" | "macos" | "windows" (`std::env::consts::OS`).
+    pub os: String,
+    /// The command to run in a terminal to install the update.
+    pub install_command: String,
+}
+
+/// The terminal command that installs/updates the agent, matching
+/// `service/install.sh` (Linux/macOS) and `service/install.ps1` (Windows). Keep
+/// the URLs in sync with those scripts and the README quick-start.
+fn install_command() -> String {
     if cfg!(target_os = "windows") {
-        format!("{base}.exe")
+        "iex ((curl.exe -fsSL https://locallmos.com/install.ps1) -join \"`n\")".to_string()
     } else {
-        base
+        "curl -fsSL https://locallmos.com/install.sh | sh".to_string()
     }
 }
 
-/// Account-less self-update: query the public GitHub Releases API directly (no
-/// Supabase / device JWT), and if the latest release is newer, download + verify
-/// + swap + restart. Returns `Some(version)` when updated, `None` if current.
-/// Used by local (unenrolled) installs; connected rigs use the command path.
-pub async fn self_update_from_github() -> Result<Option<String>> {
+/// Query the public GitHub Releases API (no download, no swap) and report whether
+/// a newer release exists. Returns `Some(info)` with the OS-appropriate install
+/// command when an update is available, `None` when already current. The desktop
+/// app calls this to show an update-available toast instead of self-updating.
+pub async fn check_for_update() -> Result<Option<AgentUpdateInfo>> {
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
         .build()?;
-    // GitHub's API requires a User-Agent.
     let ua = concat!("locallmos-agent/", env!("CARGO_PKG_VERSION"));
     let rel: Value = client
         .get(format!(
@@ -70,60 +85,15 @@ pub async fn self_update_from_github() -> Result<Option<String>> {
         .and_then(Value::as_str)
         .unwrap_or("")
         .trim_start_matches('v');
-    if !is_newer(latest, AGENT_VERSION) {
+    if latest.is_empty() || !is_newer(latest, AGENT_VERSION) {
         return Ok(None);
     }
-
-    let assets = rel
-        .get("assets")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let url_of = |name: &str| -> Option<String> {
-        assets
-            .iter()
-            .find(|a| a.get("name").and_then(Value::as_str) == Some(name))
-            .and_then(|a| a.get("browser_download_url"))
-            .and_then(Value::as_str)
-            .map(String::from)
-    };
-    let name = asset_name();
-    let bin_url = url_of(&name).ok_or_else(|| anyhow!("release has no asset {name}"))?;
-    let sha_url = url_of(&format!("{name}.sha256")).ok_or_else(|| anyhow!("missing {name}.sha256"))?;
-    let sig_url = url_of(&format!("{name}.minisig")).ok_or_else(|| anyhow!("missing {name}.minisig"))?;
-
-    let fetch_text = |u: String| {
-        let client = client.clone();
-        async move {
-            client
-                .get(&u)
-                .header("User-Agent", ua)
-                .send()
-                .await?
-                .error_for_status()?
-                .text()
-                .await
-                .map_err(anyhow::Error::from)
-        }
-    };
-    let sha256 = fetch_text(sha_url)
-        .await?
-        .split_whitespace()
-        .next()
-        .unwrap_or_default()
-        .to_string();
-    let sig = fetch_text(sig_url).await?;
-
-    let bytes = download_and_verify(&ReleaseArtifact {
-        url: bin_url,
-        sha256,
-        sig,
-    })
-    .await?;
-    swap_binary(&bytes)?;
-    tracing::info!("local self-update {} -> {}; restarting", AGENT_VERSION, latest);
-    schedule_restart();
-    Ok(Some(latest.to_string()))
+    Ok(Some(AgentUpdateInfo {
+        current_version: AGENT_VERSION.to_string(),
+        latest_version: latest.to_string(),
+        os: std::env::consts::OS.to_string(),
+        install_command: install_command(),
+    }))
 }
 
 /// Handle an `update_agent` command payload: `{ version, channel }`.

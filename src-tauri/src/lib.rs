@@ -1318,11 +1318,14 @@ async fn coding_local_cancel(state: State<'_, Arc<AppState>>, request_id: String
     Ok(())
 }
 
-/// Check GitHub Releases directly (no account) and self-update if a newer version
-/// exists. Returns the new version when it updated, `None` when already current.
+/// Check GitHub Releases directly (no account, no download) for a newer agent
+/// version. Returns the version delta plus the OS-appropriate install command so
+/// the desktop app can show a copy-command update toast; `None` when current.
+/// The GUI can't overwrite its own privileged binary, so it points the user at
+/// the installer command rather than self-updating in place.
 #[tauri::command]
-async fn local_update() -> Result<Option<String>, String> {
-    crate::updater::self_update_from_github()
+async fn agent_check_update() -> Result<Option<updater::AgentUpdateInfo>, String> {
+    crate::updater::check_for_update()
         .await
         .map_err(|e| e.to_string())
 }
@@ -1615,7 +1618,7 @@ fn run_gui() {
             local_chat_send,
             local_chat_cancel,
             chat_context,
-            local_update,
+            agent_check_update,
             llamacpp_check_update,
             llamacpp_install_update,
             chat_list_sessions,

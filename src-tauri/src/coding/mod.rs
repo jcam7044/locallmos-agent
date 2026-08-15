@@ -102,7 +102,8 @@ impl ApprovalPolicy {
 /// subcommand. Pure — MCP tools are classified by [`is_mutating`].
 fn builtin_is_mutating(name: &str, args: &Value) -> bool {
     match name {
-        "write_file" | "edit_file" | "run_command" | "dev_server_start" | "update_memory" => true,
+        "write_file" | "edit_file" | "run_command" | "dev_server_start" | "update_memory"
+        | "create_agent" => true,
         "git" => !tools::git_is_readonly(args.get("args").and_then(Value::as_str).unwrap_or("")),
         // run_agent only dispatches read-only sub-agents, so it never mutates.
         _ => false,
@@ -161,7 +162,7 @@ pub fn is_known_tool(name: &str) -> bool {
         || matches!(
             name,
             "read_file" | "list_dir" | "search" | "write_file" | "edit_file" | "run_command" | "git"
-                | "update_memory" | "run_agent"
+                | "update_memory" | "run_agent" | "create_agent"
                 | "dev_server_start" | "dev_server_logs" | "dev_server_stop"
                 | "web_preview_open" | "web_preview_snapshot" | "web_preview_click"
                 | "web_preview_fill" | "web_preview_press" | "web_preview_reload"
@@ -187,7 +188,7 @@ pub fn tool_defs_for(cx: &CodingContext, include_preview: bool, include_mcp: boo
     if !allows {
         all.retain(|d| {
             let name = d.pointer("/function/name").and_then(Value::as_str).unwrap_or("");
-            !matches!(name, "write_file" | "edit_file" | "run_command" | "dev_server_start" | "update_memory")
+            !matches!(name, "write_file" | "edit_file" | "run_command" | "dev_server_start" | "update_memory" | "create_agent")
         });
     }
     // run_agent dispatches read-only sub-agents, so it is offered in every mode.
@@ -284,6 +285,11 @@ pub fn tool_defs() -> Vec<Value> {
             "Record a durable fact in the workspace MEMORY.md (build/test commands, decisions, constraints). Pass `replaces` with a snippet of an existing memory line to supersede it. Requires approval.",
             serde_json::json!({"type":"object","properties":{"note":s("string"),"replaces":s("string")},"required":["note"]}),
         ),
+        def(
+            "create_agent",
+            "Save a reusable read-only sub-agent to .agents/<name>.md so it can be dispatched with run_agent later. Write `prompt` as the agent's own system prompt (its role and how to report). `tools` is an optional subset of read_file/list_dir/search/git. Use this when the user asks to create or save an agent. Requires approval.",
+            serde_json::json!({"type":"object","properties":{"name":s("string"),"description":s("string"),"prompt":s("string"),"tools":{"type":"array","items":s("string")}},"required":["name","description","prompt"]}),
+        ),
     ]
 }
 
@@ -343,6 +349,7 @@ pub fn approval_preview(cx: &CodingContext, name: &str, args: &Value) -> Option<
                 None => format!("MEMORY.md: remember: {note}"),
             })
         }
+        "create_agent" => Some(tools::agent_preview(args)),
         "dev_server_start" => Some(format!(
             "$ {}\nPreview URL: {}",
             args.get("command").and_then(Value::as_str).unwrap_or(""),
@@ -488,8 +495,9 @@ mod tests {
             for withheld in ["write_file", "edit_file", "run_command", "dev_server_start"] {
                 assert!(!offered.contains(&withheld.to_string()), "{p:?} offered {withheld}");
             }
-            // update_memory mutates, so inspection modes withhold it too.
+            // update_memory / create_agent mutate, so inspection modes withhold them.
             assert!(!offered.contains(&"update_memory".to_string()), "{p:?} offered update_memory");
+            assert!(!offered.contains(&"create_agent".to_string()), "{p:?} offered create_agent");
             // Reads and git stay available — git's mutating subcommands are
             // refused per call rather than by withholding the whole tool. run_agent
             // dispatches read-only sub-agents, so it is offered in every mode.

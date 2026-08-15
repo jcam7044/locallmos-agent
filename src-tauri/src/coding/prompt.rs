@@ -107,6 +107,9 @@ You have these tools, which operate ONLY inside the workspace:
 - git(args) — run a git subcommand.
 - update_memory(note[, replaces]) — record a durable fact in MEMORY.md.
 - run_agent(agent, task) — delegate a task to a sub-agent (see below).
+- create_agent(name, description, prompt[, tools]) — save a reusable sub-agent \
+to .agents/. When the user asks to create/save an agent, call this and write a \
+focused system prompt for it; it becomes available to run_agent on the next turn.
 
 Project context and memory:
 - If the workspace has an AGENTS.md (or CLAUDE.md) and/or MEMORY.md, their \

@@ -384,7 +384,7 @@ pub async fn process(state: &Arc<AppState>, pending: ChatPending) -> Result<()> 
     if let Some(cx) = coding_ctx.as_ref() {
         for def in coding::tool_defs_for(cx, false, false) {
             let name = match def.pointer("/function/name").and_then(Value::as_str) {
-                Some(n @ ("update_memory" | "run_agent")) => n.to_string(),
+                Some(n @ ("update_memory" | "run_agent" | "create_agent")) => n.to_string(),
                 _ => continue,
             };
             if platform_tools.iter().any(|t| t.name == name) {
@@ -406,7 +406,7 @@ pub async fn process(state: &Arc<AppState>, pending: ChatPending) -> Result<()> 
                 description,
                 parameters,
                 execution: "local".into(),
-                approval_required: name == "update_memory",
+                approval_required: name == "update_memory" || name == "create_agent",
             });
             tool_defs.push(def);
         }

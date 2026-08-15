@@ -268,4 +268,80 @@ You are a meticulous code reviewer. Read the file you are asked about, then repo
 
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    /// End-to-end proof that the loaded model itself calls `create_agent` from a
+    /// plain-English request, and that the saved agent is then discoverable. Same
+    /// live-server requirements as the reviewer test; run with:
+    ///
+    ///   LOCALLMOS_LLAMACPP_MODELS_DIR=/home/jason/.locallmos/models \
+    ///   SUBAGENT_TEST_MODEL='huggingface/unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q5_K_M.gguf' \
+    ///   cargo test --lib subagent::tests::model_creates_an_agent_on_request -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "requires a running llama-server + local model"]
+    async fn model_creates_an_agent_on_request() {
+        let model = std::env::var("SUBAGENT_TEST_MODEL")
+            .expect("set SUBAGENT_TEST_MODEL to a local gguf model id");
+        let dir = std::env::temp_dir().join(format!("locallmos-mkagent-live-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = std::fs::canonicalize(&dir).unwrap();
+
+        let cx = CodingContext {
+            workspace: Workspace::new(dir.to_str().unwrap()).unwrap(),
+            policy: ApprovalPolicy::Auto, // no approval gate in the test harness
+            mcp: McpAccess::disabled(),
+        };
+        let runtime = Runtime::from_kind(reqwest::Client::new(), "llamacpp");
+        let settings = ModelLoadSettings::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let tool_defs = coding::tool_defs_for(&cx, false, true);
+        let tools_value = Value::Array(tool_defs);
+        let mut messages = vec![
+            json!({ "role": "system", "content": coding::system_prompt(
+                &cx.workspace.root_str(), cx.policy, &cx.mcp, &coding::discover_agents(&cx.workspace),
+            ) }),
+            json!({ "role": "user", "content":
+                "Create a reusable sub-agent named 'py-reviewer' that reviews Python files for bugs and reports concrete findings." }),
+        ];
+
+        // A few rounds: execute whatever tools the model calls until it saves the
+        // agent (it may list_dir first). Then assert the agent exists.
+        let mut created = false;
+        for _ in 0..5 {
+            let out = runtime
+                .chat_stream(&model, Value::Array(messages.clone()), false,
+                    Some(&tools_value), None, &settings, cancel.clone(), |_| {})
+                .await
+                .unwrap();
+            if out.tool_calls.iter().any(|c| c.name == "create_agent") {
+                created = true;
+            }
+            if out.tool_calls.is_empty() {
+                println!("MODEL (no tools): {}", out.content);
+                break;
+            }
+            let echoed: Vec<Value> = out.tool_calls.iter().map(|c| c.to_request_value()).collect();
+            messages.push(json!({ "role": "assistant", "content": "", "tool_calls": echoed }));
+            for call in &out.tool_calls {
+                println!("TOOL CALL: {} {}", call.name, call.arguments);
+                let run = coding::execute(&cx, None, &call.name, &call.arguments).await;
+                messages.push(json!({ "role": "tool", "tool_name": call.name, "content": run.content }));
+            }
+            if created {
+                break;
+            }
+        }
+
+        assert!(created, "the model never called create_agent");
+        let agents = coding::discover_agents(&cx.workspace);
+        println!("DISCOVERED AGENTS: {:?}", agents.iter().map(|a| &a.name).collect::<Vec<_>>());
+        let made = agents.iter().find(|a| a.name != "explore").expect("a custom agent was saved");
+        // Whatever it saved must be read-only and have a usable prompt.
+        let readonly = ["read_file", "list_dir", "search", "git"];
+        assert!(made.tools.iter().all(|t| readonly.contains(&t.as_str())), "non-read-only tool saved: {:?}", made.tools);
+        assert!(!made.system_prompt.trim().is_empty());
+        println!("SAVED AGENT: {} — {}", made.name, made.description);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

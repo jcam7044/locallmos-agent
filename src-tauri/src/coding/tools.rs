@@ -28,6 +28,7 @@ pub async fn run(cx: &CodingContext, host: Option<&CodingHost>, name: &str, args
         "search" => search(cx, args),
         "write_file" | "edit_file" => write_change(cx, name, args),
         "update_memory" => update_memory(cx, args),
+        "create_agent" => create_agent(cx, args),
         "run_command" => {
             let cmd = str_arg(args, "command")?;
             run_shell(cx, &cmd).await
@@ -386,6 +387,113 @@ fn update_memory(cx: &CodingContext, args: &Value) -> Result<ToolRun> {
 }
 
 // ---------------------------------------------------------------------------
+// Agents
+// ---------------------------------------------------------------------------
+
+/// Validate a user/model-supplied agent name: it doubles as a filename, so keep
+/// it to a safe charset, and never let it claim the reserved built-in.
+fn validate_agent_name(name: &str) -> Result<String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(anyhow!("agent name is empty"));
+    }
+    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+        return Err(anyhow!("agent name must use only letters, digits, '-' or '_'"));
+    }
+    if name == super::agents::EXPLORE_AGENT {
+        return Err(anyhow!("'{}' is a reserved built-in agent", super::agents::EXPLORE_AGENT));
+    }
+    Ok(name.to_string())
+}
+
+/// Normalize a requested tool list (JSON array or comma/space string) down to the
+/// read-only set a sub-agent may use. Empty/absent → the full read-only set.
+fn requested_agent_tools(args: &Value) -> Vec<String> {
+    let raw: Vec<String> = match args.get("tools") {
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect(),
+        Some(Value::String(s)) => s.split([',', ' ', '\t']).map(|t| t.trim().to_string()).collect(),
+        _ => Vec::new(),
+    };
+    let filtered: Vec<String> = raw
+        .into_iter()
+        .filter(|t| super::agents::READONLY_TOOLS.contains(&t.as_str()))
+        .collect();
+    if filtered.is_empty() {
+        super::agents::READONLY_TOOLS.iter().map(|s| s.to_string()).collect()
+    } else {
+        filtered
+    }
+}
+
+/// Render the `.agents/<name>.md` file a `create_agent` call would write. Shared
+/// by the executor and the approval preview so the user approves the exact text.
+fn render_agent_file(name: &str, description: &str, prompt: &str, tools: &[String]) -> String {
+    let description = description.trim().replace(['\n', '\r'], " ");
+    let mut out = String::from("---\n");
+    out.push_str(&format!("name: {name}\n"));
+    out.push_str(&format!("description: {description}\n"));
+    out.push_str(&format!("tools: {}\n", tools.join(", ")));
+    out.push_str("---\n\n");
+    out.push_str(prompt.trim());
+    out.push('\n');
+    out
+}
+
+/// Create (or overwrite) a reusable sub-agent as `<workspace>/.agents/<name>.md`.
+/// The model authors `prompt` (the agent's system prompt) from the user's
+/// request; the resulting agent is discoverable on the very next turn. Mutating,
+/// so it flows through the approval gate; emits a `file_edit` event.
+fn create_agent(cx: &CodingContext, args: &Value) -> Result<ToolRun> {
+    let name = validate_agent_name(&str_arg(args, "name")?)?;
+    let description = str_arg(args, "description")?;
+    let prompt = str_arg(args, "prompt")?;
+    let tools = requested_agent_tools(args);
+    let content = render_agent_file(&name, &description, &prompt, &tools);
+
+    // `.agents/` lives at the workspace root; create it if missing. `name` is
+    // validated to a safe charset above, so the join cannot escape the dir.
+    let dir = cx.workspace.resolve(".agents")?;
+    std::fs::create_dir_all(&dir).map_err(|e| anyhow!("could not create .agents: {e}"))?;
+    let path = dir.join(format!("{name}.md"));
+    let rel = cx.workspace.display_relative(&path);
+    let old = std::fs::read_to_string(&path).unwrap_or_default();
+    let verb = if old.is_empty() { "Created" } else { "Updated" };
+    std::fs::write(&path, &content).map_err(|e| anyhow!("could not write {rel}: {e}"))?;
+
+    let (diff, added, removed) = line_diff(&old, &content);
+    let summary = format!("+{added} -{removed}");
+    Ok(ToolRun {
+        content: format!(
+            "{verb} sub-agent '{name}' at {rel} (tools: {}). It is now available to run_agent.",
+            tools.join(", ")
+        ),
+        summary: summary.clone(),
+        event: Some(json!({ "type": "file_edit", "path": rel, "diff": diff, "summary": summary })),
+        activity: Some(json!({
+            "name": "create_agent", "provider": "coding", "status": "succeeded",
+            "summary": format!("{} agent {name}", verb.to_lowercase()), "citations": [],
+        })),
+    })
+}
+
+/// The approval preview for `create_agent`: the exact file that will be written.
+pub fn agent_preview(args: &Value) -> String {
+    let name = args.get("name").and_then(Value::as_str).unwrap_or("");
+    let name = match validate_agent_name(name) {
+        Ok(n) => n,
+        Err(e) => return format!("create_agent: {e}"),
+    };
+    let description = args.get("description").and_then(Value::as_str).unwrap_or("");
+    let prompt = args.get("prompt").and_then(Value::as_str).unwrap_or("");
+    let tools = requested_agent_tools(args);
+    let body = render_agent_file(&name, description, prompt, &tools);
+    format!(".agents/{name}.md\n{}", truncate(&body, MAX_DIFF_CHARS))
+}
+
+// ---------------------------------------------------------------------------
 // Commands
 // ---------------------------------------------------------------------------
 
@@ -585,6 +693,54 @@ mod tests {
         // A non-bullet heading is never dropped by `replaces`.
         assert!(body.contains("## Memory"));
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn create_agent_writes_a_discoverable_readonly_agent() {
+        let dir = std::env::temp_dir().join(format!("locallmos-mkagent-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = std::fs::canonicalize(&dir).unwrap();
+        let cx = ctx_in(&dir);
+
+        // write_file is dropped (not read-only); read_file + search survive.
+        create_agent(&cx, &json!({
+            "name": "sec-reviewer",
+            "description": "Reviews code for security issues.",
+            "prompt": "You are a security reviewer. Report concrete vulnerabilities.",
+            "tools": ["read_file", "search", "write_file"],
+        })).unwrap();
+
+        let file = dir.join(".agents").join("sec-reviewer.md");
+        let body = std::fs::read_to_string(&file).unwrap();
+        assert!(body.contains("name: sec-reviewer"));
+        assert!(body.contains("tools: read_file, search"));
+        assert!(!body.contains("write_file"));
+        assert!(body.contains("You are a security reviewer."));
+
+        // The freshly-written file is picked up by discovery, with tools intersected.
+        let agents = crate::coding::discover_agents(&cx.workspace);
+        let found = agents.iter().find(|a| a.name == "sec-reviewer").expect("discovered");
+        assert_eq!(found.tools, vec!["read_file", "search"]);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn create_agent_rejects_reserved_and_unsafe_names() {
+        let dir = std::env::temp_dir().join(format!("locallmos-mkagent-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = std::fs::canonicalize(&dir).unwrap();
+        let cx = ctx_in(&dir);
+        let base = json!({ "description": "d", "prompt": "p" });
+        let with_name = |n: &str| {
+            let mut v = base.clone();
+            v["name"] = json!(n);
+            v
+        };
+        assert!(create_agent(&cx, &with_name("explore")).is_err(), "reserved");
+        assert!(create_agent(&cx, &with_name("../evil")).is_err(), "path chars");
+        assert!(create_agent(&cx, &with_name("has space")).is_err(), "space");
         std::fs::remove_dir_all(&dir).ok();
     }
 

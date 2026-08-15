@@ -5,7 +5,8 @@ import type { CodingEvent, CodingStreamEvent } from "../types";
 export type CodingTrace =
   | { kind: "tool"; name: string; summary?: string }
   | { kind: "file_edit"; path: string; diff: string; summary: string; invocationId?: string }
-  | { kind: "command"; command: string; output: string; exitCode?: number | null; invocationId?: string };
+  | { kind: "command"; command: string; output: string; exitCode?: number | null; invocationId?: string }
+  | { kind: "subagent"; agent: string; task: string; summary?: string };
 
 export type PendingApproval = { invocationId: string; name: string; preview: string };
 
@@ -107,6 +108,23 @@ function reduce(s: CodingLive, messageId: string, ev: CodingStreamEvent): Coding
           { kind: "command", command: ev.command, output: ev.chunk, exitCode: ev.exitCode, invocationId: ev.invocationId },
         ],
       };
+    case "subagent_started":
+      return {
+        ...cur,
+        status: "streaming",
+        trace: [...cur.trace, { kind: "subagent", agent: ev.agent, task: ev.task }],
+      };
+    case "subagent_result": {
+      const trace = [...cur.trace];
+      for (let i = trace.length - 1; i >= 0; i--) {
+        const t = trace[i];
+        if (t && t.kind === "subagent" && t.agent === ev.agent && t.summary === undefined) {
+          trace[i] = { ...t, summary: ev.summary };
+          break;
+        }
+      }
+      return { ...cur, trace };
+    }
     case "approval_needed":
       return {
         ...cur,

@@ -181,10 +181,16 @@ pub async fn process(state: &Arc<AppState>, pending: ChatPending) -> Result<()> 
                 // freeze it for the turn.
                 state.mcp.ensure_enabled_started().await;
                 let mcp = coding::McpAccess::frozen(state.mcp.clone());
+                // Insert the base coding prompt at index 0, then the optional
+                // project-context (AGENTS.md/MEMORY.md) block right after it, so
+                // both lead the transcript in the same order as the local path.
                 messages.insert(
                     0,
-                    json!({ "role": "system", "content": coding::system_prompt(&workspace.root_str(), policy, &mcp) }),
+                    json!({ "role": "system", "content": coding::system_prompt(&workspace.root_str(), policy, &mcp, &coding::discover_agents(&workspace)) }),
                 );
+                if let Some(project_context) = coding::load_project_context(&workspace) {
+                    messages.insert(1, json!({ "role": "system", "content": project_context }));
+                }
                 Some(coding::CodingContext { workspace, policy, mcp })
             }
             Err(e) => {
@@ -335,7 +341,7 @@ pub async fn process(state: &Arc<AppState>, pending: ChatPending) -> Result<()> 
     // platform snapshot; protocol v0 retains the legacy Brave/web-fetch path for
     // older control planes during the agent rollout. These schemas are built
     // independently of how they're delivered to the model (native vs prompt).
-    let platform_tools = if pending.tool_protocol_version >= 1 {
+    let mut platform_tools = if pending.tool_protocol_version >= 1 {
         tools::platform_tools(pending.platform_tools.as_ref())
     } else {
         Vec::new()
@@ -366,6 +372,43 @@ pub async fn process(state: &Arc<AppState>, pending: ChatPending) -> Result<()> 
             if !platform_tools.iter().any(|tool| Some(tool.name.as_str()) == name) {
                 tool_defs.push(def.clone());
             }
+        }
+    }
+
+    // Coding turns also get the local-only agent + memory tools (update_memory,
+    // run_agent). These aren't control-plane tool_catalog rows, so synthesize
+    // them as local platform tools — offered to the model and dispatched through
+    // the same local execution path as the other coding tools. `tool_defs_for`
+    // filters by policy (update_memory is withheld in read-only/plan) and builds
+    // run_agent's `agent` enum from the workspace's discovered agents.
+    if let Some(cx) = coding_ctx.as_ref() {
+        for def in coding::tool_defs_for(cx, false, false) {
+            let name = match def.pointer("/function/name").and_then(Value::as_str) {
+                Some(n @ ("update_memory" | "run_agent")) => n.to_string(),
+                _ => continue,
+            };
+            if platform_tools.iter().any(|t| t.name == name) {
+                continue;
+            }
+            let parameters = def
+                .pointer("/function/parameters")
+                .cloned()
+                .unwrap_or_else(|| json!({ "type": "object" }));
+            let description = def
+                .pointer("/function/description")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            platform_tools.push(tools::PlatformTool {
+                id: format!("coding:{name}"),
+                provider: "coding".into(),
+                name: name.clone(),
+                description,
+                parameters,
+                execution: "local".into(),
+                approval_required: name == "update_memory",
+            });
+            tool_defs.push(def);
         }
     }
 
@@ -552,7 +595,7 @@ pub async fn process(state: &Arc<AppState>, pending: ChatPending) -> Result<()> 
             // Local coding tools run on the rig itself (with the approval gate);
             // hosted tools relay to the cloud gateway as before.
             let (result_text, activity, summary) = if tool.execution == "local" {
-                run_local_tool(state, coding_ctx.as_ref(), &token, &pending.id, &tx, &cancel, tool, call).await
+                run_local_tool(state, coding_ctx.as_ref(), &model, &token, &pending.id, &tx, &cancel, tool, call).await
             } else {
                 let invocation_id = Uuid::new_v4().to_string();
                 run_platform_tool(state, &token, &pending.id, &invocation_id, tool, call).await
@@ -747,6 +790,7 @@ async fn run_platform_tool(
 async fn run_local_tool(
     state: &Arc<AppState>,
     coding_ctx: Option<&coding::CodingContext>,
+    model: &str,
     token: &str,
     message_id: &str,
     tx: &tokio::sync::mpsc::UnboundedSender<StreamDelta>,
@@ -767,6 +811,13 @@ async fn run_local_tool(
             "unavailable".into(),
         );
     };
+
+    // run_agent dispatches an isolated read-only sub-agent — no cloud invocation
+    // row and no approval (it cannot mutate). Its UI events ride the same realtime
+    // stream as the rest of the turn.
+    if call.name == "run_agent" {
+        return dispatch_subagent(state, cx, model, tx, cancel, call).await;
+    }
     let invocation_id = Uuid::new_v4().to_string();
     let args_hash = sha256_hex(&call.arguments);
     // MCP tools are not tool_catalog rows, so their invocation carries a null
@@ -828,6 +879,53 @@ async fn run_local_tool(
         .await
         .ok();
     (run.content, run.activity, run.summary)
+}
+
+/// Resolve and run a `run_agent` call as an isolated read-only sub-agent, on the
+/// cloud/relay path. Mirrors `local_coding::dispatch_subagent`, but routes the
+/// sub-agent's UI events onto the realtime stream via `tx`.
+async fn dispatch_subagent(
+    state: &Arc<AppState>,
+    cx: &coding::CodingContext,
+    model: &str,
+    tx: &tokio::sync::mpsc::UnboundedSender<StreamDelta>,
+    cancel: &Arc<AtomicBool>,
+    call: &ToolCall,
+) -> (String, Option<Value>, String) {
+    let agent_name = call.arguments.get("agent").and_then(Value::as_str).unwrap_or("");
+    let task = call.arguments.get("task").and_then(Value::as_str).unwrap_or("");
+    let agents = coding::discover_agents(&cx.workspace);
+    let Some(agent) = agents.iter().find(|a| a.name == agent_name) else {
+        let known = agents.iter().map(|a| a.name.as_str()).collect::<Vec<_>>().join(", ");
+        return (
+            format!("No sub-agent named '{agent_name}'. Available agents: {known}."),
+            Some(json!({
+                "name": "run_agent", "provider": "coding", "status": "failed",
+                "summary": format!("unknown agent '{agent_name}'"), "citations": [],
+            })),
+            "unknown agent".into(),
+        );
+    };
+    if task.trim().is_empty() {
+        return (
+            "run_agent requires a non-empty task.".into(),
+            Some(json!({
+                "name": "run_agent", "provider": "coding", "status": "failed",
+                "summary": "empty task", "citations": [],
+            })),
+            "empty task".into(),
+        );
+    }
+    let tx_emit = tx.clone();
+    let result = crate::subagent::run_agent(
+        state, &cx.workspace, model, agent, task, cancel.clone(),
+        move |ev| { let _ = tx_emit.send(StreamDelta::Event(ev)); },
+    ).await;
+    let activity = Some(json!({
+        "name": "run_agent", "provider": "coding", "status": "succeeded",
+        "summary": format!("{} explored", agent.name), "citations": [],
+    }));
+    (result, activity, format!("{} explored", agent.name))
 }
 
 /// Execute one MCP tool in a chat turn (no coding workspace) against the rig's

@@ -24,6 +24,7 @@ mod realtime;
 pub mod runtime;
 mod settings;
 mod status;
+mod subagent;
 mod supabase;
 mod updater;
 mod worker;

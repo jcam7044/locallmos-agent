@@ -596,6 +596,19 @@ function TraceItem({ trace }: { trace: CodingTrace }) {
       </details>
     );
   }
+  if (trace.kind === "subagent") {
+    return (
+      <details style={{ border: C.border, borderRadius: 8, padding: 8 }}>
+        <summary style={{ fontSize: 12, color: "#e2e8f0", cursor: "pointer" }}>
+          🔍 {trace.agent}: <span style={{ color: C.muted }}>{trace.task}</span>
+          {trace.summary === undefined ? " …" : ""}
+        </summary>
+        <div style={{ fontSize: 12, color: C.muted, marginTop: 6, whiteSpace: "pre-wrap" }}>
+          {trace.summary ?? "Exploring…"}
+        </div>
+      </details>
+    );
+  }
   return (
     <details style={{ border: C.border, borderRadius: 8, padding: 8 }}>
       <summary style={{ fontSize: 12, color: "#e2e8f0", cursor: "pointer" }}>

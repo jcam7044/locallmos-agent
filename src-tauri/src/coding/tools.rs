@@ -27,6 +27,7 @@ pub async fn run(cx: &CodingContext, host: Option<&CodingHost>, name: &str, args
         "list_dir" => list_dir(cx, args),
         "search" => search(cx, args),
         "write_file" | "edit_file" => write_change(cx, name, args),
+        "update_memory" => update_memory(cx, args),
         "run_command" => {
             let cmd = str_arg(args, "command")?;
             run_shell(cx, &cmd).await
@@ -302,6 +303,89 @@ fn write_change(cx: &CodingContext, name: &str, args: &Value) -> Result<ToolRun>
 }
 
 // ---------------------------------------------------------------------------
+// Memory
+// ---------------------------------------------------------------------------
+
+/// Cap on MEMORY.md size, mirroring the read-side budget in `context_files`.
+const MAX_MEMORY_CHARS: usize = 8_000;
+
+const MEMORY_TEMPLATE: &str = "# Project memory\n\nDurable notes maintained by the coding agent — one fact per bullet.\n\n## Memory\n";
+
+/// Append a durable note to MEMORY.md (creating it from a template if missing).
+/// When `replaces` is given, existing bullet lines containing that substring are
+/// dropped first, so the model can supersede an out-of-date memory. Emits a
+/// `file_edit` event like the other write tools so the UI shows the diff.
+fn update_memory(cx: &CodingContext, args: &Value) -> Result<ToolRun> {
+    let note = str_arg(args, "note")?;
+    let note = note.trim().replace(['\n', '\r'], " ");
+    if note.is_empty() {
+        return Err(anyhow!("note is empty"));
+    }
+    let replaces = args
+        .get("replaces")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let path = cx.workspace.resolve(super::context_files::MEMORY_FILE)?;
+    let rel = cx.workspace.display_relative(&path);
+    let old = std::fs::read_to_string(&path).unwrap_or_default();
+
+    let mut new = if old.trim().is_empty() {
+        MEMORY_TEMPLATE.to_string()
+    } else {
+        // Drop superseded bullets, but never non-bullet lines (headings/prose).
+        match replaces {
+            Some(r) => {
+                let kept: Vec<&str> = old
+                    .lines()
+                    .filter(|line| !(line.trim_start().starts_with('-') && line.contains(r)))
+                    .collect();
+                let mut s = kept.join("\n");
+                if !s.ends_with('\n') {
+                    s.push('\n');
+                }
+                s
+            }
+            None => {
+                let mut s = old.clone();
+                if !s.ends_with('\n') {
+                    s.push('\n');
+                }
+                s
+            }
+        }
+    };
+
+    if !new.contains("## Memory") {
+        new.push_str("\n## Memory\n");
+    }
+    if !new.ends_with('\n') {
+        new.push('\n');
+    }
+    new.push_str(&format!("- {note}\n"));
+
+    if new.chars().count() > MAX_MEMORY_CHARS {
+        return Err(anyhow!(
+            "MEMORY.md would exceed {MAX_MEMORY_CHARS} characters; consolidate or prune existing notes first (edit {rel} directly)"
+        ));
+    }
+
+    std::fs::write(&path, &new).map_err(|e| anyhow!("could not write {rel}: {e}"))?;
+    let (diff, added, removed) = line_diff(&old, &new);
+    let summary = format!("+{added} -{removed}");
+    Ok(ToolRun {
+        content: format!("Recorded to {rel}: {note}"),
+        summary: summary.clone(),
+        event: Some(json!({ "type": "file_edit", "path": rel, "diff": diff, "summary": summary })),
+        activity: Some(json!({
+            "name": "update_memory", "provider": "coding", "status": "succeeded",
+            "summary": format!("updated {rel}"), "citations": [],
+        })),
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Commands
 // ---------------------------------------------------------------------------
 
@@ -463,6 +547,56 @@ fn line_diff(old: &str, new: &str) -> (String, usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::coding::{ApprovalPolicy, McpAccess};
+
+    fn ctx_in(dir: &std::path::Path) -> CodingContext {
+        CodingContext {
+            workspace: crate::coding::Workspace::new(dir.to_str().unwrap()).unwrap(),
+            policy: ApprovalPolicy::Auto,
+            mcp: McpAccess::disabled(),
+        }
+    }
+
+    #[test]
+    fn update_memory_creates_appends_and_replaces() {
+        let dir = std::env::temp_dir().join(format!("locallmos-mem-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = std::fs::canonicalize(&dir).unwrap();
+        let cx = ctx_in(&dir);
+        let mem = dir.join("MEMORY.md");
+
+        // First note creates the file from the template.
+        update_memory(&cx, &json!({ "note": "Build with `just build`." })).unwrap();
+        let body = std::fs::read_to_string(&mem).unwrap();
+        assert!(body.contains("## Memory"));
+        assert!(body.contains("- Build with `just build`."));
+
+        // Second note appends.
+        update_memory(&cx, &json!({ "note": "Tests live in tests/." })).unwrap();
+        let body = std::fs::read_to_string(&mem).unwrap();
+        assert!(body.contains("- Build with `just build`."));
+        assert!(body.contains("- Tests live in tests/."));
+
+        // `replaces` supersedes a matching bullet (drops the old, adds the new).
+        update_memory(&cx, &json!({ "note": "Build with `make`.", "replaces": "just build" })).unwrap();
+        let body = std::fs::read_to_string(&mem).unwrap();
+        assert!(!body.contains("just build"));
+        assert!(body.contains("- Build with `make`."));
+        // A non-bullet heading is never dropped by `replaces`.
+        assert!(body.contains("## Memory"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn update_memory_rejects_empty_note() {
+        let dir = std::env::temp_dir().join(format!("locallmos-mem-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = std::fs::canonicalize(&dir).unwrap();
+        let cx = ctx_in(&dir);
+        assert!(update_memory(&cx, &json!({ "note": "   " })).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn git_readonly_classification() {

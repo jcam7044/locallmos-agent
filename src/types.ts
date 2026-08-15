@@ -439,6 +439,8 @@ export type CodingStreamEvent =
   | { type: "tool_result"; name: string; summary: string }
   | { type: "file_edit"; path: string; diff: string; summary: string; invocationId?: string }
   | { type: "command"; command: string; chunk: string; exitCode?: number | null; invocationId?: string }
+  | { type: "subagent_started"; agent: string; task: string }
+  | { type: "subagent_result"; agent: string; summary: string }
   | { type: "approval_needed"; invocationId: string; name: string; preview: string }
   | { type: "approval_resolved"; invocationId: string; decision: "approved" | "denied" }
   | { type: "context_updated"; context: CodingContextInfo }

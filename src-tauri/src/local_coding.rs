@@ -8,6 +8,7 @@ use crate::coding::{self, CodingContext};
 use crate::coding_store::{self, CodingSession, CodingStoredMessage};
 use crate::runtime::ollama::{ChatDelta, ToolCall};
 use crate::runtime::tool_protocol;
+use crate::subagent;
 use crate::AppState;
 use serde_json::{json, Value};
 use serde::Serialize;
@@ -349,8 +350,16 @@ async fn build_context(
     let mut messages = Vec::with_capacity(session.messages.len() + 2);
     messages.push(json!({
         "role": "system",
-        "content": coding::system_prompt(&cx.workspace.root_str(), cx.policy, &cx.mcp),
+        "content": coding::system_prompt(
+            &cx.workspace.root_str(),
+            cx.policy,
+            &cx.mcp,
+            &coding::discover_agents(&cx.workspace),
+        ),
     }));
+    if let Some(project_context) = coding::load_project_context(&cx.workspace) {
+        messages.push(json!({ "role": "system", "content": project_context }));
+    }
     let mut start = 0usize;
     if let (Some(checkpoint), Some(boundary)) = (
         session.context_state.checkpoint.as_deref(),
@@ -770,9 +779,23 @@ async fn run_turn(
             messages.push(json!({ "role": "assistant", "content": "", "tool_calls": assistant_calls }));
         }
 
+        // Sub-agent dispatches (run_agent) run concurrently — the model can fan
+        // out several explorations in one turn. Every other tool runs
+        // sequentially through the approval gate, exactly as before. Results are
+        // then reassembled in call order so each tool_call keeps its matching
+        // response (which native tool mode relies on).
+        let mut sub_futs = Vec::new();
+        for call in calls.iter().filter(|c| c.name == "run_agent") {
+            sub_futs.push(dispatch_subagent(app, state, cx, session_id, request_id, model, cancel.clone(), call));
+        }
+        let mut sub_results = futures_util::future::join_all(sub_futs).await.into_iter();
+
         for call in &calls {
-            let (result_text, activity) =
-                run_one(app, state, cx, session_id, request_id, &cancel, call).await;
+            let (result_text, activity) = if call.name == "run_agent" {
+                sub_results.next().expect("one result per run_agent call")
+            } else {
+                run_one(app, state, cx, session_id, request_id, &cancel, call).await
+            };
             if let Some(a) = activity {
                 out.tool_activity.push(a);
             }
@@ -794,6 +817,58 @@ fn append_round_text(target: &mut String, text: &str) {
         target.push_str("\n\n");
     }
     target.push_str(text);
+}
+
+/// Resolve a `run_agent` call to a discovered agent and run it as an isolated
+/// read-only sub-agent, returning its summary as the tool result plus a
+/// persisted activity row. A missing agent name degrades to an error result
+/// rather than aborting the turn.
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_subagent(
+    app: &tauri::AppHandle,
+    state: &Arc<AppState>,
+    cx: &CodingContext,
+    session_id: &str,
+    request_id: &str,
+    model: &str,
+    cancel: Arc<AtomicBool>,
+    call: &ToolCall,
+) -> (String, Option<Value>) {
+    let agent_name = call.arguments.get("agent").and_then(Value::as_str).unwrap_or("");
+    let task = call.arguments.get("task").and_then(Value::as_str).unwrap_or("");
+    let agents = coding::discover_agents(&cx.workspace);
+    let Some(agent) = agents.iter().find(|a| a.name == agent_name) else {
+        let known = agents.iter().map(|a| a.name.as_str()).collect::<Vec<_>>().join(", ");
+        emit(app, session_id, request_id, json!({
+            "type": "subagent_result", "agent": agent_name,
+            "summary": "unknown agent",
+        }));
+        return (
+            format!("No sub-agent named '{agent_name}'. Available agents: {known}."),
+            Some(json!({
+                "name": "run_agent", "provider": "coding", "status": "failed",
+                "summary": format!("unknown agent '{agent_name}'"), "citations": [],
+            })),
+        );
+    };
+    if task.trim().is_empty() {
+        return (
+            "run_agent requires a non-empty task.".into(),
+            Some(json!({
+                "name": "run_agent", "provider": "coding", "status": "failed",
+                "summary": "empty task", "citations": [],
+            })),
+        );
+    }
+    let result = subagent::run_agent(
+        state, &cx.workspace, model, agent, task, cancel,
+        |ev| emit(app, session_id, request_id, ev),
+    ).await;
+    let activity = Some(json!({
+        "name": "run_agent", "provider": "coding", "status": "succeeded",
+        "summary": format!("{} explored", agent.name), "citations": [],
+    }));
+    (result, activity)
 }
 
 /// Execute one coding tool call with the approval gate, streaming its events.

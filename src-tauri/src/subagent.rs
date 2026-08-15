@@ -12,8 +12,7 @@
 
 use crate::coding::{self, AgentDef, ApprovalPolicy, CodingContext, McpAccess, Workspace};
 use crate::runtime::ollama::ChatDelta;
-use crate::runtime::tool_protocol;
-use crate::AppState;
+use crate::runtime::{tool_protocol, ModelLoadSettings, Runtime};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -27,12 +26,16 @@ const MAX_RESULT_CHARS: usize = 8_000;
 /// message the orchestrator can react to rather than aborting the parent turn.
 ///
 /// `workspace` is the parent's (reused, still confined) and the sub-agent's
-/// policy is forced to read-only regardless of the parent's. `emit` receives the
+/// policy is forced to read-only regardless of the parent's. It borrows the
+/// session's `runtime` + `settings` directly (not the whole `AppState`), so the
+/// loop stays testable against a bare runtime. `emit` receives the
 /// `subagent_started` / `subagent_result` UI events; the caller wraps them for
 /// its transport (local Tauri event vs. cloud realtime), so this loop is shared
 /// by both engines.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_agent<E: Fn(Value)>(
-    state: &Arc<AppState>,
+    runtime: &Runtime,
+    settings: &ModelLoadSettings,
     workspace: &Workspace,
     model: &str,
     agent: &AgentDef,
@@ -42,7 +45,7 @@ pub async fn run_agent<E: Fn(Value)>(
 ) -> String {
     emit(json!({ "type": "subagent_started", "agent": agent.name, "task": task }));
 
-    let result = run_loop(state, workspace, model, agent, task, cancel).await;
+    let result = run_loop(runtime, settings, workspace, model, agent, task, cancel).await;
     let summary = match &result {
         Ok(text) if !text.trim().is_empty() => clamp(text.trim(), MAX_RESULT_CHARS),
         Ok(_) => "The sub-agent finished without producing a summary.".to_string(),
@@ -55,8 +58,10 @@ pub async fn run_agent<E: Fn(Value)>(
     format!("Result from the {} sub-agent:\n\n{summary}", agent.name)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_loop(
-    state: &Arc<AppState>,
+    runtime: &Runtime,
+    settings: &ModelLoadSettings,
     workspace: &Workspace,
     model: &str,
     agent: &AgentDef,
@@ -87,8 +92,7 @@ async fn run_loop(
         .map(str::to_string)
         .collect();
 
-    let (_, settings) = state.model_settings(model).await?;
-    let native_tools = state.runtime.template_supports_tools(model).await;
+    let native_tools = runtime.template_supports_tools(model).await;
     let prompt_tool_mode = !native_tools;
     let tools_value = native_tools.then(|| Value::Array(allowed.clone()));
     let options = settings.context_size.map(|size| json!({ "num_ctx": size }));
@@ -115,15 +119,14 @@ async fn run_loop(
         }
         let round_out = {
             let mut filter = tool_protocol::ToolCallStreamFilter::new();
-            state
-                .runtime
+            runtime
                 .chat_stream(
                     model,
                     Value::Array(messages.clone()),
                     false,
                     tools_value.as_ref(),
                     options.as_ref(),
-                    &settings,
+                    settings,
                     cancel.clone(),
                     move |delta| {
                         // Sub-agent tokens are consumed to drive the loop but not
@@ -200,4 +203,69 @@ fn clamp(s: &str, max: usize) -> String {
 fn summarize_line(s: &str) -> String {
     let line: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
     line.chars().take(160).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// End-to-end run of a custom `.agents/reviewer.md` sub-agent against a live
+    /// llama-server. Ignored by default (needs a running model); drive it with:
+    ///
+    ///   LOCALLMOS_LLAMACPP_MODELS_DIR=/home/jason/.locallmos/models \
+    ///   SUBAGENT_TEST_MODEL='huggingface/unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q5_K_M.gguf' \
+    ///   cargo test --lib subagent::tests::reviewer_reviews_a_buggy_file -- --ignored --nocapture
+    ///
+    /// It reuses an already-healthy server serving the same GGUF (ensure_running
+    /// checks /health first), so it will not fight the desktop app for the port.
+    #[tokio::test]
+    #[ignore = "requires a running llama-server + local model"]
+    async fn reviewer_reviews_a_buggy_file() {
+        let model = std::env::var("SUBAGENT_TEST_MODEL")
+            .expect("set SUBAGENT_TEST_MODEL to a local gguf model id");
+
+        // A scratch workspace with a custom reviewer agent and a file with an
+        // off-by-one bug the reviewer should notice.
+        let dir = std::env::temp_dir().join(format!("locallmos-reviewer-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join(".agents")).unwrap();
+        std::fs::write(
+            dir.join(".agents").join("reviewer.md"),
+            "---\nname: reviewer\ndescription: Reviews a file for bugs and reports findings.\ntools: read_file, list_dir, search\n---\n\
+You are a meticulous code reviewer. Read the file you are asked about, then report concrete bugs with the line and a one-line fix. If you find none, say so.",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("sum.py"),
+            "def sum_first_n(items, n):\n    total = 0\n    # BUG: range(n+1) reads one past the intended n elements\n    for i in range(n + 1):\n        total += items[i]\n    return total\n",
+        )
+        .unwrap();
+
+        let workspace = Workspace::new(dir.to_str().unwrap()).unwrap();
+        let agents = coding::discover_agents(&workspace);
+        let reviewer = agents.iter().find(|a| a.name == "reviewer").expect("reviewer discovered");
+        // The custom tools list was intersected down to read-only tools.
+        assert_eq!(reviewer.tools, vec!["read_file", "list_dir", "search"]);
+
+        let runtime = Runtime::from_kind(reqwest::Client::new(), "llamacpp");
+        let settings = ModelLoadSettings::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let result = run_agent(
+            &runtime,
+            &settings,
+            &workspace,
+            &model,
+            reviewer,
+            "Review sum.py for bugs and report what you find.",
+            cancel,
+            |ev| println!("EVENT: {ev}"),
+        )
+        .await;
+
+        println!("\n===== SUB-AGENT RESULT =====\n{result}\n============================\n");
+        assert!(result.contains("reviewer sub-agent"));
+        assert!(result.len() > 40, "expected a real summary, got: {result}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

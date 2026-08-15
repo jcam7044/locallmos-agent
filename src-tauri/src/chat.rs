@@ -917,8 +917,9 @@ async fn dispatch_subagent(
         );
     }
     let tx_emit = tx.clone();
+    let settings = state.model_settings(model).await.map(|(_, s)| s).unwrap_or_default();
     let result = crate::subagent::run_agent(
-        state, &cx.workspace, model, agent, task, cancel.clone(),
+        &state.runtime, &settings, &cx.workspace, model, agent, task, cancel.clone(),
         move |ev| { let _ = tx_emit.send(StreamDelta::Event(ev)); },
     ).await;
     let activity = Some(json!({

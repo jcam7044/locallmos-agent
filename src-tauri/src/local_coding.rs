@@ -860,8 +860,9 @@ async fn dispatch_subagent(
             })),
         );
     }
+    let settings = state.model_settings(model).await.map(|(_, s)| s).unwrap_or_default();
     let result = subagent::run_agent(
-        state, &cx.workspace, model, agent, task, cancel,
+        &state.runtime, &settings, &cx.workspace, model, agent, task, cancel,
         |ev| emit(app, session_id, request_id, ev),
     ).await;
     let activity = Some(json!({

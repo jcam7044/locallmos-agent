@@ -1159,6 +1159,24 @@ async fn coding_local_set_mcp_enabled(
     Ok(session)
 }
 
+/// Set the reasoning effort for a coding session. `None` disables reasoning.
+#[tauri::command]
+async fn coding_local_set_reasoning_effort(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+    effort: Option<crate::runtime::ReasoningEffort>,
+) -> Result<coding_store::CodingSession, String> {
+    let session = {
+        let _guard = state.chat_lock.lock().await;
+        let mut s = coding_store::load(&id).map_err(|e| e.to_string())?;
+        s.reasoning_effort = effort;
+        s.updated_at = chrono::Utc::now();
+        coding_store::save(&s).map_err(|e| e.to_string())?;
+        s
+    };
+    Ok(session)
+}
+
 /// Validate paths picked from the native dialog against the session's workspace,
 /// returning them workspace-relative. Anything outside the root is rejected —
 /// the agent's tools could not read it anyway, so silently accepting it would
@@ -1705,6 +1723,7 @@ fn run_gui() {
             coding_local_create_session,
             coding_local_set_policy,
             coding_local_set_mcp_enabled,
+            coding_local_set_reasoning_effort,
             coding_local_attach,
             coding_local_list_sessions,
             coding_local_get_session,

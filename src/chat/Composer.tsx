@@ -2,18 +2,19 @@ import { useRef, useState } from "react";
 import { buttonStyle, inputStyle, secondaryButton } from "../styles";
 import { AttachmentChip } from "./AttachmentChip";
 import { FILE_ACCEPT } from "./attachments";
-import type { Attachment } from "../types";
+import type { Attachment, ReasoningEffort } from "../types";
 import type { ChatContextInfo } from "../types";
 import { ContextRing, formatTokens } from "../components/ContextIndicator";
+import { EffortSelector } from "../components/EffortSelector";
 
 export function Composer({
   disabled,
   streaming,
   onSend,
   onStop,
-  think,
+  effort,
   canThink,
-  onToggleThink,
+  onChangeEffort,
   webTools,
   canWebTools,
   webToolsHint,
@@ -30,9 +31,9 @@ export function Composer({
   streaming: boolean;
   onSend: (text: string) => void;
   onStop?: () => void;
-  think: boolean;
+  effort: ReasoningEffort;
   canThink: boolean;
-  onToggleThink: () => void;
+  onChangeEffort: (effort: ReasoningEffort) => void;
   webTools: boolean;
   canWebTools: boolean;
   webToolsHint?: string;
@@ -66,14 +67,11 @@ export function Composer({
         </div>
       )}
       <div style={{ display: "flex", gap: 6, marginBottom: 6 }}>
-        <TogglePill
-          on={think && canThink}
+        <EffortSelector
+          value={canThink ? effort : "none"}
           disabled={!canThink}
-          title={canThink ? "Stream the model's reasoning" : "This model doesn't support thinking"}
-          onClick={onToggleThink}
-        >
-          💭 Think
-        </TogglePill>
+          onChange={onChangeEffort}
+        />
         {canWebTools && (
           <TogglePill
             on={webTools}

@@ -141,6 +141,7 @@ pub async fn send(
         info.reserve_tokens,
         session.context_state.auto_compact,
         session.context_state.auto_threshold,
+        session.reasoning_effort.unwrap_or_default(),
         cancel.clone(),
     ).await;
 
@@ -672,6 +673,7 @@ async fn run_turn(
     reserve_tokens: u32,
     auto_compact: bool,
     auto_threshold: u8,
+    effort: crate::runtime::ReasoningEffort,
     cancel: Arc<AtomicBool>,
 ) -> anyhow::Result<TurnOutput> {
     let (_, load_settings) = state.model_settings(model).await?;
@@ -682,7 +684,19 @@ async fn run_turn(
         tool_names,
         ..
     } = built;
-    let options = load_settings.context_size.map(|size| json!({ "num_ctx": size }));
+    // Reasoning is only requested when the model can honor it; the effort level
+    // then flows into the request body verbatim (ignored by non-reasoning models).
+    let think = effort.is_thinking() && state.runtime.model_supports_thinking(model).await;
+    let options = {
+        let mut map = serde_json::Map::new();
+        if let Some(size) = load_settings.context_size {
+            map.insert("num_ctx".into(), json!(size));
+        }
+        if think {
+            map.insert("reasoning_effort".into(), json!(effort.as_str()));
+        }
+        (!map.is_empty()).then(|| Value::Object(map))
+    };
 
     let mut out = TurnOutput {
         content: String::new(),
@@ -696,7 +710,7 @@ async fn run_turn(
         let mut count = state.runtime.count_input_tokens(
             model,
             &Value::Array(messages.clone()),
-            false,
+            think,
             tools_value.as_ref(),
             options.as_ref(),
             &load_settings,
@@ -708,7 +722,7 @@ async fn run_turn(
         {
             truncate_tool_results(&mut messages, max_tokens.saturating_sub(reserve_tokens));
             let retry = state.runtime.count_input_tokens(
-                model, &Value::Array(messages.clone()), false, tools_value.as_ref(),
+                model, &Value::Array(messages.clone()), think, tools_value.as_ref(),
                 options.as_ref(), &load_settings,
             ).await;
             if u64::from(retry.tokens) + u64::from(reserve_tokens) >= u64::from(max_tokens) {
@@ -726,7 +740,7 @@ async fn run_turn(
                 .chat_stream(
                     model,
                     Value::Array(messages.clone()),
-                    false,
+                    think,
                     tools_value.as_ref(),
                     options.as_ref(),
                     &load_settings,

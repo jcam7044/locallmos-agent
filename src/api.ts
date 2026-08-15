@@ -21,6 +21,7 @@ import type {
   McpOverview,
   McpServerConfig,
   McpTrust,
+  ReasoningEffort,
   ChatContextInfo,
   AgentUpdateInfo,
   LlamaCppUpdateInfo,
@@ -174,6 +175,9 @@ export const codingPreviewClose = (sessionId: string) =>
 
 export const codingSetMcpEnabled = (id: string, enabled: boolean) =>
   invoke<CodingSession>("coding_local_set_mcp_enabled", { id, enabled });
+
+export const codingSetReasoningEffort = (id: string, effort: ReasoningEffort | null) =>
+  invoke<CodingSession>("coding_local_set_reasoning_effort", { id, effort });
 
 // ---- MCP server management ----
 

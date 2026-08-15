@@ -40,6 +40,11 @@ pub struct CodingSession {
     /// Off by default so a session opts in explicitly.
     #[serde(default)]
     pub mcp_enabled: bool,
+    /// Reasoning intensity for the coding model. `None` (the default) keeps
+    /// reasoning off, matching prior behavior; graded levels are honored only by
+    /// reasoning-trained models. Applies to the main turn, not internal calls.
+    #[serde(default)]
+    pub reasoning_effort: Option<crate::runtime::ReasoningEffort>,
     #[serde(default)]
     pub messages: Vec<CodingStoredMessage>,
     /// Full transcript storage is independent from the active model context.
@@ -157,6 +162,7 @@ impl CodingSession {
             workspace_root,
             approval_policy,
             mcp_enabled: false,
+            reasoning_effort: None,
             messages: Vec::new(),
             context_state: CodingContextState::default(),
             remote_id: None,

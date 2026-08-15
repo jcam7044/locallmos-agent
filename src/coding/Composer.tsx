@@ -1,9 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { codingAttach } from "../api";
-import type { ApprovalPolicy, CodingContextInfo, ModelOption } from "../types";
+import type { ApprovalPolicy, CodingContextInfo, LocalModel, ReasoningEffort } from "../types";
 import { C } from "./tokens";
 import { ContextRing, formatTokens } from "../components/ContextIndicator";
+import { EffortSelector } from "../components/EffortSelector";
 
 export { ContextRing } from "../components/ContextIndicator";
 
@@ -40,6 +41,8 @@ export function Composer({
   onPolicyChange,
   mcpEnabled,
   onMcpToggle,
+  effort,
+  onEffortChange,
   sessionId,
   attachments,
   setAttachments,
@@ -49,7 +52,7 @@ export function Composer({
   onCompact,
   onContextSettings,
 }: {
-  models: ModelOption[];
+  models: LocalModel[];
   model: string;
   setModel: (m: string) => void;
   prompt: string;
@@ -62,6 +65,8 @@ export function Composer({
   onPolicyChange: (p: ApprovalPolicy) => void;
   mcpEnabled: boolean;
   onMcpToggle: (enabled: boolean) => void;
+  effort: ReasoningEffort;
+  onEffortChange: (effort: ReasoningEffort) => void;
   sessionId: string;
   attachments: string[];
   setAttachments: (a: string[]) => void;
@@ -115,6 +120,9 @@ export function Composer({
   }
 
   const canSend = !busy && !streaming && !!prompt.trim();
+  const canThink =
+    models.find((m) => m.name === model || m.id === model)?.capabilities.includes("thinking") ??
+    false;
 
   return (
     <div ref={boxRef} style={{ position: "relative", marginTop: 10 }}>
@@ -178,6 +186,12 @@ export function Composer({
           >
             MCP {mcpEnabled ? "on" : "off"}
           </button>
+
+          <EffortSelector
+            value={canThink ? effort : "none"}
+            disabled={!canThink}
+            onChange={onEffortChange}
+          />
 
           <div style={{ flex: 1 }} />
 

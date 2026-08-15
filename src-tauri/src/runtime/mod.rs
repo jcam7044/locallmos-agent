@@ -71,6 +71,44 @@ impl ModelLoadSettings {
     }
 }
 
+/// Reasoning intensity for a chat turn. Values serialize to the exact strings
+/// llama-server accepts for the OpenAI `reasoning_effort` request field, so the
+/// stored value *is* the request value — no mapping table. `None` disables
+/// reasoning; the graded levels are only honored by reasoning-trained models
+/// (GPT-OSS, StepFun, …) and are silently ignored by others.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningEffort {
+    #[default]
+    None,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
+}
+
+impl ReasoningEffort {
+    /// Whether reasoning should be turned on at all (drives `enable_thinking`).
+    pub fn is_thinking(self) -> bool {
+        self != ReasoningEffort::None
+    }
+
+    /// The string llama-server expects for the `reasoning_effort` field.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReasoningEffort::None => "none",
+            ReasoningEffort::Minimal => "minimal",
+            ReasoningEffort::Low => "low",
+            ReasoningEffort::Medium => "medium",
+            ReasoningEffort::High => "high",
+            ReasoningEffort::Xhigh => "xhigh",
+            ReasoningEffort::Max => "max",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum KvCacheType {

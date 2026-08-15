@@ -4,7 +4,7 @@
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use crate::runtime::GenerationMetrics;
+use crate::runtime::{GenerationMetrics, ReasoningEffort};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::PathBuf;
@@ -29,14 +29,34 @@ pub struct SessionSettings {
     pub system_prompt: Option<String>,
     pub temperature: Option<f32>,
     pub num_ctx: Option<u32>,
+    /// Superseded by `reasoning_effort`; retained so older session files (which
+    /// only carry this binary flag) still deserialize. Read via [`Self::effort`].
     #[serde(default)]
     pub think: bool,
+    /// Graded reasoning intensity. `None` in a stored file means the session
+    /// predates this control — [`Self::effort`] then falls back to `think`.
+    #[serde(default)]
+    pub reasoning_effort: Option<ReasoningEffort>,
     #[serde(default)]
     pub web_tools: bool,
     /// Offer read-only tools from trusted MCP servers. Chat has no approval gate,
     /// so mutating MCP tools are never exposed here — use the coding harness.
     #[serde(default)]
     pub mcp: bool,
+}
+
+impl SessionSettings {
+    /// The effective reasoning effort for this session, migrating older sessions
+    /// that only stored the binary `think` flag (`true → Medium`, `false → None`).
+    pub fn effort(&self) -> ReasoningEffort {
+        self.reasoning_effort.unwrap_or({
+            if self.think {
+                ReasoningEffort::Medium
+            } else {
+                ReasoningEffort::None
+            }
+        })
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -313,5 +333,21 @@ mod tests {
     fn rejects_bad_ids() {
         assert!(session_path("../evil").is_err());
         assert!(session_path("").is_err());
+    }
+
+    #[test]
+    fn effort_migrates_legacy_think_flag() {
+        // A session file predating `reasoning_effort` only carries `think`.
+        let legacy_on: SessionSettings =
+            serde_json::from_str(r#"{ "think": true }"#).unwrap();
+        assert_eq!(legacy_on.effort(), ReasoningEffort::Medium);
+        let legacy_off: SessionSettings =
+            serde_json::from_str(r#"{ "think": false }"#).unwrap();
+        assert_eq!(legacy_off.effort(), ReasoningEffort::None);
+
+        // An explicit effort always wins, even against a stale `think`.
+        let explicit: SessionSettings =
+            serde_json::from_str(r#"{ "think": true, "reasoningEffort": "high" }"#).unwrap();
+        assert_eq!(explicit.effort(), ReasoningEffort::High);
     }
 }

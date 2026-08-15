@@ -17,9 +17,10 @@ import {
   codingSend,
   codingSetPolicy,
   codingSetMcpEnabled,
+  codingSetReasoningEffort,
   codingSetContextSettings,
 } from "../api";
-import type { ApprovalPolicy, CodingContextInfo, CodingEvent, CodingPreviewStatus, CodingSessionMeta, CodingStoredMessage, ModelOption } from "../types";
+import type { ApprovalPolicy, CodingContextInfo, CodingEvent, CodingPreviewStatus, CodingSessionMeta, CodingStoredMessage, LocalModel, ReasoningEffort } from "../types";
 import { Markdown } from "../chat/Markdown";
 import { AgentsPanel } from "./AgentsPanel";
 import { Composer, MODES } from "./Composer";
@@ -30,7 +31,7 @@ import { useCodingStream, type CodingLive, type CodingTrace } from "./useCodingS
 const uuid = () =>
   (crypto.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`);
 
-export function CodingView({ models }: { models: ModelOption[] }) {
+export function CodingView({ models }: { models: LocalModel[] }) {
   const [sessions, setSessions] = useState<CodingSessionMeta[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [messages, setMessages] = useState<CodingStoredMessage[]>([]);
@@ -41,6 +42,7 @@ export function CodingView({ models }: { models: ModelOption[] }) {
   // Mode + attachments belong to the active session, so both reload with it.
   const [policy, setPolicy] = useState<ApprovalPolicy>("approve_writes");
   const [mcpEnabled, setMcpEnabled] = useState(false);
+  const [effort, setEffort] = useState<ReasoningEffort>("none");
   const [attachments, setAttachments] = useState<string[]>([]);
   const [preview, setPreview] = useState<CodingPreviewStatus | null>(null);
   const [contextInfo, setContextInfo] = useState<CodingContextInfo | null>(null);
@@ -78,6 +80,7 @@ export function CodingView({ models }: { models: ModelOption[] }) {
       setMessages(Array.isArray(session?.messages) ? session.messages : []);
       if (session?.approvalPolicy) setPolicy(session.approvalPolicy);
       setMcpEnabled(session?.mcpEnabled ?? false);
+      setEffort(session?.reasoningEffort ?? "none");
     } catch (e) {
       setError(String(e));
     }
@@ -133,6 +136,19 @@ export function CodingView({ models }: { models: ModelOption[] }) {
       await codingSetMcpEnabled(activeId, next);
     } catch (e) {
       setMcpEnabled(previous);
+      setError(String(e));
+    }
+  }
+
+  async function changeEffort(next: ReasoningEffort) {
+    if (!activeId) return;
+    const previous = effort;
+    setEffort(next); // optimistic
+    try {
+      // Persist "none" as null so a disabled session stores no effort.
+      await codingSetReasoningEffort(activeId, next === "none" ? null : next);
+    } catch (e) {
+      setEffort(previous);
       setError(String(e));
     }
   }
@@ -376,6 +392,8 @@ export function CodingView({ models }: { models: ModelOption[] }) {
               onPolicyChange={(p) => void changePolicy(p)}
               mcpEnabled={mcpEnabled}
               onMcpToggle={(v) => void toggleMcp(v)}
+              effort={effort}
+              onEffortChange={(e) => void changeEffort(e)}
               sessionId={activeId}
               attachments={attachments}
               setAttachments={setAttachments}
@@ -436,7 +454,7 @@ function NewSession({
   onStart,
   onError,
 }: {
-  models: ModelOption[];
+  models: LocalModel[];
   model: string;
   setModel: (m: string) => void;
   prompt: string;

@@ -188,11 +188,37 @@ export type ModelLoadSettings = {
 
 // --- Persistent chat sessions (mirror src-tauri/src/chat_store.rs) ---------
 
+/**
+ * Reasoning intensity, matching llama-server's `reasoning_effort` values.
+ * `"none"` disables reasoning; graded levels are only honored by reasoning-
+ * trained models (mirror src-tauri/src/runtime/mod.rs `ReasoningEffort`).
+ */
+export type ReasoningEffort =
+  | "none"
+  | "minimal"
+  | "low"
+  | "medium"
+  | "high"
+  | "xhigh"
+  | "max";
+
+/** Ordered levels for the effort selector, low → high. */
+export const REASONING_EFFORTS: ReasoningEffort[] = [
+  "none",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+];
+
 export type SessionSettings = {
   systemPrompt: string | null;
   temperature: number | null;
   numCtx: number | null;
   think: boolean;
+  reasoningEffort: ReasoningEffort | null;
   webTools: boolean;
   mcp: boolean;
 };
@@ -296,6 +322,7 @@ export type CodingSession = {
   workspaceRoot: string;
   approvalPolicy: ApprovalPolicy;
   mcpEnabled: boolean;
+  reasoningEffort: ReasoningEffort | null;
   messages: CodingStoredMessage[];
   contextState: CodingContextState;
 };

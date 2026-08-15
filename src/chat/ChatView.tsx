@@ -338,9 +338,13 @@ export function ChatView({
           streaming={streaming}
           onSend={(t) => void send(t)}
           onStop={stop}
-          think={active?.settings.think ?? false}
+          effort={
+            active?.settings.reasoningEffort ?? (active?.settings.think ? "medium" : "none")
+          }
           canThink={canThink}
-          onToggleThink={() => patchSettings({ think: !(active?.settings.think ?? false) })}
+          onChangeEffort={(e) =>
+            patchSettings({ reasoningEffort: e, think: e !== "none" })
+          }
           webTools={active?.settings.webTools ?? false}
           canWebTools={canWebTools}
           webToolsHint={

@@ -9,9 +9,9 @@ describe("chat context indicator", () => {
         disabled={false}
         streaming={false}
         onSend={() => undefined}
-        think={false}
+        effort="none"
         canThink={false}
-        onToggleThink={() => undefined}
+        onChangeEffort={() => undefined}
         webTools={false}
         canWebTools
         onToggleWebTools={() => undefined}

@@ -121,7 +121,20 @@ describe("coding context indicator", () => {
   it("shows usage, estimate accuracy, and warning color", () => {
     const html = renderToStaticMarkup(
       <Composer
-        models={[{ name: "coder", loaded: true }]}
+        models={[
+          {
+            id: "coder",
+            name: "coder",
+            loaded: true,
+            sizeBytes: null,
+            quantization: null,
+            capabilities: [],
+            sourceRepo: null,
+            revision: null,
+            variantId: null,
+            files: [],
+          },
+        ]}
         model="coder"
         setModel={() => undefined}
         prompt=""
@@ -134,6 +147,8 @@ describe("coding context indicator", () => {
         onPolicyChange={() => undefined}
         mcpEnabled
         onMcpToggle={() => undefined}
+        effort="none"
+        onEffortChange={() => undefined}
         sessionId="session-1"
         attachments={[]}
         setAttachments={() => undefined}

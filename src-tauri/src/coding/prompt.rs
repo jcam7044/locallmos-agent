@@ -2,13 +2,20 @@
 //! (and, in prompt-injection tool mode, folded into the turn alongside the tool
 //! manifest). Kept model-agnostic and concise so small local models follow it.
 
-use super::{McpAccess, ApprovalPolicy};
+use super::{AgentDef, McpAccess, ApprovalPolicy};
 
 /// Build the coding system prompt for a session rooted at `workspace_root`,
 /// including the mode-specific rules for `policy`. `mcp` contributes a short
-/// section naming any connected MCP servers and the untrusted-results rule.
-pub fn system_prompt(workspace_root: &str, policy: ApprovalPolicy, mcp: &McpAccess) -> String {
+/// section naming any connected MCP servers and the untrusted-results rule;
+/// `agents` contributes a section naming the sub-agents `run_agent` can dispatch.
+pub fn system_prompt(
+    workspace_root: &str,
+    policy: ApprovalPolicy,
+    mcp: &McpAccess,
+    agents: &[AgentDef],
+) -> String {
     let base = base_prompt(workspace_root);
+    let agents_section = agents_prompt_section(agents);
     let mcp_section = mcp_prompt_section(mcp);
     let mode = match policy {
         ApprovalPolicy::ReadOnly => {
@@ -32,7 +39,25 @@ user's approval before they run. If one is denied, adapt — do not retry the sa
 targeted edits, and verify with the project's build or tests after changing code."
         }
     };
-    format!("{base}{mcp_section}{mode}")
+    format!("{base}{agents_section}{mcp_section}{mode}")
+}
+
+/// A short section naming the sub-agents `run_agent` can dispatch this session.
+/// Always non-empty — the built-in `explore` agent is always present.
+fn agents_prompt_section(agents: &[AgentDef]) -> String {
+    if agents.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from(
+        "\n\nSub-agents you can dispatch with run_agent(agent, task). Each runs read-only in \
+its own isolated context and returns a compact summary — prefer them for broad, multi-file \
+exploration so your own context stays focused. Issue several run_agent calls in one turn to \
+explore different areas in parallel:",
+    );
+    for agent in agents {
+        out.push_str(&format!("\n- {}: {}", agent.name, agent.description));
+    }
+    out
 }
 
 /// A concise section naming the connected MCP servers (not their full schemas —
@@ -80,6 +105,20 @@ You have these tools, which operate ONLY inside the workspace:
 - edit_file(path, old_string, new_string[, replace_all]) — replace an exact snippet.
 - run_command(command) — run a shell command (cwd is the workspace root).
 - git(args) — run a git subcommand.
+- update_memory(note[, replaces]) — record a durable fact in MEMORY.md.
+- run_agent(agent, task) — delegate a task to a sub-agent (see below).
+- create_agent(name, description, prompt[, tools]) — save a reusable sub-agent \
+to .agents/. When the user asks to create/save an agent, call this and write a \
+focused system prompt for it; it becomes available to run_agent on the next turn.
+
+Project context and memory:
+- If the workspace has an AGENTS.md (or CLAUDE.md) and/or MEMORY.md, their \
+contents are provided as a system message above. Follow AGENTS.md as project \
+instructions, and treat MEMORY.md as durable notes from earlier work.
+- Use update_memory to record durable, reusable facts (build/test commands, \
+architectural decisions, hard-won constraints) — not transient chatter. Pass \
+`replaces` with a snippet of an existing memory line to supersede it. Memory \
+writes pause for approval like any other edit.
 
 Working rules:
 1. All paths are relative to the workspace root. You cannot read or write outside it.
@@ -118,7 +157,7 @@ mod tests {
 
     #[test]
     fn coding_prompt_teaches_preview_verification_without_claiming_screenshots() {
-        let prompt = system_prompt("/workspace", ApprovalPolicy::ApproveWrites, &McpAccess::disabled());
+        let prompt = system_prompt("/workspace", ApprovalPolicy::ApproveWrites, &McpAccess::disabled(), &[]);
         assert!(prompt.contains("web_preview_snapshot"));
         assert!(prompt.contains("web_preview_console"));
         assert!(prompt.contains("not screenshots"));
@@ -126,8 +165,16 @@ mod tests {
 
     #[test]
     fn no_mcp_section_when_no_servers_connected() {
-        let prompt = system_prompt("/workspace", ApprovalPolicy::Auto, &McpAccess::disabled());
+        let prompt = system_prompt("/workspace", ApprovalPolicy::Auto, &McpAccess::disabled(), &[]);
         assert!(!prompt.contains("Connected MCP servers"));
+    }
+
+    #[test]
+    fn agents_section_names_dispatchable_agents() {
+        let agents = super::super::discover_agents(&super::super::Workspace::new(".").unwrap());
+        let prompt = system_prompt("/workspace", ApprovalPolicy::Auto, &McpAccess::disabled(), &agents);
+        assert!(prompt.contains("run_agent(agent, task)"));
+        assert!(prompt.contains("- explore:"));
     }
 
     #[test]
@@ -148,7 +195,7 @@ mod tests {
             truncated: 0,
         });
         let access = McpAccess { snapshot, manager: None };
-        let prompt = system_prompt("/workspace", ApprovalPolicy::Auto, &access);
+        let prompt = system_prompt("/workspace", ApprovalPolicy::Auto, &access, &[]);
         assert!(prompt.contains("Connected MCP servers"));
         assert!(prompt.contains("- db (2 tool(s))"));
         assert!(prompt.contains("- gh (1 tool(s))"));

@@ -66,6 +66,45 @@ describe("coding turn rendering", () => {
     expect(html.indexOf("I inspected the app")).toBeLessThan(html.indexOf("Approval needed"));
   });
 
+  it("renders a sub-agent trace row with its task and returned summary", () => {
+    const html = renderToStaticMarkup(
+      <LiveTurn
+        live={{
+          messageId: "message-1",
+          text: "",
+          thinking: "",
+          status: "streaming",
+          trace: [
+            { kind: "subagent", agent: "explore", task: "find the auth flow", summary: "auth lives in src/auth.ts" },
+          ],
+          approvals: [],
+        }}
+        onDecide={() => undefined}
+      />,
+    );
+    expect(html).toContain("explore");
+    expect(html).toContain("find the auth flow");
+    expect(html).toContain("auth lives in src/auth.ts");
+  });
+
+  it("shows a running indicator for an in-flight sub-agent", () => {
+    const html = renderToStaticMarkup(
+      <LiveTurn
+        live={{
+          messageId: "message-1",
+          text: "",
+          thinking: "",
+          status: "streaming",
+          trace: [{ kind: "subagent", agent: "explore", task: "map the auth flow" }],
+          approvals: [],
+        }}
+        onDecide={() => undefined}
+      />,
+    );
+    expect(html).toContain("running…");
+    expect(html).toContain("map the auth flow");
+  });
+
   it("hides legacy empty assistant records while preserving user messages", () => {
     const base = { thinking: null, toolActivity: null, cancelled: false, createdAt: "2026-01-01T00:00:00Z" };
     const visible = visibleCodingMessages([
@@ -82,7 +121,20 @@ describe("coding context indicator", () => {
   it("shows usage, estimate accuracy, and warning color", () => {
     const html = renderToStaticMarkup(
       <Composer
-        models={[{ name: "coder", loaded: true }]}
+        models={[
+          {
+            id: "coder",
+            name: "coder",
+            loaded: true,
+            sizeBytes: null,
+            quantization: null,
+            capabilities: [],
+            sourceRepo: null,
+            revision: null,
+            variantId: null,
+            files: [],
+          },
+        ]}
         model="coder"
         setModel={() => undefined}
         prompt=""
@@ -95,6 +147,8 @@ describe("coding context indicator", () => {
         onPolicyChange={() => undefined}
         mcpEnabled
         onMcpToggle={() => undefined}
+        effort="none"
+        onEffortChange={() => undefined}
         sessionId="session-1"
         attachments={[]}
         setAttachments={() => undefined}

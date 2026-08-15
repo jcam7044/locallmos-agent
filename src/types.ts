@@ -143,6 +143,13 @@ export type DownloadState = {
   error: string | null;
 };
 
+export type AgentUpdateInfo = {
+  currentVersion: string;
+  latestVersion: string;
+  os: string;
+  installCommand: string;
+};
+
 export type LlamaCppUpdateInfo = {
   currentTag: string | null;
   latestTag: string;
@@ -181,11 +188,37 @@ export type ModelLoadSettings = {
 
 // --- Persistent chat sessions (mirror src-tauri/src/chat_store.rs) ---------
 
+/**
+ * Reasoning intensity, matching llama-server's `reasoning_effort` values.
+ * `"none"` disables reasoning; graded levels are only honored by reasoning-
+ * trained models (mirror src-tauri/src/runtime/mod.rs `ReasoningEffort`).
+ */
+export type ReasoningEffort =
+  | "none"
+  | "minimal"
+  | "low"
+  | "medium"
+  | "high"
+  | "xhigh"
+  | "max";
+
+/** Ordered levels for the effort selector, low → high. */
+export const REASONING_EFFORTS: ReasoningEffort[] = [
+  "none",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+];
+
 export type SessionSettings = {
   systemPrompt: string | null;
   temperature: number | null;
   numCtx: number | null;
   think: boolean;
+  reasoningEffort: ReasoningEffort | null;
   webTools: boolean;
   mcp: boolean;
 };
@@ -289,8 +322,21 @@ export type CodingSession = {
   workspaceRoot: string;
   approvalPolicy: ApprovalPolicy;
   mcpEnabled: boolean;
+  reasoningEffort: ReasoningEffort | null;
   messages: CodingStoredMessage[];
   contextState: CodingContextState;
+};
+
+export type AgentScope = "builtin" | "project" | "global";
+
+/** A sub-agent shown in the Code tab's Agents panel (mirror lib.rs AgentView). */
+export type AgentView = {
+  name: string;
+  description: string;
+  tools: string[];
+  prompt: string;
+  scope: AgentScope;
+  editable: boolean;
 };
 
 // ---- MCP servers (mirrors src-tauri/src/mcp + the mcp_* Tauri commands) ----
@@ -432,6 +478,8 @@ export type CodingStreamEvent =
   | { type: "tool_result"; name: string; summary: string }
   | { type: "file_edit"; path: string; diff: string; summary: string; invocationId?: string }
   | { type: "command"; command: string; chunk: string; exitCode?: number | null; invocationId?: string }
+  | { type: "subagent_started"; agent: string; task: string }
+  | { type: "subagent_result"; agent: string; summary: string }
   | { type: "approval_needed"; invocationId: string; name: string; preview: string }
   | { type: "approval_resolved"; invocationId: string; decision: "approved" | "denied" }
   | { type: "context_updated"; context: CodingContextInfo }

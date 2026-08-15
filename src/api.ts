@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   AgentStatus,
+  AgentView,
   ApprovalPolicy,
   Attachment,
   ChatSession,
@@ -20,7 +21,9 @@ import type {
   McpOverview,
   McpServerConfig,
   McpTrust,
+  ReasoningEffort,
   ChatContextInfo,
+  AgentUpdateInfo,
   LlamaCppUpdateInfo,
   SystemMetricsSnapshot,
 } from "./types";
@@ -58,7 +61,7 @@ export const hubStartDownload = (repoId: string, revision: string, variantId: st
   invoke<DownloadState>("hub_start_download", { repoId, revision, variantId });
 export const hubListDownloads = () => invoke<DownloadState[]>("hub_list_downloads");
 export const hubCancelDownload = (id: string) => invoke<DownloadState>("hub_cancel_download", { id });
-export const localUpdate = () => invoke<string | null>("local_update");
+export const agentCheckUpdate = () => invoke<AgentUpdateInfo | null>("agent_check_update");
 export const llamaCppCheckUpdate = () =>
   invoke<LlamaCppUpdateInfo | null>("llamacpp_check_update");
 export const llamaCppInstallUpdate = (tag: string) =>
@@ -140,6 +143,24 @@ export const codingApprove = (invocationId: string, approved: boolean) =>
 export const codingCancel = (requestId: string) =>
   invoke("coding_local_cancel", { requestId });
 
+export const codingListAgents = (workspaceRoot: string) =>
+  invoke<AgentView[]>("coding_list_agents", { workspaceRoot });
+
+export const codingSaveAgent = (
+  workspaceRoot: string,
+  scope: "project" | "global",
+  name: string,
+  description: string,
+  prompt: string,
+  tools: string[],
+) => invoke("coding_save_agent", { workspaceRoot, scope, name, description, prompt, tools });
+
+export const codingDeleteAgent = (
+  workspaceRoot: string,
+  scope: "project" | "global",
+  name: string,
+) => invoke("coding_delete_agent", { workspaceRoot, scope, name });
+
 export const codingPreviewStatus = (sessionId: string) =>
   invoke<CodingPreviewStatus>("coding_preview_status", { sessionId });
 
@@ -154,6 +175,9 @@ export const codingPreviewClose = (sessionId: string) =>
 
 export const codingSetMcpEnabled = (id: string, enabled: boolean) =>
   invoke<CodingSession>("coding_local_set_mcp_enabled", { id, enabled });
+
+export const codingSetReasoningEffort = (id: string, effort: ReasoningEffort | null) =>
+  invoke<CodingSession>("coding_local_set_reasoning_effort", { id, effort });
 
 // ---- MCP server management ----
 

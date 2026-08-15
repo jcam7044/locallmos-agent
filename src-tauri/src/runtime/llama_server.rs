@@ -610,12 +610,14 @@ fn chat_request_body(
     body
 }
 
-/// Qwen3 and later Qwen3-family templates accept `enable_thinking` and emit
-/// their reasoning separately. The model ID is stable across GGUF filenames,
-/// directory names, and the display names surfaced by the UI, so it is a
-/// reliable capability hint when llama-server does not expose model metadata.
+/// Reasoning-capable families we can detect from the model ID alone. Qwen3
+/// templates accept `enable_thinking`; GPT-OSS was trained on graded
+/// `reasoning_effort`. The model ID is stable across GGUF filenames, directory
+/// names, and the display names surfaced by the UI, so it is a reliable
+/// capability hint when llama-server does not expose model metadata.
 fn model_supports_thinking(model: &str) -> bool {
-    model.to_ascii_lowercase().contains("qwen3")
+    let id = model.to_ascii_lowercase();
+    id.contains("qwen3") || id.contains("gpt-oss") || id.contains("gpt_oss")
 }
 
 impl RuntimeAdapter for LlamaServerAdapter {

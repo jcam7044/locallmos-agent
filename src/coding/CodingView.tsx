@@ -17,10 +17,12 @@ import {
   codingSend,
   codingSetPolicy,
   codingSetMcpEnabled,
+  codingSetReasoningEffort,
   codingSetContextSettings,
 } from "../api";
-import type { ApprovalPolicy, CodingContextInfo, CodingEvent, CodingPreviewStatus, CodingSessionMeta, CodingStoredMessage, ModelOption } from "../types";
+import type { ApprovalPolicy, CodingContextInfo, CodingEvent, CodingPreviewStatus, CodingSessionMeta, CodingStoredMessage, LocalModel, ReasoningEffort } from "../types";
 import { Markdown } from "../chat/Markdown";
+import { AgentsPanel } from "./AgentsPanel";
 import { Composer, MODES } from "./Composer";
 import { C } from "./tokens";
 import { useCodingStream, type CodingLive, type CodingTrace } from "./useCodingStream";
@@ -29,7 +31,7 @@ import { useCodingStream, type CodingLive, type CodingTrace } from "./useCodingS
 const uuid = () =>
   (crypto.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`);
 
-export function CodingView({ models }: { models: ModelOption[] }) {
+export function CodingView({ models }: { models: LocalModel[] }) {
   const [sessions, setSessions] = useState<CodingSessionMeta[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [messages, setMessages] = useState<CodingStoredMessage[]>([]);
@@ -40,10 +42,12 @@ export function CodingView({ models }: { models: ModelOption[] }) {
   // Mode + attachments belong to the active session, so both reload with it.
   const [policy, setPolicy] = useState<ApprovalPolicy>("approve_writes");
   const [mcpEnabled, setMcpEnabled] = useState(false);
+  const [effort, setEffort] = useState<ReasoningEffort>("none");
   const [attachments, setAttachments] = useState<string[]>([]);
   const [preview, setPreview] = useState<CodingPreviewStatus | null>(null);
   const [contextInfo, setContextInfo] = useState<CodingContextInfo | null>(null);
   const [compacting, setCompacting] = useState(false);
+  const [agentsOpen, setAgentsOpen] = useState(false);
   const requestIdRef = useRef<string | null>(null);
   const { live, reset } = useCodingStream(activeId);
 
@@ -76,6 +80,7 @@ export function CodingView({ models }: { models: ModelOption[] }) {
       setMessages(Array.isArray(session?.messages) ? session.messages : []);
       if (session?.approvalPolicy) setPolicy(session.approvalPolicy);
       setMcpEnabled(session?.mcpEnabled ?? false);
+      setEffort(session?.reasoningEffort ?? "none");
     } catch (e) {
       setError(String(e));
     }
@@ -131,6 +136,19 @@ export function CodingView({ models }: { models: ModelOption[] }) {
       await codingSetMcpEnabled(activeId, next);
     } catch (e) {
       setMcpEnabled(previous);
+      setError(String(e));
+    }
+  }
+
+  async function changeEffort(next: ReasoningEffort) {
+    if (!activeId) return;
+    const previous = effort;
+    setEffort(next); // optimistic
+    try {
+      // Persist "none" as null so a disabled session stores no effort.
+      await codingSetReasoningEffort(activeId, next === "none" ? null : next);
+    } catch (e) {
+      setEffort(previous);
       setError(String(e));
     }
   }
@@ -337,7 +355,11 @@ export function CodingView({ models }: { models: ModelOption[] }) {
           />
         ) : (
           <>
-            <SessionHeader meta={sessions.find((s) => s.id === activeId)} onDelete={() => onDelete(activeId)} />
+            <SessionHeader
+              meta={sessions.find((s) => s.id === activeId)}
+              onOpenAgents={() => setAgentsOpen(true)}
+              onDelete={() => onDelete(activeId)}
+            />
             {preview && (preview.windowOpen || preview.serverState !== "stopped") && (
               <PreviewStrip
                 status={preview}
@@ -370,6 +392,8 @@ export function CodingView({ models }: { models: ModelOption[] }) {
               onPolicyChange={(p) => void changePolicy(p)}
               mcpEnabled={mcpEnabled}
               onMcpToggle={(v) => void toggleMcp(v)}
+              effort={effort}
+              onEffortChange={(e) => void changeEffort(e)}
               sessionId={activeId}
               attachments={attachments}
               setAttachments={setAttachments}
@@ -382,6 +406,13 @@ export function CodingView({ models }: { models: ModelOption[] }) {
           </>
         )}
       </main>
+      {agentsOpen && activeId !== null && (
+        <AgentsPanel
+          workspaceRoot={sessions.find((s) => s.id === activeId)?.workspaceRoot ?? ""}
+          onClose={() => setAgentsOpen(false)}
+          onError={setError}
+        />
+      )}
     </div>
   );
 }
@@ -423,7 +454,7 @@ function NewSession({
   onStart,
   onError,
 }: {
-  models: ModelOption[];
+  models: LocalModel[];
   model: string;
   setModel: (m: string) => void;
   prompt: string;
@@ -516,7 +547,15 @@ function NewSession({
   );
 }
 
-function SessionHeader({ meta, onDelete }: { meta?: CodingSessionMeta; onDelete: () => void }) {
+function SessionHeader({
+  meta,
+  onOpenAgents,
+  onDelete,
+}: {
+  meta?: CodingSessionMeta;
+  onOpenAgents: () => void;
+  onDelete: () => void;
+}) {
   return (
     <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", borderBottom: C.border, paddingBottom: 8, marginBottom: 8 }}>
       <div style={{ minWidth: 0 }}>
@@ -529,9 +568,12 @@ function SessionHeader({ meta, onDelete }: { meta?: CodingSessionMeta; onDelete:
           {meta?.workspaceRoot}
         </div>
       </div>
-      <button onClick={onDelete} style={{ ...btn(false), color: "#f87171" }}>
-        Delete
-      </button>
+      <div style={{ display: "flex", gap: 8, flexShrink: 0 }}>
+        <button onClick={onOpenAgents} style={btn(false)}>Agents</button>
+        <button onClick={onDelete} style={{ ...btn(false), color: "#f87171" }}>
+          Delete
+        </button>
+      </div>
     </div>
   );
 }
@@ -596,6 +638,25 @@ function TraceItem({ trace }: { trace: CodingTrace }) {
       </details>
     );
   }
+  if (trace.kind === "subagent") {
+    const running = trace.summary === undefined;
+    return (
+      <details style={{ border: C.border, borderRadius: 8, padding: 8 }}>
+        <summary style={{ fontSize: 12, color: "#e2e8f0", cursor: "pointer" }}>
+          <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+            {running ? <span style={spinner} /> : <span>🔍</span>}
+            <span>
+              {trace.agent}: <span style={{ color: C.muted }}>{trace.task}</span>
+            </span>
+            {running && <span style={{ color: C.accent }}>running…</span>}
+          </span>
+        </summary>
+        <div style={{ fontSize: 12, color: C.muted, marginTop: 6, whiteSpace: "pre-wrap" }}>
+          {trace.summary ?? "Working…"}
+        </div>
+      </details>
+    );
+  }
   return (
     <details style={{ border: C.border, borderRadius: 8, padding: 8 }}>
       <summary style={{ fontSize: 12, color: "#e2e8f0", cursor: "pointer" }}>
@@ -633,6 +694,15 @@ function folderName(path: string): string {
 }
 
 // --- styles ---------------------------------------------------------------
+const spinner: React.CSSProperties = {
+  display: "inline-block",
+  width: 10,
+  height: 10,
+  border: "2px solid rgba(56,189,248,0.25)",
+  borderTopColor: C.accent,
+  borderRadius: "50%",
+  animation: "coding-spin 0.8s linear infinite",
+};
 const input: React.CSSProperties = {
   background: "rgba(15,23,42,0.6)",
   border: C.border,

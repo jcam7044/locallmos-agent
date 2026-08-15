@@ -2,7 +2,6 @@ import { useState } from "react";
 import {
   enroll as enrollRig,
   loadModel,
-  localUpdate,
   openResourcesWindow,
   openModelsDir,
   restartRuntime,
@@ -18,11 +17,13 @@ export function Dashboard({
   local,
   running,
   onChanged,
+  onCheckAgentUpdate,
   onCheckLlamaCppUpdate,
 }: {
   local: LocalStatus | null;
   running: boolean;
   onChanged: () => void;
+  onCheckAgentUpdate: () => Promise<string>;
   onCheckLlamaCppUpdate: () => Promise<string>;
 }) {
   const [busy, setBusy] = useState<string | null>(null);
@@ -89,8 +90,7 @@ export function Dashboard({
     setBusy("__update");
     setUpdateMsg(null);
     try {
-      const v = await localUpdate();
-      setUpdateMsg(v ? `Updating to ${v}… the agent will restart.` : "You're on the latest version.");
+      setUpdateMsg(await onCheckAgentUpdate());
     } catch (e) {
       setUpdateMsg(`Update check failed: ${String(e)}`);
     } finally {

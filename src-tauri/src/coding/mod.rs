@@ -5,11 +5,17 @@
 //! relays them to the hosted tool gateway. `chat.rs` routes local platform-tool
 //! calls here, gating mutating ones through the cross-device approval flow.
 
+mod agents;
+mod context_files;
 mod prompt;
 pub mod preview;
 mod tools;
 mod workspace;
 
+pub use agents::{
+    delete_agent, discover_agents, list_agents, save_agent, AgentDef, AgentScope,
+};
+pub use context_files::load_project_context;
 pub use prompt::system_prompt;
 pub use workspace::Workspace;
 
@@ -98,8 +104,10 @@ impl ApprovalPolicy {
 /// subcommand. Pure — MCP tools are classified by [`is_mutating`].
 fn builtin_is_mutating(name: &str, args: &Value) -> bool {
     match name {
-        "write_file" | "edit_file" | "run_command" | "dev_server_start" => true,
+        "write_file" | "edit_file" | "run_command" | "dev_server_start" | "update_memory"
+        | "create_agent" => true,
         "git" => !tools::git_is_readonly(args.get("args").and_then(Value::as_str).unwrap_or("")),
+        // run_agent only dispatches read-only sub-agents, so it never mutates.
         _ => false,
     }
 }
@@ -156,6 +164,7 @@ pub fn is_known_tool(name: &str) -> bool {
         || matches!(
             name,
             "read_file" | "list_dir" | "search" | "write_file" | "edit_file" | "run_command" | "git"
+                | "update_memory" | "run_agent" | "create_agent"
                 | "dev_server_start" | "dev_server_logs" | "dev_server_stop"
                 | "web_preview_open" | "web_preview_snapshot" | "web_preview_click"
                 | "web_preview_fill" | "web_preview_press" | "web_preview_reload"
@@ -181,9 +190,12 @@ pub fn tool_defs_for(cx: &CodingContext, include_preview: bool, include_mcp: boo
     if !allows {
         all.retain(|d| {
             let name = d.pointer("/function/name").and_then(Value::as_str).unwrap_or("");
-            !matches!(name, "write_file" | "edit_file" | "run_command" | "dev_server_start")
+            !matches!(name, "write_file" | "edit_file" | "run_command" | "dev_server_start" | "update_memory" | "create_agent")
         });
     }
+    // run_agent dispatches read-only sub-agents, so it is offered in every mode.
+    // Its `agent` enum is built from the session's discovered agents.
+    all.push(run_agent_def(&discover_agents(&cx.workspace)));
     if include_mcp {
         for tool in &cx.mcp.snapshot.tools {
             // Withhold mutating MCP tools under inspection-only modes, mirroring
@@ -270,7 +282,49 @@ pub fn tool_defs() -> Vec<Value> {
             "Run a git subcommand in the workspace. Read-only subcommands run without approval.",
             serde_json::json!({"type":"object","properties":{"args":s("string")},"required":["args"]}),
         ),
+        def(
+            "update_memory",
+            "Record a durable fact in the workspace MEMORY.md (build/test commands, decisions, constraints). Pass `replaces` with a snippet of an existing memory line to supersede it. Requires approval.",
+            serde_json::json!({"type":"object","properties":{"note":s("string"),"replaces":s("string")},"required":["note"]}),
+        ),
+        def(
+            "create_agent",
+            "Save a reusable read-only sub-agent so it can be dispatched with run_agent later. Write `prompt` as the agent's own system prompt (its role and how to report). `tools` is an optional subset of read_file/list_dir/search/git. Set `global` to true to make it available in every project on this machine; otherwise it is saved to this project's .agents/. Use this when the user asks to create or save an agent. Requires approval.",
+            serde_json::json!({"type":"object","properties":{"name":s("string"),"description":s("string"),"prompt":s("string"),"tools":{"type":"array","items":s("string")},"global":s("boolean")},"required":["name","description","prompt"]}),
+        ),
     ]
+}
+
+/// The `run_agent` dispatch tool, with its `agent` parameter constrained to the
+/// agents actually available for this session (built-in `explore` + any custom
+/// agent files). Built dynamically so the model only ever names a real agent.
+fn run_agent_def(agents: &[AgentDef]) -> Value {
+    let names: Vec<&str> = agents.iter().map(|a| a.name.as_str()).collect();
+    let roster = agents
+        .iter()
+        .map(|a| format!("- {}: {}", a.name, a.description))
+        .collect::<Vec<_>>()
+        .join("\n");
+    serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": "run_agent",
+            "description": format!(
+                "Delegate a task to a read-only sub-agent that runs in its own isolated context \
+and returns a compact summary — use it for broad, multi-file exploration so your own context \
+stays clean. You may issue several run_agent calls in one turn to explore in parallel. \
+Available agents:\n{roster}"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "agent": { "type": "string", "enum": names },
+                    "task": { "type": "string", "description": "A self-contained instruction for the sub-agent." }
+                },
+                "required": ["agent", "task"]
+            }
+        }
+    })
 }
 
 /// If this call must be approved before it runs, return the human-readable
@@ -290,6 +344,14 @@ pub fn approval_preview(cx: &CodingContext, name: &str, args: &Value) -> Option<
         "run_command" => {
             Some(format!("$ {}", args.get("command").and_then(Value::as_str).unwrap_or("")))
         }
+        "update_memory" => {
+            let note = args.get("note").and_then(Value::as_str).unwrap_or("");
+            Some(match args.get("replaces").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+                Some(r) => format!("MEMORY.md: replace “{r}” → remember: {note}"),
+                None => format!("MEMORY.md: remember: {note}"),
+            })
+        }
+        "create_agent" => Some(tools::agent_preview(args)),
         "dev_server_start" => Some(format!(
             "$ {}\nPreview URL: {}",
             args.get("command").and_then(Value::as_str).unwrap_or(""),
@@ -435,14 +497,19 @@ mod tests {
             for withheld in ["write_file", "edit_file", "run_command", "dev_server_start"] {
                 assert!(!offered.contains(&withheld.to_string()), "{p:?} offered {withheld}");
             }
+            // update_memory / create_agent mutate, so inspection modes withhold them.
+            assert!(!offered.contains(&"update_memory".to_string()), "{p:?} offered update_memory");
+            assert!(!offered.contains(&"create_agent".to_string()), "{p:?} offered create_agent");
             // Reads and git stay available — git's mutating subcommands are
-            // refused per call rather than by withholding the whole tool.
-            for kept in ["read_file", "list_dir", "search", "git"] {
+            // refused per call rather than by withholding the whole tool. run_agent
+            // dispatches read-only sub-agents, so it is offered in every mode.
+            for kept in ["read_file", "list_dir", "search", "git", "run_agent"] {
                 assert!(offered.contains(&kept.to_string()), "{p:?} withheld {kept}");
             }
         }
+        // Auto offers every built-in tool plus the always-on run_agent.
         let cx = ctx(ApprovalPolicy::Auto, vec![]);
-        assert_eq!(names(&tool_defs_for(&cx, false, false)).len(), tool_defs().len());
+        assert_eq!(names(&tool_defs_for(&cx, false, false)).len(), tool_defs().len() + 1);
     }
 
     #[test]

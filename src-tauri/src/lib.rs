@@ -24,6 +24,7 @@ mod realtime;
 pub mod runtime;
 mod settings;
 mod status;
+mod subagent;
 mod supabase;
 mod updater;
 mod worker;
@@ -1158,6 +1159,24 @@ async fn coding_local_set_mcp_enabled(
     Ok(session)
 }
 
+/// Set the reasoning effort for a coding session. `None` disables reasoning.
+#[tauri::command]
+async fn coding_local_set_reasoning_effort(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+    effort: Option<crate::runtime::ReasoningEffort>,
+) -> Result<coding_store::CodingSession, String> {
+    let session = {
+        let _guard = state.chat_lock.lock().await;
+        let mut s = coding_store::load(&id).map_err(|e| e.to_string())?;
+        s.reasoning_effort = effort;
+        s.updated_at = chrono::Utc::now();
+        coding_store::save(&s).map_err(|e| e.to_string())?;
+        s
+    };
+    Ok(session)
+}
+
 /// Validate paths picked from the native dialog against the session's workspace,
 /// returning them workspace-relative. Anything outside the root is rejected —
 /// the agent's tools could not read it anyway, so silently accepting it would
@@ -1247,6 +1266,71 @@ async fn coding_local_delete_session(state: State<'_, Arc<AppState>>, id: String
     Ok(())
 }
 
+/// A sub-agent as shown in the Code tab's Agents panel.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentView {
+    name: String,
+    description: String,
+    tools: Vec<String>,
+    prompt: String,
+    /// "builtin" | "project" | "global".
+    scope: String,
+    editable: bool,
+}
+
+/// List the sub-agents available to a session's workspace: built-in `explore`
+/// plus project (`.agents/`) and global (`<config>/agents/`) files.
+#[tauri::command]
+async fn coding_list_agents(workspace_root: String) -> Result<Vec<AgentView>, String> {
+    let ws = coding::Workspace::new(&workspace_root).map_err(|e| e.to_string())?;
+    Ok(coding::list_agents(&ws)
+        .into_iter()
+        .map(|a| AgentView {
+            name: a.def.name,
+            description: a.def.description,
+            tools: a.def.tools,
+            prompt: a.def.system_prompt,
+            scope: a.scope,
+            editable: a.editable,
+        })
+        .collect())
+}
+
+/// Create or overwrite a custom agent file (project or global). `tools` is
+/// normalized to the read-only set; the built-in `explore` name is rejected.
+#[tauri::command]
+async fn coding_save_agent(
+    workspace_root: String,
+    scope: String,
+    name: String,
+    description: String,
+    prompt: String,
+    tools: Vec<String>,
+) -> Result<(), String> {
+    coding::save_agent(
+        coding::AgentScope::parse(&scope),
+        std::path::Path::new(&workspace_root),
+        &name,
+        &description,
+        &prompt,
+        &tools,
+    )
+    .map(|_| ())
+    .map_err(|e| e.to_string())
+}
+
+/// Delete a custom agent file (project or global).
+#[tauri::command]
+async fn coding_delete_agent(workspace_root: String, scope: String, name: String) -> Result<(), String> {
+    coding::delete_agent(
+        coding::AgentScope::parse(&scope),
+        std::path::Path::new(&workspace_root),
+        &name,
+    )
+    .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 async fn coding_preview_status(
     app: tauri::AppHandle,
@@ -1318,11 +1402,14 @@ async fn coding_local_cancel(state: State<'_, Arc<AppState>>, request_id: String
     Ok(())
 }
 
-/// Check GitHub Releases directly (no account) and self-update if a newer version
-/// exists. Returns the new version when it updated, `None` when already current.
+/// Check GitHub Releases directly (no account, no download) for a newer agent
+/// version. Returns the version delta plus the OS-appropriate install command so
+/// the desktop app can show a copy-command update toast; `None` when current.
+/// The GUI can't overwrite its own privileged binary, so it points the user at
+/// the installer command rather than self-updating in place.
 #[tauri::command]
-async fn local_update() -> Result<Option<String>, String> {
-    crate::updater::self_update_from_github()
+async fn agent_check_update() -> Result<Option<updater::AgentUpdateInfo>, String> {
+    crate::updater::check_for_update()
         .await
         .map_err(|e| e.to_string())
 }
@@ -1615,7 +1702,7 @@ fn run_gui() {
             local_chat_send,
             local_chat_cancel,
             chat_context,
-            local_update,
+            agent_check_update,
             llamacpp_check_update,
             llamacpp_install_update,
             chat_list_sessions,
@@ -1636,6 +1723,7 @@ fn run_gui() {
             coding_local_create_session,
             coding_local_set_policy,
             coding_local_set_mcp_enabled,
+            coding_local_set_reasoning_effort,
             coding_local_attach,
             coding_local_list_sessions,
             coding_local_get_session,
@@ -1646,6 +1734,9 @@ fn run_gui() {
             coding_local_send,
             coding_local_approve,
             coding_local_cancel,
+            coding_list_agents,
+            coding_save_agent,
+            coding_delete_agent,
             coding_preview_status,
             coding_preview_focus,
             coding_preview_reload,

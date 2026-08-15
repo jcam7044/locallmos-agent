@@ -82,10 +82,13 @@ pub async fn send(
 
     let messages = request_messages(&session);
 
-    // Generation options from session settings.
-    let options = request_options(&session);
+    // Reasoning is only requested when the model can honor it; when it can't we
+    // also drop `reasoning_effort` from the options so we send no stray params.
+    let effort = session.settings.effort();
+    let think = effort.is_thinking() && state.runtime.model_supports_thinking(&model).await;
 
-    let think = session.settings.think && state.runtime.model_supports_thinking(&model).await;
+    // Generation options from session settings.
+    let options = request_options(&session, think.then_some(effort));
 
     // Tools are only offered when the model supports native tool calling.
     let native_tools = state.runtime.model_supports_tools(&model).await;
@@ -178,13 +181,21 @@ fn request_messages(session: &chat_store::ChatSession) -> Vec<Value> {
     messages
 }
 
-fn request_options(session: &chat_store::ChatSession) -> Option<Value> {
+fn request_options(
+    session: &chat_store::ChatSession,
+    effort: Option<crate::runtime::ReasoningEffort>,
+) -> Option<Value> {
     let mut opts = serde_json::Map::new();
     if let Some(t) = session.settings.temperature {
         opts.insert("temperature".into(), json!(t));
     }
     if let Some(n) = session.settings.num_ctx {
         opts.insert("num_ctx".into(), json!(n));
+    }
+    // Flows through `chat_request_body` verbatim into the request body; graded
+    // levels are honored by reasoning-trained models and ignored by others.
+    if let Some(effort) = effort {
+        opts.insert("reasoning_effort".into(), json!(effort.as_str()));
     }
     (!opts.is_empty()).then(|| Value::Object(opts))
 }
@@ -260,9 +271,10 @@ pub async fn context_info(
         return Err("no model selected".into());
     }
     let messages = request_messages(&session);
-    let options = request_options(&session);
+    let effort = session.settings.effort();
+    let think = effort.is_thinking() && state.runtime.model_supports_thinking(&session.model).await;
+    let options = request_options(&session, think.then_some(effort));
     let native_tools = state.runtime.model_supports_tools(&session.model).await;
-    let think = session.settings.think && state.runtime.model_supports_thinking(&session.model).await;
     let definitions = tool_definitions(state, &session, native_tools, false).await;
     let (_, settings) = state.model_settings(&session.model).await.map_err(|error| error.to_string())?;
     let max_tokens = session
@@ -621,5 +633,27 @@ async fn run_builtin(state: &Arc<AppState>, call: &ToolCall) -> (String, Option<
             }
         }
         other => (format!("unknown tool: {other}"), None, "unknown".into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::ReasoningEffort;
+
+    #[test]
+    fn request_options_carries_reasoning_effort_when_thinking() {
+        let session = chat_store::ChatSession::new("gpt-oss-20b".into());
+        // A graded effort surfaces as the string llama-server expects.
+        let opts = request_options(&session, Some(ReasoningEffort::High)).unwrap();
+        assert_eq!(opts["reasoning_effort"], json!("high"));
+    }
+
+    #[test]
+    fn request_options_omits_reasoning_effort_when_not_thinking() {
+        let session = chat_store::ChatSession::new("qwen2".into());
+        // No effort (model can't reason / level is Off) → no stray param, and no
+        // other options set means the map collapses to None.
+        assert!(request_options(&session, None).is_none());
     }
 }

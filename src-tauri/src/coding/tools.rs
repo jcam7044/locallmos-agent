@@ -27,6 +27,8 @@ pub async fn run(cx: &CodingContext, host: Option<&CodingHost>, name: &str, args
         "list_dir" => list_dir(cx, args),
         "search" => search(cx, args),
         "write_file" | "edit_file" => write_change(cx, name, args),
+        "update_memory" => update_memory(cx, args),
+        "create_agent" => create_agent(cx, args),
         "run_command" => {
             let cmd = str_arg(args, "command")?;
             run_shell(cx, &cmd).await
@@ -302,6 +304,181 @@ fn write_change(cx: &CodingContext, name: &str, args: &Value) -> Result<ToolRun>
 }
 
 // ---------------------------------------------------------------------------
+// Memory
+// ---------------------------------------------------------------------------
+
+/// Cap on MEMORY.md size, mirroring the read-side budget in `context_files`.
+const MAX_MEMORY_CHARS: usize = 8_000;
+
+const MEMORY_TEMPLATE: &str = "# Project memory\n\nDurable notes maintained by the coding agent — one fact per bullet.\n\n## Memory\n";
+
+/// Append a durable note to MEMORY.md (creating it from a template if missing).
+/// When `replaces` is given, existing bullet lines containing that substring are
+/// dropped first, so the model can supersede an out-of-date memory. Emits a
+/// `file_edit` event like the other write tools so the UI shows the diff.
+fn update_memory(cx: &CodingContext, args: &Value) -> Result<ToolRun> {
+    let note = str_arg(args, "note")?;
+    let note = note.trim().replace(['\n', '\r'], " ");
+    if note.is_empty() {
+        return Err(anyhow!("note is empty"));
+    }
+    let replaces = args
+        .get("replaces")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let path = cx.workspace.resolve(super::context_files::MEMORY_FILE)?;
+    let rel = cx.workspace.display_relative(&path);
+    let old = std::fs::read_to_string(&path).unwrap_or_default();
+
+    let mut new = if old.trim().is_empty() {
+        MEMORY_TEMPLATE.to_string()
+    } else {
+        // Drop superseded bullets, but never non-bullet lines (headings/prose).
+        match replaces {
+            Some(r) => {
+                let kept: Vec<&str> = old
+                    .lines()
+                    .filter(|line| !(line.trim_start().starts_with('-') && line.contains(r)))
+                    .collect();
+                let mut s = kept.join("\n");
+                if !s.ends_with('\n') {
+                    s.push('\n');
+                }
+                s
+            }
+            None => {
+                let mut s = old.clone();
+                if !s.ends_with('\n') {
+                    s.push('\n');
+                }
+                s
+            }
+        }
+    };
+
+    if !new.contains("## Memory") {
+        new.push_str("\n## Memory\n");
+    }
+    if !new.ends_with('\n') {
+        new.push('\n');
+    }
+    new.push_str(&format!("- {note}\n"));
+
+    if new.chars().count() > MAX_MEMORY_CHARS {
+        return Err(anyhow!(
+            "MEMORY.md would exceed {MAX_MEMORY_CHARS} characters; consolidate or prune existing notes first (edit {rel} directly)"
+        ));
+    }
+
+    std::fs::write(&path, &new).map_err(|e| anyhow!("could not write {rel}: {e}"))?;
+    let (diff, added, removed) = line_diff(&old, &new);
+    let summary = format!("+{added} -{removed}");
+    Ok(ToolRun {
+        content: format!("Recorded to {rel}: {note}"),
+        summary: summary.clone(),
+        event: Some(json!({ "type": "file_edit", "path": rel, "diff": diff, "summary": summary })),
+        activity: Some(json!({
+            "name": "update_memory", "provider": "coding", "status": "succeeded",
+            "summary": format!("updated {rel}"), "citations": [],
+        })),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Agents
+// ---------------------------------------------------------------------------
+
+use super::agents::AgentScope;
+
+/// The scope a `create_agent` call targets: `global: true` writes a machine-wide
+/// agent under the config dir; otherwise the project's `.agents/`.
+fn agent_scope(args: &Value) -> AgentScope {
+    if args.get("global").and_then(Value::as_bool).unwrap_or(false) {
+        AgentScope::Global
+    } else {
+        AgentScope::Project
+    }
+}
+
+/// Extract a requested tool list from args (JSON array or comma/space string);
+/// intersection with the read-only set happens in `agents::normalize_tools`.
+fn raw_agent_tools(args: &Value) -> Vec<String> {
+    match args.get("tools") {
+        Some(Value::Array(items)) => items.iter().filter_map(|v| v.as_str().map(str::to_string)).collect(),
+        Some(Value::String(s)) => s.split([',', ' ', '\t']).map(|t| t.trim().to_string()).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Human label for where an agent file was written (workspace-relative for a
+/// project agent; a clear marker for a global one).
+fn agent_display_path(cx: &CodingContext, scope: AgentScope, path: &std::path::Path, name: &str) -> String {
+    match scope {
+        AgentScope::Project => cx.workspace.display_relative(path),
+        AgentScope::Global => format!("(global) agents/{name}.md"),
+    }
+}
+
+/// Create (or overwrite) a reusable sub-agent under the project `.agents/` (or
+/// the global config dir when `global` is set). The model authors `prompt` (the
+/// agent's system prompt) from the user's request; the agent is discoverable on
+/// the next turn. Mutating, so it flows through the approval gate; emits a
+/// `file_edit` event.
+fn create_agent(cx: &CodingContext, args: &Value) -> Result<ToolRun> {
+    let scope = agent_scope(args);
+    let name = super::agents::validate_name(&str_arg(args, "name")?)?;
+    let description = str_arg(args, "description")?;
+    let prompt = str_arg(args, "prompt")?;
+    let tools = super::agents::normalize_tools(&raw_agent_tools(args));
+
+    // Compute the pre-write content for the diff, then persist via the shared
+    // writer (which owns dir creation + confinement-appropriate path handling).
+    let path = scope.dir(cx.workspace.root())?.join(format!("{name}.md"));
+    let old = std::fs::read_to_string(&path).unwrap_or_default();
+    let verb = if old.is_empty() { "Created" } else { "Updated" };
+    super::agents::save_agent(scope, cx.workspace.root(), &name, &description, &prompt, &tools)?;
+    let content = super::agents::render_agent_file(&name, &description, &prompt, &tools);
+
+    let rel = agent_display_path(cx, scope, &path, &name);
+    let (diff, added, removed) = line_diff(&old, &content);
+    let summary = format!("+{added} -{removed}");
+    Ok(ToolRun {
+        content: format!(
+            "{verb} {} sub-agent '{name}' at {rel} (tools: {}). It is now available to run_agent.",
+            scope.as_str(),
+            tools.join(", ")
+        ),
+        summary: summary.clone(),
+        event: Some(json!({ "type": "file_edit", "path": rel, "diff": diff, "summary": summary })),
+        activity: Some(json!({
+            "name": "create_agent", "provider": "coding", "status": "succeeded",
+            "summary": format!("{} agent {name}", verb.to_lowercase()), "citations": [],
+        })),
+    })
+}
+
+/// The approval preview for `create_agent`: the scope and the exact file text.
+pub fn agent_preview(args: &Value) -> String {
+    let name = args.get("name").and_then(Value::as_str).unwrap_or("");
+    let name = match super::agents::validate_name(name) {
+        Ok(n) => n,
+        Err(e) => return format!("create_agent: {e}"),
+    };
+    let scope = agent_scope(args);
+    let description = args.get("description").and_then(Value::as_str).unwrap_or("");
+    let prompt = args.get("prompt").and_then(Value::as_str).unwrap_or("");
+    let tools = super::agents::normalize_tools(&raw_agent_tools(args));
+    let body = super::agents::render_agent_file(&name, description, prompt, &tools);
+    let loc = match scope {
+        AgentScope::Project => format!(".agents/{name}.md"),
+        AgentScope::Global => format!("(global) agents/{name}.md"),
+    };
+    format!("{loc}\n{}", truncate(&body, MAX_DIFF_CHARS))
+}
+
+// ---------------------------------------------------------------------------
 // Commands
 // ---------------------------------------------------------------------------
 
@@ -463,6 +640,104 @@ fn line_diff(old: &str, new: &str) -> (String, usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::coding::{ApprovalPolicy, McpAccess};
+
+    fn ctx_in(dir: &std::path::Path) -> CodingContext {
+        CodingContext {
+            workspace: crate::coding::Workspace::new(dir.to_str().unwrap()).unwrap(),
+            policy: ApprovalPolicy::Auto,
+            mcp: McpAccess::disabled(),
+        }
+    }
+
+    #[test]
+    fn update_memory_creates_appends_and_replaces() {
+        let dir = std::env::temp_dir().join(format!("locallmos-mem-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = std::fs::canonicalize(&dir).unwrap();
+        let cx = ctx_in(&dir);
+        let mem = dir.join("MEMORY.md");
+
+        // First note creates the file from the template.
+        update_memory(&cx, &json!({ "note": "Build with `just build`." })).unwrap();
+        let body = std::fs::read_to_string(&mem).unwrap();
+        assert!(body.contains("## Memory"));
+        assert!(body.contains("- Build with `just build`."));
+
+        // Second note appends.
+        update_memory(&cx, &json!({ "note": "Tests live in tests/." })).unwrap();
+        let body = std::fs::read_to_string(&mem).unwrap();
+        assert!(body.contains("- Build with `just build`."));
+        assert!(body.contains("- Tests live in tests/."));
+
+        // `replaces` supersedes a matching bullet (drops the old, adds the new).
+        update_memory(&cx, &json!({ "note": "Build with `make`.", "replaces": "just build" })).unwrap();
+        let body = std::fs::read_to_string(&mem).unwrap();
+        assert!(!body.contains("just build"));
+        assert!(body.contains("- Build with `make`."));
+        // A non-bullet heading is never dropped by `replaces`.
+        assert!(body.contains("## Memory"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn create_agent_writes_a_discoverable_readonly_agent() {
+        let dir = std::env::temp_dir().join(format!("locallmos-mkagent-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = std::fs::canonicalize(&dir).unwrap();
+        let cx = ctx_in(&dir);
+
+        // write_file is dropped (not read-only); read_file + search survive.
+        create_agent(&cx, &json!({
+            "name": "sec-reviewer",
+            "description": "Reviews code for security issues.",
+            "prompt": "You are a security reviewer. Report concrete vulnerabilities.",
+            "tools": ["read_file", "search", "write_file"],
+        })).unwrap();
+
+        let file = dir.join(".agents").join("sec-reviewer.md");
+        let body = std::fs::read_to_string(&file).unwrap();
+        assert!(body.contains("name: sec-reviewer"));
+        assert!(body.contains("tools: read_file, search"));
+        assert!(!body.contains("write_file"));
+        assert!(body.contains("You are a security reviewer."));
+
+        // The freshly-written file is picked up by discovery, with tools intersected.
+        let agents = crate::coding::discover_agents(&cx.workspace);
+        let found = agents.iter().find(|a| a.name == "sec-reviewer").expect("discovered");
+        assert_eq!(found.tools, vec!["read_file", "search"]);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn create_agent_rejects_reserved_and_unsafe_names() {
+        let dir = std::env::temp_dir().join(format!("locallmos-mkagent-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = std::fs::canonicalize(&dir).unwrap();
+        let cx = ctx_in(&dir);
+        let base = json!({ "description": "d", "prompt": "p" });
+        let with_name = |n: &str| {
+            let mut v = base.clone();
+            v["name"] = json!(n);
+            v
+        };
+        assert!(create_agent(&cx, &with_name("explore")).is_err(), "reserved");
+        assert!(create_agent(&cx, &with_name("../evil")).is_err(), "path chars");
+        assert!(create_agent(&cx, &with_name("has space")).is_err(), "space");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn update_memory_rejects_empty_note() {
+        let dir = std::env::temp_dir().join(format!("locallmos-mem-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = std::fs::canonicalize(&dir).unwrap();
+        let cx = ctx_in(&dir);
+        assert!(update_memory(&cx, &json!({ "note": "   " })).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn git_readonly_classification() {

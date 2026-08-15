@@ -621,14 +621,20 @@ function TraceItem({ trace }: { trace: CodingTrace }) {
     );
   }
   if (trace.kind === "subagent") {
+    const running = trace.summary === undefined;
     return (
       <details style={{ border: C.border, borderRadius: 8, padding: 8 }}>
         <summary style={{ fontSize: 12, color: "#e2e8f0", cursor: "pointer" }}>
-          🔍 {trace.agent}: <span style={{ color: C.muted }}>{trace.task}</span>
-          {trace.summary === undefined ? " …" : ""}
+          <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+            {running ? <span style={spinner} /> : <span>🔍</span>}
+            <span>
+              {trace.agent}: <span style={{ color: C.muted }}>{trace.task}</span>
+            </span>
+            {running && <span style={{ color: C.accent }}>running…</span>}
+          </span>
         </summary>
         <div style={{ fontSize: 12, color: C.muted, marginTop: 6, whiteSpace: "pre-wrap" }}>
-          {trace.summary ?? "Exploring…"}
+          {trace.summary ?? "Working…"}
         </div>
       </details>
     );
@@ -670,6 +676,15 @@ function folderName(path: string): string {
 }
 
 // --- styles ---------------------------------------------------------------
+const spinner: React.CSSProperties = {
+  display: "inline-block",
+  width: 10,
+  height: 10,
+  border: "2px solid rgba(56,189,248,0.25)",
+  borderTopColor: C.accent,
+  borderRadius: "50%",
+  animation: "coding-spin 0.8s linear infinite",
+};
 const input: React.CSSProperties = {
   background: "rgba(15,23,42,0.6)",
   border: C.border,

@@ -87,6 +87,24 @@ describe("coding turn rendering", () => {
     expect(html).toContain("auth lives in src/auth.ts");
   });
 
+  it("shows a running indicator for an in-flight sub-agent", () => {
+    const html = renderToStaticMarkup(
+      <LiveTurn
+        live={{
+          messageId: "message-1",
+          text: "",
+          thinking: "",
+          status: "streaming",
+          trace: [{ kind: "subagent", agent: "explore", task: "map the auth flow" }],
+          approvals: [],
+        }}
+        onDecide={() => undefined}
+      />,
+    );
+    expect(html).toContain("running…");
+    expect(html).toContain("map the auth flow");
+  });
+
   it("hides legacy empty assistant records while preserving user messages", () => {
     const base = { thinking: null, toolActivity: null, cancelled: false, createdAt: "2026-01-01T00:00:00Z" };
     const visible = visibleCodingMessages([

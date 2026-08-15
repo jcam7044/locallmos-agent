@@ -142,7 +142,10 @@ export function Composer({
           value={prompt}
           onChange={(e) => setPrompt(e.target.value)}
           onKeyDown={(e) => {
-            if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+            // Enter sends; Shift+Enter inserts a newline. Skip while an IME is
+            // composing so Enter can commit a candidate without sending. Cmd/Ctrl+
+            // Enter still sends too, for muscle memory.
+            if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
               e.preventDefault();
               if (canSend) onSend();
             }
@@ -216,7 +219,7 @@ export function Composer({
               onClick={onSend}
               disabled={!canSend}
               style={{ ...sendBtn, opacity: canSend ? 1 : 0.35, cursor: canSend ? "pointer" : "default" }}
-              title="Send (Cmd/Ctrl+Enter)"
+              title="Send (Enter · Shift+Enter for newline)"
             >
               ↑
             </button>

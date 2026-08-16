@@ -455,6 +455,25 @@ pub async fn process(state: &Arc<AppState>, pending: ChatPending) -> Result<()> 
         .collect();
     let tools_value = native_tools.then(|| Value::Array(tool_defs));
 
+    // Graded reasoning intensity from the web turn. `enable_thinking` still rides
+    // the `pending.think` bool (unchanged); the level flows through the options
+    // map as `reasoning_effort` and is only sent to models that can honor it,
+    // mirroring the local chat path (`local_chat::request_options`). Non-reasoning
+    // models silently ignore it, so this stays a no-op for them.
+    let effort = pending
+        .reasoning_effort
+        .as_deref()
+        .and_then(crate::runtime::ReasoningEffort::parse)
+        .filter(|e| e.is_thinking());
+    let options = if pending.think
+        && effort.is_some()
+        && state.runtime.model_supports_thinking(&model).await
+    {
+        Some(json!({ "reasoning_effort": effort.unwrap().as_str() }))
+    } else {
+        None
+    };
+
     // Tool loop: call Ollama; if it asks for a built-in tool, run it and feed the
     // result back; caller (passthrough) tool calls are returned unexecuted. Only
     // the final, no-tool round streams the answer (tool rounds have no content).
@@ -484,7 +503,7 @@ pub async fn process(state: &Arc<AppState>, pending: ChatPending) -> Result<()> 
                     Value::Array(messages.clone()),
                     pending.think,
                     tools_value.as_ref(),
-                    None,
+                    options.as_ref(),
                     &load_settings,
                     cancel.clone(),
                     move |delta| {
@@ -916,17 +935,52 @@ async fn dispatch_subagent(
             "empty task".into(),
         );
     }
-    let tx_emit = tx.clone();
+    // A fresh event sink per run_agent call (we may run twice: remote then a
+    // local fallback), each forwarding sub-agent UI events onto the stream.
+    let make_emit = || {
+        let tx_emit = tx.clone();
+        move |ev| {
+            let _ = tx_emit.send(StreamDelta::Event(ev));
+        }
+    };
+
+    // Prefer a serving peer in the group (inference relayed via Supabase); fall
+    // back to local inference when none is ready or the peer fails.
+    if let Some(peer) = state.peers.pick(state).await {
+        let label = peer.name.clone().unwrap_or_else(|| peer.rig_id.clone());
+        let relay = crate::relay_inference::RelayLlama::new(
+            state.clone(), peer.rig_id.clone(), peer.group_id.clone(),
+        );
+        let rt = crate::subagent::SubagentRuntime::Relay(relay);
+        let (res, ok) = crate::subagent::run_agent(
+            &rt, &crate::runtime::ModelLoadSettings::default(), &cx.workspace, &peer.model,
+            agent, task, cancel.clone(), make_emit(),
+        ).await;
+        if ok {
+            let line = format!("{} ran on {label}", agent.name);
+            return (
+                res,
+                Some(json!({
+                    "name": "run_agent", "provider": "coding", "status": "succeeded",
+                    "summary": line, "citations": [],
+                })),
+                line,
+            );
+        }
+        tracing::warn!("remote sub-agent '{}' on {label} failed; retrying locally", agent.name);
+    }
+
     let settings = state.model_settings(model).await.map(|(_, s)| s).unwrap_or_default();
-    let result = crate::subagent::run_agent(
-        &state.runtime, &settings, &cx.workspace, model, agent, task, cancel.clone(),
-        move |ev| { let _ = tx_emit.send(StreamDelta::Event(ev)); },
+    let rt = crate::subagent::SubagentRuntime::Local(&state.runtime);
+    let (result, _ok) = crate::subagent::run_agent(
+        &rt, &settings, &cx.workspace, model, agent, task, cancel.clone(), make_emit(),
     ).await;
+    let line = format!("{} explored", agent.name);
     let activity = Some(json!({
         "name": "run_agent", "provider": "coding", "status": "succeeded",
-        "summary": format!("{} explored", agent.name), "citations": [],
+        "summary": line, "citations": [],
     }));
-    (result, activity, format!("{} explored", agent.name))
+    (result, activity, line)
 }
 
 /// Execute one MCP tool in a chat turn (no coding workspace) against the rig's

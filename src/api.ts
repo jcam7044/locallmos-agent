@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   AgentStatus,
   AgentView,
+  GroupSubagentStatus,
   ApprovalPolicy,
   Attachment,
   ChatSession,
@@ -160,6 +161,12 @@ export const codingDeleteAgent = (
   scope: "project" | "global",
   name: string,
 ) => invoke("coding_delete_agent", { workspaceRoot, scope, name });
+
+export const codingPeerStatus = () =>
+  invoke<GroupSubagentStatus>("coding_peer_status");
+
+export const codingSetUseGroupSubagents = (enabled: boolean) =>
+  invoke("coding_set_use_group_subagents", { enabled });
 
 export const codingPreviewStatus = (sessionId: string) =>
   invoke<CodingPreviewStatus>("coding_preview_status", { sessionId });

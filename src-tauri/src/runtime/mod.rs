@@ -107,6 +107,22 @@ impl ReasoningEffort {
             ReasoningEffort::Max => "max",
         }
     }
+
+    /// Parse a stored level string (e.g. from a cloud `reasoning_effort` column).
+    /// Unknown or absent values yield `None` so callers can treat them as "no
+    /// graded level" rather than failing the whole turn.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "none" => Some(ReasoningEffort::None),
+            "minimal" => Some(ReasoningEffort::Minimal),
+            "low" => Some(ReasoningEffort::Low),
+            "medium" => Some(ReasoningEffort::Medium),
+            "high" => Some(ReasoningEffort::High),
+            "xhigh" => Some(ReasoningEffort::Xhigh),
+            "max" => Some(ReasoningEffort::Max),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -499,6 +515,26 @@ pub fn llamacpp_models_dir() -> String {
 #[cfg(test)]
 mod model_settings_tests {
     use super::*;
+
+    #[test]
+    fn reasoning_effort_parses_stored_levels_and_rejects_junk() {
+        for level in [
+            ReasoningEffort::None,
+            ReasoningEffort::Minimal,
+            ReasoningEffort::Low,
+            ReasoningEffort::Medium,
+            ReasoningEffort::High,
+            ReasoningEffort::Xhigh,
+            ReasoningEffort::Max,
+        ] {
+            assert_eq!(ReasoningEffort::parse(level.as_str()), Some(level));
+        }
+        assert_eq!(ReasoningEffort::parse("HIGH"), Some(ReasoningEffort::High));
+        assert_eq!(ReasoningEffort::parse("bogus"), None);
+        assert_eq!(ReasoningEffort::parse(""), None);
+        assert!(!ReasoningEffort::None.is_thinking());
+        assert!(ReasoningEffort::Low.is_thinking());
+    }
 
     #[test]
     fn validates_model_load_setting_bounds() {

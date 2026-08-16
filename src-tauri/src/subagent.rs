@@ -11,8 +11,9 @@
 //! cancel flag, so cancelling the turn cancels its sub-agents too.
 
 use crate::coding::{self, AgentDef, ApprovalPolicy, CodingContext, McpAccess, Workspace};
+use crate::relay_inference::RelayLlama;
 use crate::runtime::ollama::ChatDelta;
-use crate::runtime::{tool_protocol, ModelLoadSettings, Runtime};
+use crate::runtime::{tool_protocol, ChatOutput, ModelLoadSettings, Runtime};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -20,6 +21,53 @@ use std::sync::Arc;
 const MAX_SUBAGENT_ROUNDS: usize = 12;
 /// Cap on the summary handed back to the orchestrator, protecting its context.
 const MAX_RESULT_CHARS: usize = 8_000;
+
+/// Which engine a sub-agent's inference runs on: this rig's local runtime, or a
+/// relay to a serving peer in the group. The sub-agent loop is identical either
+/// way — only `template_supports_tools` and `chat_stream` differ, so this thin
+/// enum keeps the loop (and `Runtime`) untouched.
+pub enum SubagentRuntime<'a> {
+    Local(&'a Runtime),
+    Relay(RelayLlama),
+}
+
+impl SubagentRuntime<'_> {
+    async fn template_supports_tools(&self, model: &str) -> bool {
+        match self {
+            SubagentRuntime::Local(r) => r.template_supports_tools(model).await,
+            // The peer serves under llama-server `--jinja` (native, grammar-
+            // constrained tool calling), so assume tools are available. If its
+            // model lacks a tool template the round simply returns prose and the
+            // loop still terminates cleanly.
+            SubagentRuntime::Relay(_) => true,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn chat_stream<F: FnMut(ChatDelta)>(
+        &self,
+        model: &str,
+        messages: Value,
+        think: bool,
+        tools: Option<&Value>,
+        options: Option<&Value>,
+        settings: &ModelLoadSettings,
+        cancel: Arc<AtomicBool>,
+        on_delta: F,
+    ) -> anyhow::Result<ChatOutput> {
+        match self {
+            SubagentRuntime::Local(r) => {
+                r.chat_stream(model, messages, think, tools, options, settings, cancel, on_delta)
+                    .await
+            }
+            SubagentRuntime::Relay(relay) => {
+                // The peer resolves its own model settings; nothing streams.
+                let _ = (options, settings, on_delta);
+                relay.chat_stream(model, messages, think, tools, cancel).await
+            }
+        }
+    }
+}
 
 /// Run one sub-agent to completion and return its final text (the `run_agent`
 /// tool result). Errors are returned as text so a failed sub-agent degrades to a
@@ -32,9 +80,12 @@ const MAX_RESULT_CHARS: usize = 8_000;
 /// `subagent_started` / `subagent_result` UI events; the caller wraps them for
 /// its transport (local Tauri event vs. cloud realtime), so this loop is shared
 /// by both engines.
+/// Run one sub-agent and return `(tool_result_text, ok)`. `ok` is false only
+/// when the underlying loop errored (transport/model failure) — the dispatcher
+/// uses it to fall back to local inference when a relayed sub-agent fails.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_agent<E: Fn(Value)>(
-    runtime: &Runtime,
+    runtime: &SubagentRuntime<'_>,
     settings: &ModelLoadSettings,
     workspace: &Workspace,
     model: &str,
@@ -42,10 +93,11 @@ pub async fn run_agent<E: Fn(Value)>(
     task: &str,
     cancel: Arc<AtomicBool>,
     emit: E,
-) -> String {
+) -> (String, bool) {
     emit(json!({ "type": "subagent_started", "agent": agent.name, "task": task }));
 
     let result = run_loop(runtime, settings, workspace, model, agent, task, cancel).await;
+    let ok = result.is_ok();
     let summary = match &result {
         Ok(text) if !text.trim().is_empty() => clamp(text.trim(), MAX_RESULT_CHARS),
         Ok(_) => "The sub-agent finished without producing a summary.".to_string(),
@@ -55,12 +107,12 @@ pub async fn run_agent<E: Fn(Value)>(
     emit(json!({ "type": "subagent_result", "agent": agent.name, "summary": summarize_line(&summary) }));
     // The orchestrator gets the full (clamped) summary; the UI event carries a
     // short one-liner for the trace row.
-    format!("Result from the {} sub-agent:\n\n{summary}", agent.name)
+    (format!("Result from the {} sub-agent:\n\n{summary}", agent.name), ok)
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn run_loop(
-    runtime: &Runtime,
+    runtime: &SubagentRuntime<'_>,
     settings: &ModelLoadSettings,
     workspace: &Workspace,
     model: &str,
@@ -250,8 +302,8 @@ You are a meticulous code reviewer. Read the file you are asked about, then repo
         let settings = ModelLoadSettings::default();
         let cancel = Arc::new(AtomicBool::new(false));
 
-        let result = run_agent(
-            &runtime,
+        let (result, ok) = run_agent(
+            &SubagentRuntime::Local(&runtime),
             &settings,
             &workspace,
             &model,
@@ -263,6 +315,7 @@ You are a meticulous code reviewer. Read the file you are asked about, then repo
         .await;
 
         println!("\n===== SUB-AGENT RESULT =====\n{result}\n============================\n");
+        assert!(ok, "sub-agent loop should not have errored");
         assert!(result.contains("reviewer sub-agent"));
         assert!(result.len() > 40, "expected a real summary, got: {result}");
 

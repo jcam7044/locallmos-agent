@@ -20,7 +20,9 @@ mod local_chat;
 mod llamacpp_updater;
 mod mcp;
 mod monitor;
+mod peers;
 mod realtime;
+mod relay_inference;
 pub mod runtime;
 mod settings;
 mod status;
@@ -81,6 +83,15 @@ pub struct AppState {
     /// means the first reconcile re-applies everything (idempotent).
     pub mcp_cloud_applied: Mutex<HashMap<String, String>>,
     pub hub: Arc<hub::HubState>,
+    /// Serving peers in this rig's group that can run relayed sub-agent
+    /// inference, and the round-robin cursor for load-balancing across them.
+    pub peers: Arc<peers::PeerPool>,
+    /// Whether *this* rig currently accepts relayed inference jobs (owner-set in
+    /// the cloud; mirrored here each reconcile so the serving loop can gate).
+    pub serves_inference: AtomicBool,
+    /// Caps concurrent inbound inference jobs so a group fan-out can't swamp one
+    /// machine. Sized from `LOCALLMOS_INFERENCE_SLOTS` (default 2).
+    pub serving_slots: Arc<tokio::sync::Semaphore>,
     /// The Tauri app handle, set once at GUI startup. Absent in headless service
     /// mode. Used to mirror coding-session stream events to the local webview.
     pub app: std::sync::OnceLock<tauri::AppHandle>,
@@ -188,8 +199,20 @@ fn build_state() -> Arc<AppState> {
         mcp,
         mcp_cloud_applied: Mutex::new(HashMap::new()),
         hub,
+        peers: Arc::new(peers::PeerPool::new()),
+        serves_inference: AtomicBool::new(false),
+        serving_slots: Arc::new(tokio::sync::Semaphore::new(serving_slot_count())),
         app: std::sync::OnceLock::new(),
     })
+}
+
+/// Concurrent inbound inference jobs this rig will run at once.
+fn serving_slot_count() -> usize {
+    std::env::var("LOCALLMOS_INFERENCE_SLOTS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(2)
+        .clamp(1, 32)
 }
 
 // ---------------------------------------------------------------------------
@@ -1331,6 +1354,43 @@ async fn coding_delete_agent(workspace_root: String, scope: String, name: String
     .map_err(|e| e.to_string())
 }
 
+/// Distributed sub-agent status for the coding UI: whether this rig offloads
+/// sub-agents to the group, whether it serves inference to peers (owner-set in
+/// the dashboard), and the serving peers it can currently reach.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GroupSubagentStatus {
+    /// Consumer-side opt-in: dispatch this rig's sub-agents to group peers.
+    enabled: bool,
+    /// Producer-side: this rig accepts relayed jobs (owner-set, cloud-mirrored).
+    serving: bool,
+    peers: Vec<peers::PeerInfo>,
+}
+
+#[tauri::command]
+async fn coding_peer_status(
+    state: State<'_, Arc<AppState>>,
+) -> Result<GroupSubagentStatus, String> {
+    let state = state.inner().clone();
+    let enabled = state.config.lock().await.use_group_subagents;
+    let serving = state.serves_inference.load(std::sync::atomic::Ordering::Relaxed);
+    let peers = state.peers.snapshot(&state).await;
+    Ok(GroupSubagentStatus { enabled, serving, peers })
+}
+
+/// Toggle whether this rig offloads its coding sub-agents to serving group
+/// peers. Consumer-side preference, stored locally (serving is owner-set in the
+/// web dashboard). Off by default — sub-agent prompts carry workspace code.
+#[tauri::command]
+async fn coding_set_use_group_subagents(
+    state: State<'_, Arc<AppState>>,
+    enabled: bool,
+) -> Result<(), String> {
+    let mut cfg = state.config.lock().await;
+    cfg.use_group_subagents = enabled;
+    cfg.save().map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 async fn coding_preview_status(
     app: tauri::AppHandle,
@@ -1737,6 +1797,8 @@ fn run_gui() {
             coding_list_agents,
             coding_save_agent,
             coding_delete_agent,
+            coding_peer_status,
+            coding_set_use_group_subagents,
             coding_preview_status,
             coding_preview_focus,
             coding_preview_reload,

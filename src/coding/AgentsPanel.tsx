@@ -1,6 +1,12 @@
 import { useCallback, useEffect, useState } from "react";
-import { codingDeleteAgent, codingListAgents, codingSaveAgent } from "../api";
-import type { AgentView } from "../types";
+import {
+  codingDeleteAgent,
+  codingListAgents,
+  codingPeerStatus,
+  codingSaveAgent,
+  codingSetUseGroupSubagents,
+} from "../api";
+import type { AgentView, GroupSubagentStatus } from "../types";
 import { C } from "./tokens";
 
 /** The read-only tools a sub-agent may use (mirrors agents.rs READONLY_TOOLS). */
@@ -102,6 +108,8 @@ export function AgentsPanel({
               Sub-agents run read-only in their own context and are dispatched with the run_agent tool.
               Project agents live in <code>.agents/</code>; global agents apply to every project.
             </p>
+            <GroupHardware onError={onError} />
+            <div style={{ fontSize: 13, color: "#e2e8f0", margin: "4px 0 8px" }}>Sub-agents</div>
             <div style={{ display: "flex", flexDirection: "column", gap: 8, overflowY: "auto", flex: 1 }}>
               {agents.map((a) => (
                 <div key={`${a.scope}:${a.name}`} style={row}>
@@ -227,6 +235,94 @@ function AgentForm({
         <button style={btn} onClick={onCancel} disabled={busy}>Cancel</button>
         <button style={primaryBtn} onClick={onSave} disabled={busy}>{editing ? "Save" : "Create"}</button>
       </div>
+    </div>
+  );
+}
+
+/**
+ * Distributed sub-agents: offload sub-agent inference to serving rigs in this
+ * rig's group (relayed via the cloud — no LAN setup). "Serving" is owner-set in
+ * the web dashboard; here we only toggle whether this rig *uses* the pool and
+ * show which peers are reachable.
+ */
+function GroupHardware({ onError }: { onError: (message: string) => void }) {
+  const [status, setStatus] = useState<GroupSubagentStatus | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const refresh = useCallback(() => {
+    codingPeerStatus()
+      .then(setStatus)
+      .catch((e) => onError(String(e)));
+  }, [onError]);
+
+  useEffect(() => {
+    refresh();
+    const t = setInterval(refresh, 8000);
+    return () => clearInterval(t);
+  }, [refresh]);
+
+  async function toggle(enabled: boolean) {
+    setBusy(true);
+    try {
+      await codingSetUseGroupSubagents(enabled);
+      refresh();
+    } catch (e) {
+      onError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const enabled = status?.enabled ?? false;
+  const ready = status?.peers.filter((p) => p.ready) ?? [];
+
+  return (
+    <div style={{ ...row, flexDirection: "column", alignItems: "stretch", gap: 8, marginBottom: 12 }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
+        <div style={{ minWidth: 0 }}>
+          <div style={{ fontSize: 13, color: "#e2e8f0" }}>Group hardware</div>
+          <div style={{ fontSize: 11, color: C.muted, marginTop: 2 }}>
+            Run sub-agents on serving rigs in your group. Inference is relayed through the
+            cloud — no local network setup.
+          </div>
+        </div>
+        <label style={{ display: "flex", alignItems: "center", gap: 6, flexShrink: 0, cursor: "pointer" }}>
+          <input
+            type="checkbox"
+            checked={enabled}
+            disabled={busy}
+            onChange={(e) => void toggle(e.target.checked)}
+          />
+          <span style={{ fontSize: 12, color: enabled ? C.accent : C.muted }}>
+            {enabled ? "On" : "Off"}
+          </span>
+        </label>
+      </div>
+
+      {enabled && (
+        <div style={{ fontSize: 11, color: C.muted }}>
+          {ready.length === 0 ? (
+            <span>No serving peers online. Sub-agents run locally until a group rig serves inference.</span>
+          ) : (
+            <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+              <span>{ready.length} peer{ready.length === 1 ? "" : "s"} ready:</span>
+              {ready.map((p) => (
+                <div key={p.rigId} style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                  <span style={{ width: 6, height: 6, borderRadius: 999, background: "#34d399" }} />
+                  <span style={{ color: "#cbd5e1" }}>{p.name ?? p.rigId.slice(0, 8)}</span>
+                  {p.model && <span style={{ color: C.muted }}>· {p.model}</span>}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {status?.serving && (
+        <div style={{ fontSize: 11, color: "#f0abfc" }}>
+          This rig is serving inference to its group.
+        </div>
+      )}
     </div>
   );
 }

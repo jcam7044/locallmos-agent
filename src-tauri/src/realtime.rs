@@ -163,7 +163,8 @@ async fn connect_and_listen(state: &Arc<AppState>) -> Result<()> {
                 "postgres_changes": [
                     { "event": "INSERT", "schema": "public", "table": "chat_messages", "filter": format!("rig_id=eq.{rig}") },
                     { "event": "UPDATE", "schema": "public", "table": "chat_messages", "filter": format!("rig_id=eq.{rig}") },
-                    { "event": "INSERT", "schema": "public", "table": "commands", "filter": format!("rig_id=eq.{rig}") }
+                    { "event": "INSERT", "schema": "public", "table": "commands", "filter": format!("rig_id=eq.{rig}") },
+                    { "event": "INSERT", "schema": "public", "table": "inference_jobs", "filter": format!("target_rig_id=eq.{rig}") }
                 ]
             },
             "access_token": token
@@ -285,6 +286,10 @@ async fn handle_change(state: &Arc<AppState>, v: &Value) {
                     .to_string(),
                 model: record.get("model").and_then(Value::as_str).map(str::to_string),
                 think: record.get("think").and_then(Value::as_bool).unwrap_or(false),
+                reasoning_effort: record
+                    .get("reasoning_effort")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
                 web_search: record.get("web_search").and_then(Value::as_bool).unwrap_or(false),
                 request_tools: record.get("request_tools").filter(|v| !v.is_null()).cloned(),
                 tool_protocol_version: record
@@ -300,6 +305,27 @@ async fn handle_change(state: &Arc<AppState>, v: &Value) {
             tokio::spawn(async move {
                 if let Err(e) = crate::chat::process(&state, pending).await {
                     tracing::warn!("chat turn failed: {e}");
+                }
+            });
+        }
+        "inference_jobs" => {
+            let job = crate::supabase::InferenceJob {
+                id: record.get("id").and_then(Value::as_str).unwrap_or("").to_string(),
+                requester_rig_id: record
+                    .get("requester_rig_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                model: record.get("model").and_then(Value::as_str).unwrap_or("").to_string(),
+                request: record.get("request").cloned().unwrap_or_else(|| json!({})),
+            };
+            if job.id.is_empty() {
+                return;
+            }
+            let state = state.clone();
+            tokio::spawn(async move {
+                if let Err(e) = crate::worker::process_inference_job(&state, job).await {
+                    tracing::warn!("inference job failed: {e}");
                 }
             });
         }

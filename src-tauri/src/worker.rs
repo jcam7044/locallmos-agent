@@ -240,6 +240,11 @@ async fn fallback_tick(state: &Arc<AppState>) -> Result<()> {
     for pending in state.supabase.fetch_pending_chat(&token, &rid).await? {
         crate::chat::process(state, pending).await.ok();
     }
+    if state.serves_inference.load(std::sync::atomic::Ordering::Relaxed) {
+        for job in state.supabase.fetch_pending_inference_jobs(&token, &rid).await? {
+            process_inference_job(state, job).await.ok();
+        }
+    }
     Ok(())
 }
 
@@ -263,6 +268,84 @@ pub async fn process_command(
         .await
         .ok();
     Ok(())
+}
+
+/// Claim + run one inbound relayed inference job on this (serving) rig, writing
+/// the completion back for the requester. Inference-only: we run just the
+/// forward pass with our own model + load settings. Safe against the WS +
+/// fallback-poll double-trigger via the atomic claim. Called from both the
+/// Realtime handler and the fallback poll.
+pub async fn process_inference_job(
+    state: &Arc<AppState>,
+    job: crate::supabase::InferenceJob,
+) -> Result<()> {
+    if !state.serves_inference.load(std::sync::atomic::Ordering::Relaxed) {
+        return Ok(()); // serving turned off since the row was inserted
+    }
+    // Bound concurrency: if every slot is busy, leave the job pending for the
+    // next poll (or another peer) rather than piling work onto one machine.
+    let Ok(_permit) = state.serving_slots.clone().try_acquire_owned() else {
+        return Ok(());
+    };
+    let token = ensure_token(state).await?;
+    if !state.supabase.claim_inference_job(&token, &job.id).await? {
+        return Ok(()); // another trigger won the claim
+    }
+
+    match run_inference_job(state, &job).await {
+        Ok(response) => {
+            state
+                .supabase
+                .complete_inference_job(&token, &job.id, response)
+                .await
+                .ok();
+        }
+        Err(e) => {
+            tracing::warn!("inference job {} failed: {e}", job.id);
+            state
+                .supabase
+                .fail_inference_job(&token, &job.id, &e.to_string())
+                .await
+                .ok();
+        }
+    }
+    Ok(())
+}
+
+/// Run the relayed completion locally and encode the result for the job row.
+async fn run_inference_job(
+    state: &Arc<AppState>,
+    job: &crate::supabase::InferenceJob,
+) -> Result<Value> {
+    let req = &job.request;
+    let messages = req
+        .get("messages")
+        .cloned()
+        .ok_or_else(|| anyhow!("inference job carried no messages"))?;
+    let think = req.get("think").and_then(Value::as_bool).unwrap_or(false);
+    let tools = req.get("tools").filter(|v| !v.is_null()).cloned();
+    // Serve with our own load settings for the model the peer asked for (which
+    // is the model we advertised as loaded).
+    let settings = state
+        .model_settings(&job.model)
+        .await
+        .map(|(_, s)| s)
+        .unwrap_or_default();
+    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let out = state
+        .runtime
+        .chat_stream(
+            &job.model,
+            messages,
+            think,
+            tools.as_ref(),
+            None,
+            &settings,
+            cancel,
+            |_| {},
+        )
+        .await?;
+    Ok(crate::relay_inference::encode_response(&out))
 }
 
 /// Execute a single command; returns (ok, result-json).
@@ -328,6 +411,12 @@ async fn reconcile_tick(state: &Arc<AppState>) -> Result<()> {
     }
 
     let desired = state.supabase.fetch_desired(&token, &rid).await?;
+
+    // Mirror the owner's serving opt-in so the inbound inference-job loop can
+    // gate on it (RLS also blocks inserts targeting a non-serving rig).
+    state
+        .serves_inference
+        .store(desired.serves_inference, std::sync::atomic::Ordering::Relaxed);
 
     let snap = state.runtime.snapshot().await;
 

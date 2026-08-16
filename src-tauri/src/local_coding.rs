@@ -874,16 +874,38 @@ async fn dispatch_subagent(
             })),
         );
     }
+    let activity = |summary: String| {
+        Some(json!({
+            "name": "run_agent", "provider": "coding", "status": "succeeded",
+            "summary": summary, "citations": [],
+        }))
+    };
+
+    // Prefer a serving peer in this rig's group (inference relayed via Supabase);
+    // fall back to local inference when none is ready or the peer fails.
+    if let Some(peer) = state.peers.pick(state).await {
+        let label = peer.name.clone().unwrap_or_else(|| peer.rig_id.clone());
+        let relay = crate::relay_inference::RelayLlama::new(
+            state.clone(), peer.rig_id.clone(), peer.group_id.clone(),
+        );
+        let rt = subagent::SubagentRuntime::Relay(relay);
+        let (res, ok) = subagent::run_agent(
+            &rt, &crate::runtime::ModelLoadSettings::default(), &cx.workspace, &peer.model,
+            agent, task, cancel.clone(), |ev| emit(app, session_id, request_id, ev),
+        ).await;
+        if ok {
+            return (res, activity(format!("{} ran on {label}", agent.name)));
+        }
+        tracing::warn!("remote sub-agent '{}' on {label} failed; retrying locally", agent.name);
+    }
+
     let settings = state.model_settings(model).await.map(|(_, s)| s).unwrap_or_default();
-    let result = subagent::run_agent(
-        &state.runtime, &settings, &cx.workspace, model, agent, task, cancel,
+    let rt = subagent::SubagentRuntime::Local(&state.runtime);
+    let (result, _ok) = subagent::run_agent(
+        &rt, &settings, &cx.workspace, model, agent, task, cancel,
         |ev| emit(app, session_id, request_id, ev),
     ).await;
-    let activity = Some(json!({
-        "name": "run_agent", "provider": "coding", "status": "succeeded",
-        "summary": format!("{} explored", agent.name), "citations": [],
-    }));
-    (result, activity)
+    (result, activity(format!("{} explored", agent.name)))
 }
 
 /// Execute one coding tool call with the approval gate, streaming its events.

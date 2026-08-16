@@ -339,6 +339,26 @@ export type AgentView = {
   editable: boolean;
 };
 
+/** A serving group peer this rig can offload sub-agent inference to
+ * (mirror peers::PeerInfo). */
+export type PeerInfo = {
+  rigId: string;
+  name: string | null;
+  groupId: string;
+  model: string | null;
+  ready: boolean;
+};
+
+/** Distributed sub-agent status for the Code tab (mirror lib.rs
+ * GroupSubagentStatus). */
+export type GroupSubagentStatus = {
+  /** Consumer-side opt-in: dispatch this rig's sub-agents to group peers. */
+  enabled: boolean;
+  /** Producer-side: this rig accepts relayed jobs (owner-set in the dashboard). */
+  serving: boolean;
+  peers: PeerInfo[];
+};
+
 // ---- MCP servers (mirrors src-tauri/src/mcp + the mcp_* Tauri commands) ----
 
 export type McpTrust = "untrusted" | "trusted";

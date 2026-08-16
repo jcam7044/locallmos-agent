@@ -39,6 +39,12 @@ pub struct AgentConfig {
     /// preserves the recommended default so older configs migrate cleanly.
     #[serde(default)]
     pub mcp_tool_limit: Option<u16>,
+    /// Opt-in: dispatch coding sub-agents to serving rigs in this rig's group
+    /// (inference relayed through Supabase). Off by default — sub-agent prompts
+    /// carry workspace code, so offloading to a peer owned by another group
+    /// member is an explicit choice. See `peers.rs` / `relay_inference.rs`.
+    #[serde(default)]
+    pub use_group_subagents: bool,
 }
 
 /// Serializes tests that mutate the process-global `LOCALLMOS_CONFIG_DIR` env

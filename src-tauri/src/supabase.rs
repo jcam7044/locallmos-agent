@@ -50,6 +50,44 @@ pub struct DesiredState {
     pub desired_model: Option<String>,
     #[serde(default)]
     pub desired_runtime_state: Option<String>,
+    /// Owner opt-in for this rig to accept relayed sub-agent inference (0051).
+    #[serde(default)]
+    pub serves_inference: bool,
+}
+
+/// A serving peer this rig may offload sub-agent inference to, from the
+/// `list_inference_peers` RPC (0051). `group_id` is the shared group to stamp on
+/// the job; `loaded_model` is what the peer currently serves (None → skip it).
+#[derive(Deserialize, Clone, Debug)]
+pub struct InferencePeer {
+    pub rig_id: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    pub group_id: String,
+    #[serde(default)]
+    pub loaded_model: Option<String>,
+    #[serde(default)]
+    pub last_seen: Option<String>,
+}
+
+/// One inbound inference job a serving rig must fulfil (its pending queue).
+#[derive(Deserialize, Clone, Debug)]
+pub struct InferenceJob {
+    pub id: String,
+    pub requester_rig_id: String,
+    pub model: String,
+    pub request: Value,
+}
+
+/// The result-bearing view of a job the requester polls for.
+#[derive(Deserialize, Clone, Debug)]
+pub struct InferenceJobResult {
+    pub id: String,
+    pub status: String,
+    #[serde(default)]
+    pub response: Option<Value>,
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 /// One web-authored MCP server the rig should run (0048), as returned by the
@@ -358,7 +396,7 @@ impl Supabase {
         let resp = self
             .auth(
                 self.http.get(format!(
-                    "{}/rigs?id=eq.{rig_id}&select=desired_runtime,desired_model,desired_runtime_state",
+                    "{}/rigs?id=eq.{rig_id}&select=desired_runtime,desired_model,desired_runtime_state,serves_inference",
                     self.rest
                 )),
                 token,
@@ -540,6 +578,162 @@ impl Supabase {
         }
         let rows: Vec<Value> = resp.json().await.unwrap_or_default();
         Ok(!rows.is_empty())
+    }
+
+    // ---- distributed sub-agent inference (rig -> rig via relay, 0051) ----
+
+    /// Serving peers this rig may target (co-grouped + `serves_inference` on).
+    /// Uses the SECURITY DEFINER RPC because a device JWT cannot read other
+    /// rigs' rows directly (no `auth.uid()`).
+    pub async fn list_inference_peers(&self, token: &str) -> Result<Vec<InferencePeer>> {
+        let resp = self
+            .auth(
+                self.http
+                    .post(format!("{}/rpc/list_inference_peers", self.rest)),
+                token,
+            )
+            .json(&json!({}))
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            let s = resp.status();
+            let b = resp.text().await.unwrap_or_default();
+            return Err(anyhow!("list_inference_peers failed: HTTP {s}: {b}"));
+        }
+        Ok(resp.json().await.unwrap_or_default())
+    }
+
+    /// Insert a pending inference job for a serving peer; returns the new id.
+    pub async fn insert_inference_job(
+        &self,
+        token: &str,
+        group_id: &str,
+        requester_rig_id: &str,
+        target_rig_id: &str,
+        model: &str,
+        request: Value,
+    ) -> Result<String> {
+        let resp = self
+            .auth(
+                self.http
+                    .post(format!("{}/inference_jobs?select=id", self.rest)),
+                token,
+            )
+            .header("Prefer", "return=representation")
+            .json(&json!({
+                "group_id": group_id,
+                "requester_rig_id": requester_rig_id,
+                "target_rig_id": target_rig_id,
+                "model": model,
+                "request": request,
+            }))
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            let s = resp.status();
+            let b = resp.text().await.unwrap_or_default();
+            return Err(anyhow!("insert_inference_job failed: HTTP {s}: {b}"));
+        }
+        let rows: Vec<Value> = resp.json().await.unwrap_or_default();
+        rows.into_iter()
+            .next()
+            .and_then(|r| r.get("id").and_then(Value::as_str).map(str::to_string))
+            .ok_or_else(|| anyhow!("insert_inference_job returned no id"))
+    }
+
+    /// Poll a job's current status/result (the requester side).
+    pub async fn get_inference_job(
+        &self,
+        token: &str,
+        id: &str,
+    ) -> Result<Option<InferenceJobResult>> {
+        let resp = self
+            .auth(
+                self.http.get(format!(
+                    "{}/inference_jobs?id=eq.{id}&select=id,status,response,error",
+                    self.rest
+                )),
+                token,
+            )
+            .send()
+            .await?;
+        let rows: Vec<InferenceJobResult> = resp.json().await.unwrap_or_default();
+        Ok(rows.into_iter().next())
+    }
+
+    /// Delete a finished job (requester cleanup).
+    pub async fn delete_inference_job(&self, token: &str, id: &str) -> Result<()> {
+        let resp = self
+            .auth(
+                self.http
+                    .delete(format!("{}/inference_jobs?id=eq.{id}", self.rest)),
+                token,
+            )
+            .header("Prefer", "return=minimal")
+            .send()
+            .await?;
+        ensure_ok(resp, "delete_inference_job").await
+    }
+
+    /// Pending inbound jobs for this serving rig (fallback poll; the Realtime
+    /// INSERT is the primary trigger).
+    pub async fn fetch_pending_inference_jobs(
+        &self,
+        token: &str,
+        rig_id: &str,
+    ) -> Result<Vec<InferenceJob>> {
+        let resp = self
+            .auth(
+                self.http.get(format!(
+                    "{}/inference_jobs?target_rig_id=eq.{rig_id}&status=eq.pending&select=id,requester_rig_id,model,request&order=created_at.asc",
+                    self.rest
+                )),
+                token,
+            )
+            .send()
+            .await?;
+        Ok(resp.json().await.unwrap_or_default())
+    }
+
+    /// Atomically claim a pending inbound job (pending → claimed). True if this
+    /// caller won the race (safe against the WS + fallback-poll double-trigger).
+    pub async fn claim_inference_job(&self, token: &str, id: &str) -> Result<bool> {
+        self.claim(token, "inference_jobs", id, "claimed").await
+    }
+
+    /// Write the completed result of a job (target → done).
+    pub async fn complete_inference_job(
+        &self,
+        token: &str,
+        id: &str,
+        response: Value,
+    ) -> Result<()> {
+        let resp = self
+            .auth(
+                self.http
+                    .patch(format!("{}/inference_jobs?id=eq.{id}", self.rest)),
+                token,
+            )
+            .header("Prefer", "return=minimal")
+            .json(&json!({ "status": "done", "response": response }))
+            .send()
+            .await?;
+        ensure_ok(resp, "complete_inference_job").await
+    }
+
+    /// Mark a job failed with an error message (target → error).
+    pub async fn fail_inference_job(&self, token: &str, id: &str, error: &str) -> Result<()> {
+        let resp = self
+            .auth(
+                self.http
+                    .patch(format!("{}/inference_jobs?id=eq.{id}", self.rest)),
+                token,
+            )
+            .header("Prefer", "return=minimal")
+            .json(&json!({ "status": "error", "error": error }))
+            .send()
+            .await?;
+        ensure_ok(resp, "fail_inference_job").await
     }
 
     // ---- chat -----------------------------------------------------------

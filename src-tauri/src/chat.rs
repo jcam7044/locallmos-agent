@@ -935,17 +935,52 @@ async fn dispatch_subagent(
             "empty task".into(),
         );
     }
-    let tx_emit = tx.clone();
+    // A fresh event sink per run_agent call (we may run twice: remote then a
+    // local fallback), each forwarding sub-agent UI events onto the stream.
+    let make_emit = || {
+        let tx_emit = tx.clone();
+        move |ev| {
+            let _ = tx_emit.send(StreamDelta::Event(ev));
+        }
+    };
+
+    // Prefer a serving peer in the group (inference relayed via Supabase); fall
+    // back to local inference when none is ready or the peer fails.
+    if let Some(peer) = state.peers.pick(state).await {
+        let label = peer.name.clone().unwrap_or_else(|| peer.rig_id.clone());
+        let relay = crate::relay_inference::RelayLlama::new(
+            state.clone(), peer.rig_id.clone(), peer.group_id.clone(),
+        );
+        let rt = crate::subagent::SubagentRuntime::Relay(relay);
+        let (res, ok) = crate::subagent::run_agent(
+            &rt, &crate::runtime::ModelLoadSettings::default(), &cx.workspace, &peer.model,
+            agent, task, cancel.clone(), make_emit(),
+        ).await;
+        if ok {
+            let line = format!("{} ran on {label}", agent.name);
+            return (
+                res,
+                Some(json!({
+                    "name": "run_agent", "provider": "coding", "status": "succeeded",
+                    "summary": line, "citations": [],
+                })),
+                line,
+            );
+        }
+        tracing::warn!("remote sub-agent '{}' on {label} failed; retrying locally", agent.name);
+    }
+
     let settings = state.model_settings(model).await.map(|(_, s)| s).unwrap_or_default();
-    let result = crate::subagent::run_agent(
-        &state.runtime, &settings, &cx.workspace, model, agent, task, cancel.clone(),
-        move |ev| { let _ = tx_emit.send(StreamDelta::Event(ev)); },
+    let rt = crate::subagent::SubagentRuntime::Local(&state.runtime);
+    let (result, _ok) = crate::subagent::run_agent(
+        &rt, &settings, &cx.workspace, model, agent, task, cancel.clone(), make_emit(),
     ).await;
+    let line = format!("{} explored", agent.name);
     let activity = Some(json!({
         "name": "run_agent", "provider": "coding", "status": "succeeded",
-        "summary": format!("{} explored", agent.name), "citations": [],
+        "summary": line, "citations": [],
     }));
-    (result, activity, format!("{} explored", agent.name))
+    (result, activity, line)
 }
 
 /// Execute one MCP tool in a chat turn (no coding workspace) against the rig's

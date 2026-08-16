@@ -112,6 +112,10 @@ pub struct ChatPending {
     /// Whether the turn requested reasoning output (reasoning models only).
     #[serde(default)]
     pub think: bool,
+    /// Graded reasoning intensity (llama.cpp `reasoning_effort` value) set by the
+    /// web client. `None` for legacy rows — the turn then falls back to `think`.
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
     /// Enable the built-in web_search/web_fetch tools for this turn.
     #[serde(default)]
     pub web_search: bool,
@@ -547,7 +551,7 @@ impl Supabase {
         let resp = self
             .auth(
                 self.http.get(format!(
-                    "{}/chat_messages?rig_id=eq.{rig_id}&status=eq.pending&role=eq.assistant&select=id,conversation_id,model,think,web_search,request_tools,tool_protocol_version,platform_tools&order=created_at.asc",
+                    "{}/chat_messages?rig_id=eq.{rig_id}&status=eq.pending&role=eq.assistant&select=id,conversation_id,model,think,reasoning_effort,web_search,request_tools,tool_protocol_version,platform_tools&order=created_at.asc",
                     self.rest
                 )),
                 token,

@@ -455,6 +455,25 @@ pub async fn process(state: &Arc<AppState>, pending: ChatPending) -> Result<()> 
         .collect();
     let tools_value = native_tools.then(|| Value::Array(tool_defs));
 
+    // Graded reasoning intensity from the web turn. `enable_thinking` still rides
+    // the `pending.think` bool (unchanged); the level flows through the options
+    // map as `reasoning_effort` and is only sent to models that can honor it,
+    // mirroring the local chat path (`local_chat::request_options`). Non-reasoning
+    // models silently ignore it, so this stays a no-op for them.
+    let effort = pending
+        .reasoning_effort
+        .as_deref()
+        .and_then(crate::runtime::ReasoningEffort::parse)
+        .filter(|e| e.is_thinking());
+    let options = if pending.think
+        && effort.is_some()
+        && state.runtime.model_supports_thinking(&model).await
+    {
+        Some(json!({ "reasoning_effort": effort.unwrap().as_str() }))
+    } else {
+        None
+    };
+
     // Tool loop: call Ollama; if it asks for a built-in tool, run it and feed the
     // result back; caller (passthrough) tool calls are returned unexecuted. Only
     // the final, no-tool round streams the answer (tool rounds have no content).
@@ -484,7 +503,7 @@ pub async fn process(state: &Arc<AppState>, pending: ChatPending) -> Result<()> 
                     Value::Array(messages.clone()),
                     pending.think,
                     tools_value.as_ref(),
-                    None,
+                    options.as_ref(),
                     &load_settings,
                     cancel.clone(),
                     move |delta| {

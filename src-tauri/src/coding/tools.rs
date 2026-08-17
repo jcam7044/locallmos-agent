@@ -412,6 +412,15 @@ fn raw_agent_tools(args: &Value) -> Vec<String> {
     }
 }
 
+/// Extract an optional `max_rounds` (accepts a number or numeric string),
+/// clamped into the sub-agent bounds. Absent/invalid → None (env/default applies).
+fn agent_max_rounds(args: &Value) -> Option<usize> {
+    let raw = args
+        .get("max_rounds")
+        .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok())))?;
+    Some(super::agents::clamp_rounds(raw as usize))
+}
+
 /// Human label for where an agent file was written (workspace-relative for a
 /// project agent; a clear marker for a global one).
 fn agent_display_path(cx: &CodingContext, scope: AgentScope, path: &std::path::Path, name: &str) -> String {
@@ -432,14 +441,15 @@ fn create_agent(cx: &CodingContext, args: &Value) -> Result<ToolRun> {
     let description = str_arg(args, "description")?;
     let prompt = str_arg(args, "prompt")?;
     let tools = super::agents::normalize_tools(&raw_agent_tools(args));
+    let max_rounds = agent_max_rounds(args);
 
     // Compute the pre-write content for the diff, then persist via the shared
     // writer (which owns dir creation + confinement-appropriate path handling).
     let path = scope.dir(cx.workspace.root())?.join(format!("{name}.md"));
     let old = std::fs::read_to_string(&path).unwrap_or_default();
     let verb = if old.is_empty() { "Created" } else { "Updated" };
-    super::agents::save_agent(scope, cx.workspace.root(), &name, &description, &prompt, &tools)?;
-    let content = super::agents::render_agent_file(&name, &description, &prompt, &tools);
+    super::agents::save_agent(scope, cx.workspace.root(), &name, &description, &prompt, &tools, max_rounds)?;
+    let content = super::agents::render_agent_file(&name, &description, &prompt, &tools, max_rounds);
 
     let rel = agent_display_path(cx, scope, &path, &name);
     let (diff, added, removed) = line_diff(&old, &content);
@@ -470,7 +480,7 @@ pub fn agent_preview(args: &Value) -> String {
     let description = args.get("description").and_then(Value::as_str).unwrap_or("");
     let prompt = args.get("prompt").and_then(Value::as_str).unwrap_or("");
     let tools = super::agents::normalize_tools(&raw_agent_tools(args));
-    let body = super::agents::render_agent_file(&name, description, prompt, &tools);
+    let body = super::agents::render_agent_file(&name, description, prompt, &tools, agent_max_rounds(args));
     let loc = match scope {
         AgentScope::Project => format!(".agents/{name}.md"),
         AgentScope::Global => format!("(global) agents/{name}.md"),

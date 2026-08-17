@@ -61,6 +61,16 @@ pub struct AgentDef {
     pub system_prompt: String,
     /// Read-only tools this agent may call (always a subset of `READONLY_TOOLS`).
     pub tools: Vec<String>,
+    /// Optional per-agent exploration round budget (frontmatter `max_rounds`),
+    /// already clamped into the sub-agent bounds. `None` falls back to the env
+    /// default. See [`crate::subagent`].
+    pub max_rounds: Option<usize>,
+}
+
+/// Clamp a requested round budget into the sub-agent's hard bounds, so a stored
+/// or model-supplied value can never remove the safety backstop.
+pub fn clamp_rounds(n: usize) -> usize {
+    n.clamp(crate::subagent::SUBAGENT_ROUNDS_MIN, crate::subagent::SUBAGENT_ROUNDS_MAX)
 }
 
 impl AgentDef {
@@ -84,6 +94,7 @@ Do not dump whole files, do not speculate beyond what you read, and do not attem
 changes — you cannot. Be thorough in searching but terse in reporting."
                     .to_string(),
             tools: READONLY_TOOLS.iter().map(|s| s.to_string()).collect(),
+            max_rounds: None,
         }
     }
 }
@@ -181,14 +192,24 @@ pub fn normalize_tools(raw: &[String]) -> Vec<String> {
     }
 }
 
-/// Render the `.md` file for an agent: frontmatter (name/description/tools) plus
-/// the system prompt as the body. Shared by the model tool and the UI.
-pub fn render_agent_file(name: &str, description: &str, prompt: &str, tools: &[String]) -> String {
+/// Render the `.md` file for an agent: frontmatter (name/description/tools, and
+/// `max_rounds` when set) plus the system prompt as the body. Shared by the
+/// model tool and the UI.
+pub fn render_agent_file(
+    name: &str,
+    description: &str,
+    prompt: &str,
+    tools: &[String],
+    max_rounds: Option<usize>,
+) -> String {
     let description = description.trim().replace(['\n', '\r'], " ");
     let mut out = String::from("---\n");
     out.push_str(&format!("name: {name}\n"));
     out.push_str(&format!("description: {description}\n"));
     out.push_str(&format!("tools: {}\n", tools.join(", ")));
+    if let Some(rounds) = max_rounds {
+        out.push_str(&format!("max_rounds: {}\n", clamp_rounds(rounds)));
+    }
     out.push_str("---\n\n");
     out.push_str(prompt.trim());
     out.push('\n');
@@ -204,6 +225,7 @@ pub fn save_agent(
     description: &str,
     prompt: &str,
     tools: &[String],
+    max_rounds: Option<usize>,
 ) -> Result<PathBuf> {
     let name = validate_name(name)?;
     if prompt.trim().is_empty() {
@@ -213,7 +235,8 @@ pub fn save_agent(
     std::fs::create_dir_all(&dir).map_err(|e| anyhow!("could not create {}: {e}", dir.display()))?;
     let path = dir.join(format!("{name}.md"));
     let tools = normalize_tools(tools);
-    std::fs::write(&path, render_agent_file(&name, description, prompt, &tools))
+    let max_rounds = max_rounds.map(clamp_rounds);
+    std::fs::write(&path, render_agent_file(&name, description, prompt, &tools, max_rounds))
         .map_err(|e| anyhow!("could not write {}: {e}", path.display()))?;
     Ok(path)
 }
@@ -275,11 +298,20 @@ fn parse_agent(default_name: &str, text: &str) -> Option<AgentDef> {
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| READONLY_TOOLS.iter().map(|s| s.to_string()).collect());
 
+    // Optional per-agent round budget; a non-numeric or out-of-range value is
+    // clamped (invalid text is ignored → env/default applies).
+    let max_rounds = front
+        .as_ref()
+        .and_then(|f| field(f, "max_rounds"))
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .map(clamp_rounds);
+
     Some(AgentDef {
         name,
         description,
         system_prompt: body.to_string(),
         tools,
+        max_rounds,
     })
 }
 
@@ -364,16 +396,32 @@ mod tests {
     }
 
     #[test]
+    fn max_rounds_parses_clamps_and_defaults() {
+        // A valid in-range value is kept.
+        assert_eq!(parse_agent("x", "---\nmax_rounds: 30\n---\nbody").unwrap().max_rounds, Some(30));
+        // Out-of-range is clamped to the hard ceiling / floor.
+        assert_eq!(parse_agent("x", "---\nmax_rounds: 999\n---\nbody").unwrap().max_rounds,
+                   Some(crate::subagent::SUBAGENT_ROUNDS_MAX));
+        assert_eq!(parse_agent("x", "---\nmax_rounds: 1\n---\nbody").unwrap().max_rounds,
+                   Some(crate::subagent::SUBAGENT_ROUNDS_MIN));
+        // Non-numeric or absent → None (env/default applies).
+        assert_eq!(parse_agent("x", "---\nmax_rounds: lots\n---\nbody").unwrap().max_rounds, None);
+        assert_eq!(parse_agent("x", "---\ntools: read_file\n---\nbody").unwrap().max_rounds, None);
+    }
+
+    #[test]
     fn save_delete_and_list_round_trip_with_scope() {
         let dir = std::env::temp_dir().join(format!("locallmos-crud-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let dir = std::fs::canonicalize(&dir).unwrap();
         let ws = Workspace::new(dir.to_str().unwrap()).unwrap();
 
-        // Save a project agent; write_file is dropped from the tool list.
+        // Save a project agent; write_file is dropped from the tool list. A
+        // per-agent max_rounds is persisted and read back.
         let path = save_agent(
             AgentScope::Project, ws.root(), "reviewer",
             "Reviews code.", "You review code.", &["read_file".into(), "write_file".into()],
+            Some(30),
         )
         .unwrap();
         assert!(path.starts_with(ws.root().join(".agents")));
@@ -383,6 +431,7 @@ mod tests {
         assert_eq!(reviewer.scope, "project");
         assert!(reviewer.editable);
         assert_eq!(reviewer.def.tools, vec!["read_file"]);
+        assert_eq!(reviewer.def.max_rounds, Some(30));
         // The built-in is present and not editable.
         assert!(listed.iter().any(|a| a.def.name == EXPLORE_AGENT && !a.editable));
 
@@ -399,8 +448,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let dir = std::fs::canonicalize(&dir).unwrap();
         let ws = Workspace::new(dir.to_str().unwrap()).unwrap();
-        assert!(save_agent(AgentScope::Project, ws.root(), "explore", "d", "p", &[]).is_err());
-        assert!(save_agent(AgentScope::Project, ws.root(), "ok", "d", "   ", &[]).is_err());
+        assert!(save_agent(AgentScope::Project, ws.root(), "explore", "d", "p", &[], None).is_err());
+        assert!(save_agent(AgentScope::Project, ws.root(), "ok", "d", "   ", &[], None).is_err());
         std::fs::remove_dir_all(&dir).ok();
     }
 

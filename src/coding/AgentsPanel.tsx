@@ -19,7 +19,12 @@ type Draft = {
   description: string;
   tools: string[];
   prompt: string;
+  maxRounds: string; // empty = use default; otherwise a number (clamped 4–64)
 };
+
+/** Hard bounds mirrored from subagent.rs (SUBAGENT_ROUNDS_MIN/MAX). */
+const ROUNDS_MIN = 4;
+const ROUNDS_MAX = 64;
 
 const BLANK: Draft = {
   original: null,
@@ -28,6 +33,7 @@ const BLANK: Draft = {
   description: "",
   tools: [...READONLY_TOOLS],
   prompt: "",
+  maxRounds: "",
 };
 
 /**
@@ -62,6 +68,12 @@ export function AgentsPanel({
       onError("An agent needs a name and a prompt.");
       return;
     }
+    const trimmedRounds = draft.maxRounds.trim();
+    const parsedRounds = trimmedRounds === "" ? null : Number(trimmedRounds);
+    if (parsedRounds !== null && (!Number.isInteger(parsedRounds) || parsedRounds < ROUNDS_MIN || parsedRounds > ROUNDS_MAX)) {
+      onError(`Max rounds must be a whole number between ${ROUNDS_MIN} and ${ROUNDS_MAX}, or blank for the default.`);
+      return;
+    }
     setBusy(true);
     try {
       await codingSaveAgent(
@@ -71,6 +83,7 @@ export function AgentsPanel({
         draft.description.trim(),
         draft.prompt,
         draft.tools,
+        parsedRounds,
       );
       setDraft(null);
       refresh();
@@ -119,7 +132,10 @@ export function AgentsPanel({
                       <span style={badge(a.scope)}>{a.scope}</span>
                     </div>
                     <div style={{ fontSize: 12, color: C.muted, marginTop: 2 }}>{a.description}</div>
-                    <div style={{ fontSize: 11, color: C.muted, marginTop: 2 }}>tools: {a.tools.join(", ")}</div>
+                    <div style={{ fontSize: 11, color: C.muted, marginTop: 2 }}>
+                      tools: {a.tools.join(", ")}
+                      {a.maxRounds != null && ` · max rounds: ${a.maxRounds}`}
+                    </div>
                   </div>
                   {a.editable && (
                     <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
@@ -133,6 +149,7 @@ export function AgentsPanel({
                             description: a.description,
                             tools: a.tools.length ? a.tools : [...READONLY_TOOLS],
                             prompt: a.prompt,
+                            maxRounds: a.maxRounds == null ? "" : String(a.maxRounds),
                           })
                         }
                       >
@@ -222,6 +239,21 @@ function AgentForm({
           ))}
         </div>
       </div>
+      <label>
+        <div style={fieldLabel}>Max rounds (optional)</div>
+        <input
+          style={{ ...input, width: 140 }}
+          type="number"
+          min={ROUNDS_MIN}
+          max={ROUNDS_MAX}
+          value={draft.maxRounds}
+          placeholder="default"
+          onChange={(e) => setDraft({ ...draft, maxRounds: e.target.value })}
+        />
+        <div style={{ fontSize: 11, color: C.muted, marginTop: 4 }}>
+          Exploration budget ({ROUNDS_MIN}–{ROUNDS_MAX}). Higher = deeper multi-file reviews; blank uses the default.
+        </div>
+      </label>
       <label style={{ display: "flex", flexDirection: "column", flex: 1, minHeight: 0 }}>
         <div style={fieldLabel}>System prompt</div>
         <textarea

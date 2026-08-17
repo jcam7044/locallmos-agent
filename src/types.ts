@@ -337,6 +337,8 @@ export type AgentView = {
   prompt: string;
   scope: AgentScope;
   editable: boolean;
+  /** Per-agent exploration round budget (4–64), or null to use the default. */
+  maxRounds: number | null;
 };
 
 /** A serving group peer this rig can offload sub-agent inference to

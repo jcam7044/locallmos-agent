@@ -18,9 +18,33 @@ use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-const MAX_SUBAGENT_ROUNDS: usize = 12;
+const DEFAULT_MAX_SUBAGENT_ROUNDS: usize = 16;
 /// Cap on the summary handed back to the orchestrator, protecting its context.
 const MAX_RESULT_CHARS: usize = 8_000;
+
+/// Hard bounds on a sub-agent's exploration budget. Any per-agent `max_rounds`
+/// or env override is clamped into this range: the ceiling protects the
+/// sub-agent's own context window and bounds cost / relay latency, so a user can
+/// tune the budget but never remove the backstop.
+pub const SUBAGENT_ROUNDS_MIN: usize = 4;
+pub const SUBAGENT_ROUNDS_MAX: usize = 64;
+
+/// Resolve a sub-agent's exploration round budget. Precedence: the agent's own
+/// `max_rounds` (frontmatter) > `LOCALLMOS_SUBAGENT_MAX_ROUNDS` (machine
+/// default) > the built-in default, clamped into
+/// `[SUBAGENT_ROUNDS_MIN, SUBAGENT_ROUNDS_MAX]`. A final tool-free synthesis
+/// round runs on top of this budget (see `run_loop`), so the caller always gets
+/// a complete report rather than a truncated mid-step when it is exhausted.
+fn effective_max_rounds(agent_override: Option<usize>) -> usize {
+    agent_override
+        .or_else(|| {
+            std::env::var("LOCALLMOS_SUBAGENT_MAX_ROUNDS")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+        })
+        .unwrap_or(DEFAULT_MAX_SUBAGENT_ROUNDS)
+        .clamp(SUBAGENT_ROUNDS_MIN, SUBAGENT_ROUNDS_MAX)
+}
 
 /// Which engine a sub-agent's inference runs on: this rig's local runtime, or a
 /// relay to a serving peer in the group. The sub-agent loop is identical either
@@ -164,8 +188,9 @@ async fn run_loop(
         json!({ "role": "user", "content": user_task }),
     ];
 
+    let max_rounds = effective_max_rounds(agent.max_rounds);
     let mut answer = String::new();
-    for _round in 0..MAX_SUBAGENT_ROUNDS {
+    for _round in 0..max_rounds {
         if cancel.load(Ordering::Relaxed) {
             break;
         }
@@ -233,11 +258,47 @@ async fn run_loop(
             }
         }
     }
-    // Hit the round cap: return whatever prose accumulated, with a note.
+    // Budget exhausted mid-exploration. Rather than hand back a truncated
+    // mid-step, force one final *tool-free* round so the model synthesizes a
+    // complete report from what it has already gathered (mirrors the main chat
+    // engine reserving a synthesis turn). Skipped on cancel — the caller wants
+    // to stop, not spend another round.
+    if !cancel.load(Ordering::Relaxed) {
+        messages.push(json!({
+            "role": "user",
+            "content": "You have reached your exploration budget — do not call any more tools. \
+Write your final report now from what you have already gathered. If you could not fully verify \
+something, say so briefly rather than continuing to search.",
+        }));
+        if let Ok(final_out) = runtime
+            .chat_stream(
+                model,
+                Value::Array(messages.clone()),
+                false,
+                None, // tools disabled: this round must produce prose, not calls
+                options.as_ref(),
+                settings,
+                cancel.clone(),
+                |_| {},
+            )
+            .await
+        {
+            let visible = if prompt_tool_mode {
+                tool_protocol::strip_tool_calls(&final_out.content)
+            } else {
+                final_out.content
+            };
+            if !visible.trim().is_empty() {
+                if !answer.is_empty() {
+                    answer.push_str("\n\n");
+                }
+                answer.push_str(visible.trim());
+            }
+        }
+    }
+
     if answer.trim().is_empty() {
-        answer = format!(
-            "(reached the {MAX_SUBAGENT_ROUNDS}-round limit without a final summary)"
-        );
+        answer = format!("(reached the {max_rounds}-round limit without a final summary)");
     }
     Ok(answer)
 }

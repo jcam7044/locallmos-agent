@@ -154,7 +154,8 @@ export const codingSaveAgent = (
   description: string,
   prompt: string,
   tools: string[],
-) => invoke("coding_save_agent", { workspaceRoot, scope, name, description, prompt, tools });
+  maxRounds: number | null,
+) => invoke("coding_save_agent", { workspaceRoot, scope, name, description, prompt, tools, maxRounds });
 
 export const codingDeleteAgent = (
   workspaceRoot: string,

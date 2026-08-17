@@ -1300,6 +1300,8 @@ struct AgentView {
     /// "builtin" | "project" | "global".
     scope: String,
     editable: bool,
+    /// Per-agent exploration round budget, or null to use the default.
+    max_rounds: Option<usize>,
 }
 
 /// List the sub-agents available to a session's workspace: built-in `explore`
@@ -1316,6 +1318,7 @@ async fn coding_list_agents(workspace_root: String) -> Result<Vec<AgentView>, St
             prompt: a.def.system_prompt,
             scope: a.scope,
             editable: a.editable,
+            max_rounds: a.def.max_rounds,
         })
         .collect())
 }
@@ -1330,6 +1333,7 @@ async fn coding_save_agent(
     description: String,
     prompt: String,
     tools: Vec<String>,
+    max_rounds: Option<usize>,
 ) -> Result<(), String> {
     coding::save_agent(
         coding::AgentScope::parse(&scope),
@@ -1338,6 +1342,7 @@ async fn coding_save_agent(
         &description,
         &prompt,
         &tools,
+        max_rounds,
     )
     .map(|_| ())
     .map_err(|e| e.to_string())

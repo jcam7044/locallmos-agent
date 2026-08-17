@@ -257,6 +257,20 @@ function Get-MarkerValue([string]$Marker, [string]$Key) {
   return ""
 }
 
+# Compare two llama.cpp build tags. Returns $true when <Installed> is the same or a
+# newer build than <Target>. Upstream tags are build numbers of the form bNNNNN;
+# the numeric part is compared so a rig already on a newer build than the pinned
+# default isn't downgraded on an update run. If either tag isn't in that form (a
+# fork's semver, say), fall back to exact-string equality so an unknown scheme is
+# never mistaken for "newer".
+function Test-LlamaTagAtLeast([string]$Installed, [string]$Target) {
+  if ($Installed -match '^b(\d+)$') {
+    $in = [int]$Matches[1]
+    if ($Target -match '^b(\d+)$') { return ($in -ge [int]$Matches[1]) }
+  }
+  return ($Installed -eq $Target)
+}
+
 function Install-LlamaCpp([string]$Backend, [string]$Tag, [string]$Repo, [string]$Mode) {
   # Desktop runtimes are user-owned so the signed in-app updater can replace
   # them without UAC. Headless/SYSTEM installs remain machine-owned.
@@ -277,13 +291,20 @@ function Install-LlamaCpp([string]$Backend, [string]$Tag, [string]$Repo, [string
   $chain = if ($forced) { @($Backend) } else { Get-LlamaCppChain $target }
   Write-Host "==> Provisioning llama.cpp: tag=$Tag mode=$Backend target=$target (windows-x86_64)"
 
-  # Idempotency: reuse iff the marker records the same backend + tag.
+  # Idempotency: reuse iff the marker records the same backend and a build that's
+  # the same or newer than the target. This runs on updates too, so a rig already
+  # on a newer llama.cpp than the pinned default must be left alone rather than
+  # downgraded (which would just make the agent prompt to update again).
   $existing = Find-LlamaServer $llamaDir
   if ($existing -and (Test-Path $marker)) {
     $mb = Get-MarkerValue $marker "backend"
     $mt = Get-MarkerValue $marker "tag"
-    if ($mb -eq $target -and $mt -eq $Tag) {
-      Write-Host "==> llama-server already provisioned (backend=$mb tag=$mt)"
+    if ($mb -eq $target -and (Test-LlamaTagAtLeast $mt $Tag)) {
+      if ($mt -eq $Tag) {
+        Write-Host "==> llama-server already provisioned (backend=$mb tag=$mt)"
+      } else {
+        Write-Host "==> llama-server already at $mt (newer than default $Tag) - skipping download"
+      }
       New-Item -ItemType Directory -Force -Path $modelsDir | Out-Null
       return @{ Bin = $existing; Backend = $mb; ModelsDir = $modelsDir }
     }

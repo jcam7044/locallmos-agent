@@ -25,6 +25,26 @@ _llamacpp_parse_version() {
   awk 'NF && $1 !~ /^#/ { gsub(/[ \t\r]/, "", $0); print; exit }'
 }
 
+# Compare two llama.cpp build tags. Echo "ge" when <installed> is the same or a
+# newer build than <target>, else nothing. Upstream tags are build numbers of the
+# form bNNNNN; the numeric part is compared so a rig already on a newer build than
+# the pinned default isn't downgraded on an update run. If either tag isn't in that
+# form (a fork's semver, say), fall back to exact-string equality so an unknown
+# scheme is never mistaken for "newer".
+_llamacpp_tag_ge() {
+  _inst="$1"; _targ="$2"
+  _in=""; _tn=""
+  case "$_inst" in b[0-9]*) _in="${_inst#b}" ;; esac
+  case "$_targ" in b[0-9]*) _tn="${_targ#b}" ;; esac
+  case "$_in" in *[!0-9]*) _in="" ;; esac
+  case "$_tn" in *[!0-9]*) _tn="" ;; esac
+  if [ -n "$_in" ] && [ -n "$_tn" ]; then
+    [ "$_in" -ge "$_tn" ] && printf 'ge\n'
+  else
+    [ "$_inst" = "$_targ" ] && printf 'ge\n'
+  fi
+}
+
 # Resolve the release tag ("latest" → newest tag via the GitHub API; else as-is).
 resolve_llamacpp_tag() {
   if [ "$LLAMACPP_VERSION" != "latest" ]; then
@@ -259,13 +279,20 @@ provision_llamacpp() {
   echo "==> Provisioning llama.cpp: tag=$_tag mode=$_backend target=$_target ($OS-$ARCH)"
 
   # Idempotency: reuse an existing install iff the marker records the same backend
-  # and tag. A missing marker (all legacy installs) reprovisions once.
+  # and a build that's the same or newer than the target. This runs on updates too,
+  # so a rig already on a newer llama.cpp than the pinned default must be left alone
+  # rather than downgraded (which would just make the agent prompt to update again).
+  # A missing marker (all legacy installs) reprovisions once.
   _existing="$(find "$LLAMA_DIR" -type f -name llama-server 2>/dev/null | head -n1)"
   if [ -n "$_existing" ] && [ -f "$_marker" ]; then
     _mbackend="$(sed -n 's/^backend=//p' "$_marker" 2>/dev/null | head -n1)"
     _mtag="$(sed -n 's/^tag=//p' "$_marker" 2>/dev/null | head -n1)"
-    if [ "$_mbackend" = "$_target" ] && [ "$_mtag" = "$_tag" ]; then
-      echo "==> llama-server already provisioned (backend=$_mbackend tag=$_mtag)"
+    if [ "$_mbackend" = "$_target" ] && [ -n "$(_llamacpp_tag_ge "$_mtag" "$_tag")" ]; then
+      if [ "$_mtag" = "$_tag" ]; then
+        echo "==> llama-server already provisioned (backend=$_mbackend tag=$_mtag)"
+      else
+        echo "==> llama-server already at $_mtag (newer than default $_tag) — skipping download"
+      fi
       LLAMA_BIN="$_existing"
       LLAMA_BACKEND="$_mbackend"
       $SUDO mkdir -p "$MODELS_DIR"

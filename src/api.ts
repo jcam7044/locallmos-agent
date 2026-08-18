@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   AgentStatus,
   AgentView,
+  GroupRigMetrics,
   GroupSubagentStatus,
   ApprovalPolicy,
   Attachment,
@@ -165,6 +166,9 @@ export const codingDeleteAgent = (
 
 export const codingPeerStatus = () =>
   invoke<GroupSubagentStatus>("coding_peer_status");
+
+export const codingGroupRigMetrics = () =>
+  invoke<GroupRigMetrics[]>("coding_group_rig_metrics");
 
 export const codingSetUseGroupSubagents = (enabled: boolean) =>
   invoke("coding_set_use_group_subagents", { enabled });

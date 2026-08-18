@@ -10,6 +10,19 @@ export type GpuStat = {
   powerWatts: number | null;
 };
 
+/** Latest utilization for one rig in this rig's group (mirror lib.rs
+ * GroupRigMetricsView / the list_group_rig_metrics RPC). `gpus` are the raw
+ * rig_metrics jsonb objects — a superset of GpuStat, only some fields used. */
+export type GroupRigMetrics = {
+  rigId: string;
+  name: string | null;
+  /** True for the local rig itself (resolved server-side). */
+  isSelf: boolean;
+  lastSeen: string | null;
+  cpuUtilizationPct: number | null;
+  gpus: GpuStat[];
+};
+
 export type DiskStat = {
   id: string;
   name: string;

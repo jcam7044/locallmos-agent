@@ -1383,6 +1383,46 @@ async fn coding_peer_status(
     Ok(GroupSubagentStatus { enabled, serving, peers })
 }
 
+/// One rig's latest utilization for the Code-tab group sidebar. `gpus` is the
+/// raw jsonb array from `rig_metrics` (objects already camelCase → frontend
+/// `GpuStat`).
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GroupRigMetricsView {
+    rig_id: String,
+    name: Option<String>,
+    is_self: bool,
+    last_seen: Option<String>,
+    cpu_utilization_pct: Option<f32>,
+    gpus: Value,
+}
+
+/// Latest CPU + per-GPU utilization for every rig in this rig's group (incl.
+/// itself), polled by the Code-tab sidebar. Empty when this rig is in no group.
+#[tauri::command]
+async fn coding_group_rig_metrics(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<GroupRigMetricsView>, String> {
+    let state = state.inner().clone();
+    let token = worker::ensure_token(&state).await.map_err(|e| e.to_string())?;
+    let rows = state
+        .supabase
+        .list_group_rig_metrics(&token)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(rows
+        .into_iter()
+        .map(|r| GroupRigMetricsView {
+            rig_id: r.rig_id,
+            name: r.name,
+            is_self: r.is_self,
+            last_seen: r.last_seen,
+            cpu_utilization_pct: r.cpu_utilization_pct,
+            gpus: r.gpus,
+        })
+        .collect())
+}
+
 /// Toggle whether this rig offloads its coding sub-agents to serving group
 /// peers. Consumer-side preference, stored locally (serving is owner-set in the
 /// web dashboard). Off by default — sub-agent prompts carry workspace code.
@@ -1803,6 +1843,7 @@ fn run_gui() {
             coding_save_agent,
             coding_delete_agent,
             coding_peer_status,
+            coding_group_rig_metrics,
             coding_set_use_group_subagents,
             coding_preview_status,
             coding_preview_focus,

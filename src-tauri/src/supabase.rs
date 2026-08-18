@@ -90,6 +90,26 @@ pub struct InferenceJobResult {
     pub error: Option<String>,
 }
 
+/// Latest CPU + per-GPU utilization for one rig in the caller's group, from the
+/// `list_group_rig_metrics` RPC (0052). `gpus` is passed through as raw JSON —
+/// its objects are already camelCase (see `monitor::GpuStat`) so they map
+/// straight onto the frontend `GpuStat` type.
+#[derive(Deserialize, Clone, Debug)]
+pub struct GroupRigMetricsRow {
+    pub rig_id: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    /// True for the calling rig itself (resolved server-side from the token).
+    #[serde(default)]
+    pub is_self: bool,
+    #[serde(default)]
+    pub last_seen: Option<String>,
+    #[serde(default)]
+    pub cpu_utilization_pct: Option<f32>,
+    #[serde(default)]
+    pub gpus: Value,
+}
+
 /// One web-authored MCP server the rig should run (0048), as returned by the
 /// `mcp-desired` function. `secrets` are decrypted values (e.g. an access token)
 /// merged into the catalog entry's inputs at reconcile time. `version` bumps on
@@ -599,6 +619,27 @@ impl Supabase {
             let s = resp.status();
             let b = resp.text().await.unwrap_or_default();
             return Err(anyhow!("list_inference_peers failed: HTTP {s}: {b}"));
+        }
+        Ok(resp.json().await.unwrap_or_default())
+    }
+
+    /// Latest CPU + per-GPU metrics for every rig in this rig's group (including
+    /// itself), for the Code-tab utilization sidebar. SECURITY DEFINER RPC
+    /// because a device JWT cannot read peer rigs' `rig_metrics` under RLS.
+    pub async fn list_group_rig_metrics(&self, token: &str) -> Result<Vec<GroupRigMetricsRow>> {
+        let resp = self
+            .auth(
+                self.http
+                    .post(format!("{}/rpc/list_group_rig_metrics", self.rest)),
+                token,
+            )
+            .json(&json!({}))
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            let s = resp.status();
+            let b = resp.text().await.unwrap_or_default();
+            return Err(anyhow!("list_group_rig_metrics failed: HTTP {s}: {b}"));
         }
         Ok(resp.json().await.unwrap_or_default())
     }

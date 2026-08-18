@@ -23,6 +23,7 @@ import {
 import type { ApprovalPolicy, CodingContextInfo, CodingEvent, CodingPreviewStatus, CodingSessionMeta, CodingStoredMessage, LocalModel, ReasoningEffort } from "../types";
 import { Markdown } from "../chat/Markdown";
 import { AgentsPanel } from "./AgentsPanel";
+import { GroupResources } from "./GroupResources";
 import { Composer, MODES } from "./Composer";
 import { C } from "./tokens";
 import { useCodingStream, type CodingLive, type CodingTrace } from "./useCodingStream";
@@ -48,6 +49,7 @@ export function CodingView({ models }: { models: LocalModel[] }) {
   const [contextInfo, setContextInfo] = useState<CodingContextInfo | null>(null);
   const [compacting, setCompacting] = useState(false);
   const [agentsOpen, setAgentsOpen] = useState(false);
+  const [resourcesOpen, setResourcesOpen] = useState(true);
   const requestIdRef = useRef<string | null>(null);
   const { live, reset } = useCodingStream(activeId);
 
@@ -406,6 +408,7 @@ export function CodingView({ models }: { models: LocalModel[] }) {
           </>
         )}
       </main>
+      <GroupResources open={resourcesOpen} onToggle={setResourcesOpen} />
       {agentsOpen && activeId !== null && (
         <AgentsPanel
           workspaceRoot={sessions.find((s) => s.id === activeId)?.workspaceRoot ?? ""}

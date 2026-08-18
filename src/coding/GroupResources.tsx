@@ -105,7 +105,7 @@ function RigCard({ rig, isSelf }: { rig: GroupRigMetrics; isSelf: boolean }) {
       {gpus.map((g) => (
         <div key={g.id ?? g.index} style={{ marginTop: 6 }}>
           <Meter
-            label={`GPU ${g.index}`}
+            label={g.name ?? `GPU ${g.index}`}
             pct={online ? g.utilizationPct : null}
             color={GPU_COLOR}
           />
@@ -122,9 +122,14 @@ function Meter({ label, pct, color }: { label: string; pct: number | null; color
   const value = pct == null ? null : Math.max(0, Math.min(100, Math.round(pct)));
   return (
     <div>
-      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, color: C.muted, marginBottom: 2 }}>
-        <span>{label}</span>
-        <span>{value == null ? "—" : `${value}%`}</span>
+      <div style={{ display: "flex", justifyContent: "space-between", gap: 6, fontSize: 11, color: C.muted, marginBottom: 2 }}>
+        <span
+          title={label}
+          style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0 }}
+        >
+          {label}
+        </span>
+        <span style={{ flexShrink: 0 }}>{value == null ? "—" : `${value}%`}</span>
       </div>
       <div style={trackStyle}>
         <div style={{ height: "100%", borderRadius: "inherit", width: `${value ?? 0}%`, background: color, transition: "width 0.4s ease" }} />

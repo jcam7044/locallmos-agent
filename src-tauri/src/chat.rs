@@ -719,6 +719,16 @@ async fn write_back_to_disk(state: &Arc<AppState>, token: &str, conversation_id:
         }
     };
     let Some(rows) = value.as_array() else { return };
+    let retained_context_notes: std::collections::HashMap<String, Option<String>> = {
+        let _guard = state.chat_lock.lock().await;
+        crate::coding_store::load(local_session_id)
+            .map(|session| {
+                session.messages.into_iter()
+                    .map(|message| (message.id, message.context_notes))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
     let messages: Vec<crate::coding_store::CodingStoredMessage> = rows
         .iter()
         .filter_map(|r| {
@@ -735,8 +745,10 @@ async fn write_back_to_disk(state: &Arc<AppState>, token: &str, conversation_id:
                 .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
                 .map(|d| d.with_timezone(&chrono::Utc))
                 .unwrap_or_else(chrono::Utc::now);
+            let id = r.get("id").and_then(Value::as_str).unwrap_or_default().to_string();
             Some(crate::coding_store::CodingStoredMessage {
-                id: r.get("id").and_then(Value::as_str).unwrap_or_default().to_string(),
+                context_notes: retained_context_notes.get(&id).cloned().flatten(),
+                id,
                 role: role.to_string(),
                 content: r.get("content").and_then(Value::as_str).unwrap_or_default().to_string(),
                 thinking: r.get("thinking").and_then(Value::as_str).map(str::to_string),

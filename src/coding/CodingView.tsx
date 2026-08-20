@@ -689,7 +689,7 @@ function withAttachments(text: string, attachments: string[]): string {
 }
 
 function optimisticUser(content: string): CodingStoredMessage {
-  return { role: "user", content, thinking: null, toolActivity: null, cancelled: false, createdAt: new Date().toISOString() };
+  return { role: "user", content, thinking: null, toolActivity: null, contextNotes: null, cancelled: false, createdAt: new Date().toISOString() };
 }
 
 function folderName(path: string): string {

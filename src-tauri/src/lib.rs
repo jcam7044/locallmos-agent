@@ -932,6 +932,32 @@ async fn chat_context(
     local_chat::context_info(state.inner(), &session_id).await
 }
 
+#[tauri::command]
+async fn chat_compact(
+    app: tauri::AppHandle,
+    state: State<'_, Arc<AppState>>,
+    session_id: String,
+) -> Result<local_chat::ChatContextInfo, String> {
+    local_chat::compact(&app, state.inner(), &session_id).await
+}
+
+#[tauri::command]
+async fn chat_set_context_settings(
+    app: tauri::AppHandle,
+    state: State<'_, Arc<AppState>>,
+    session_id: String,
+    auto_compact: bool,
+    auto_threshold: u8,
+) -> Result<local_chat::ChatContextInfo, String> {
+    local_chat::set_context_settings(
+        &app,
+        state.inner(),
+        &session_id,
+        auto_compact,
+        auto_threshold,
+    ).await
+}
+
 // --- Persistent chat sessions (local, on-disk) ------------------------------
 
 #[tauri::command]
@@ -1807,6 +1833,8 @@ fn run_gui() {
             local_chat_send,
             local_chat_cancel,
             chat_context,
+            chat_compact,
+            chat_set_context_settings,
             agent_check_update,
             llamacpp_check_update,
             llamacpp_install_update,

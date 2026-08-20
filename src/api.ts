@@ -83,6 +83,19 @@ export const localChatCancel = (requestId: string) =>
 export const chatGetContext = (sessionId: string) =>
   invoke<ChatContextInfo>("chat_context", { sessionId });
 
+export const chatCompact = (sessionId: string) =>
+  invoke<ChatContextInfo>("chat_compact", { sessionId });
+
+export const chatSetContextSettings = (
+  sessionId: string,
+  autoCompact: boolean,
+  autoThreshold: number,
+) => invoke<ChatContextInfo>("chat_set_context_settings", {
+  sessionId,
+  autoCompact,
+  autoThreshold,
+});
+
 export const readDroppedFile = (path: string) =>
   invoke<Attachment>("read_dropped_file", { path });
 

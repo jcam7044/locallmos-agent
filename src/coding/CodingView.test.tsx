@@ -106,7 +106,7 @@ describe("coding turn rendering", () => {
   });
 
   it("hides legacy empty assistant records while preserving user messages", () => {
-    const base = { thinking: null, toolActivity: null, cancelled: false, createdAt: "2026-01-01T00:00:00Z" };
+    const base = { thinking: null, toolActivity: null, contextNotes: null, cancelled: false, createdAt: "2026-01-01T00:00:00Z" };
     const visible = visibleCodingMessages([
       { ...base, role: "assistant", content: "" },
       { ...base, role: "assistant", content: "   " },

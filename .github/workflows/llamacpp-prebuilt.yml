@@ -25,8 +25,8 @@ name: llama.cpp Linux prebuilts
 on:
   schedule:
     # llama.cpp commonly publishes several builds per day. Promote the newest
-    # complete upstream build once per day instead of rebuilding every tag.
-    - cron: "17 8 * * *"
+    # complete upstream build once a week (Mondays 08:17 UTC) rather than daily.
+    - cron: "17 8 * * 1"
   push:
     tags:
       - "b[0-9]*" # llama.cpp build tags, e.g. b10068 (the [0-9] avoids matching `beta` etc.)
@@ -66,11 +66,13 @@ jobs:
             workflow_dispatch) TAG="$INPUT_TAG" ;;
             push) TAG="$PUSH_TAG" ;;
             schedule)
-              TAG="$(curl -fsSL \
-                -H 'Accept: application/vnd.github+json' \
-                -H 'User-Agent: locallmos-llamacpp-builder' \
-                https://api.github.com/repos/ggml-org/llama.cpp/releases/latest \
-                | jq -r '.tag_name')"
+              # Upstream now marks a semver release (e.g. v0.2.0) as "Latest" and
+              # flags every rolling build (bNNNNN) as a prerelease, so
+              # /releases/latest no longer returns a b-tag. List releases and take
+              # the newest non-draft bNNNNN instead (releases come newest-first).
+              TAG="$(gh api 'repos/ggml-org/llama.cpp/releases?per_page=50' \
+                --jq 'map(select(.draft == false and (.tag_name | test("^b[0-9]+$"))))
+                      | first | .tag_name // ""')"
               ;;
             *) echo "unsupported event: $EVENT_NAME" >&2; exit 2 ;;
           esac
@@ -235,6 +237,9 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: cuda-${{ matrix.variant }}
+          # Intermediate staging only — publish downloads these in the same run.
+          # Short retention so per-run build artifacts don't pile up for 90 days.
+          retention-days: 2
           path: |
             dist/*.tar.gz
             dist/*.tar.gz.sha256
@@ -273,6 +278,8 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: mirror-upstream
+          # Intermediate staging only — publish downloads these in the same run.
+          retention-days: 2
           path: |
             dist/*.tar.gz
             dist/*.tar.gz.sha256
@@ -458,3 +465,47 @@ jobs:
           # The stable pointer is updated last, after every referenced asset and
           # the immutable versioned catalog are available.
           gh release upload llamacpp-stable llamacpp-release.json llamacpp-release.json.minisig --clobber
+
+  # Every published build creates a bNNNNN release + git tag; left alone they
+  # accumulate forever. Keep only the newest $KEEP prebuilt releases and delete
+  # the rest (with their tags). Never touches llamacpp-stable or any non-b tag,
+  # and always keeps two referenced tags regardless of age: the blessed default
+  # pinned in service/LLAMACPP_VERSION (what the installers download by default)
+  # and whatever tag the desktop stable channel currently points at. Deleting
+  # either would 404 the CUDA download for installs that resolve to it.
+  cleanup:
+    needs: publish
+    if: ${{ always() && needs.publish.result == 'success' }}
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      KEEP: "5"
+    steps:
+      - uses: actions/checkout@v4 # for service/LLAMACPP_VERSION (the pinned tag)
+      - name: Prune old llama.cpp prebuilt releases
+        run: |
+          set -euo pipefail
+          # The blessed tag the installers pin by default (first non-comment line).
+          pinned="$(awk 'NF && $1 !~ /^#/ {gsub(/[ \t\r]/,"",$0); print; exit}' \
+            service/LLAMACPP_VERSION 2>/dev/null || true)"
+          # The tag the desktop stable channel currently resolves to.
+          stable_tag="$(curl -fsSL \
+            "https://github.com/$GH_REPO/releases/download/llamacpp-stable/llamacpp-release.json" \
+            | jq -r '.tag // empty' 2>/dev/null || true)"
+          echo "Protected tags: pinned='$pinned' stable='$stable_tag'"
+
+          mapfile -t old < <(
+            gh release list --limit 200 --json tagName,createdAt \
+              --jq 'map(select(.tagName | test("^b[0-9]+$")))
+                    | sort_by(.createdAt) | reverse
+                    | .[(env.KEEP | tonumber):] | .[].tagName'
+          )
+          for tag in "${old[@]}"; do
+            if [[ "$tag" == "$pinned" || "$tag" == "$stable_tag" ]]; then
+              echo "Keeping $tag (still referenced by installers/stable channel)"
+              continue
+            fi
+            echo "Deleting old prebuilt release + tag: $tag"
+            gh release delete "$tag" --cleanup-tag --yes
+          done

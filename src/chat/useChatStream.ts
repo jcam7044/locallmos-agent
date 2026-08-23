@@ -36,6 +36,8 @@ export function useChatStream() {
             return { ...s, toolStatus: `Running ${p.name}…` };
           case "tool_result":
             return { ...s, toolStatus: `${p.name}: ${p.summary}` };
+          default:
+            return s;
         }
       });
     }).then((un) => {

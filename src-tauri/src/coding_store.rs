@@ -118,6 +118,9 @@ pub struct CodingStoredMessage {
     /// Persisted record of tool runs this turn (summaries), for re-render.
     #[serde(default)]
     pub tool_activity: Option<Value>,
+    /// Concise model-visible record of tool findings retained across turns.
+    #[serde(default)]
+    pub context_notes: Option<String>,
     #[serde(default)]
     pub cancelled: bool,
     pub created_at: DateTime<Utc>,
@@ -131,6 +134,7 @@ impl CodingStoredMessage {
             content,
             thinking: None,
             tool_activity: None,
+            context_notes: None,
             cancelled: false,
             created_at: Utc::now(),
         }

@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
-import type { UnlistenFn } from "@tauri-apps/api/event";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import {
+  chatCompact,
   chatCreateSession,
   chatDeleteSession,
   chatGetSession,
@@ -9,6 +10,7 @@ import {
   chatRenameSession,
   chatUpdateSettings,
   chatGetContext,
+  chatSetContextSettings,
   localChatCancel,
   localChatSend,
   readDroppedFile,
@@ -19,6 +21,7 @@ import {
   type Attachment,
   type ChatSession,
   type ChatContextInfo,
+  type LocalChatEvent,
   type LocalModel,
   type SessionMeta,
   type SessionSettings,
@@ -48,6 +51,7 @@ export function ChatView({
   const [error, setError] = useState<string | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [contextInfo, setContextInfo] = useState<ChatContextInfo | null>(null);
+  const [compacting, setCompacting] = useState(false);
   const { stream, begin, end } = useChatStream();
   const activeRequest = useRef<string | null>(null);
   const saveTimer = useRef<number | undefined>(undefined);
@@ -153,6 +157,44 @@ export function ChatView({
     };
   }, [active?.id, active?.model, active?.settings, active?.messages.length]);
 
+  useEffect(() => {
+    let unlisten: UnlistenFn | undefined;
+    let disposed = false;
+    void listen<LocalChatEvent>("local-chat", ({ payload }) => {
+      if (disposed || payload.sessionId !== active?.id) return;
+      if (payload.type === "context_updated") setContextInfo(payload.context);
+      if (payload.type === "compaction_started") setCompacting(true);
+      if (payload.type === "compaction_completed") setCompacting(false);
+      if (payload.type === "compaction_failed") {
+        setCompacting(false);
+        setError(payload.message);
+      }
+    }).then((stop) => { unlisten = stop; });
+    return () => { disposed = true; unlisten?.(); };
+  }, [active?.id]);
+
+  const compact = async () => {
+    if (!active || streaming || compacting) return;
+    setCompacting(true);
+    setError(null);
+    try {
+      setContextInfo(await chatCompact(active.id));
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setCompacting(false);
+    }
+  };
+
+  const changeContextSettings = async (autoCompact: boolean, autoThreshold: number) => {
+    if (!active) return;
+    try {
+      setContextInfo(await chatSetContextSettings(active.id, autoCompact, autoThreshold));
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
   // --- Attachments -----------------------------------------------------------
   const [pending, setPending] = useState<Attachment[]>([]);
 
@@ -224,7 +266,11 @@ export function ChatView({
   };
 
   const send = async (text: string) => {
-    if (streaming) return;
+    if (streaming || compacting) return;
+    if (text.trim().toLowerCase() === "/compact" && active) {
+      await compact();
+      return;
+    }
     let session = active;
     if (!session) {
       // First message with no session yet: create one on the fly.
@@ -360,6 +406,9 @@ export function ChatView({
           onAddFiles={addFiles}
           onRemoveAttachment={(i) => setPending((p) => p.filter((_, idx) => idx !== i))}
           contextInfo={contextInfo}
+          compacting={compacting}
+          onCompact={() => void compact()}
+          onContextSettings={(auto, threshold) => void changeContextSettings(auto, threshold)}
         />
         {error && <p style={{ color: "#f87171", fontSize: 12, marginTop: 8 }}>{error}</p>}
       </div>

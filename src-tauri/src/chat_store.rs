@@ -21,6 +21,40 @@ pub struct ChatSession {
     pub settings: SessionSettings,
     #[serde(default)]
     pub messages: Vec<StoredMessage>,
+    /// Full transcript storage is independent from the compact model context.
+    #[serde(default)]
+    pub context_state: ChatContextState,
+}
+
+fn default_auto_compact() -> bool { true }
+fn default_auto_threshold() -> u8 { 80 }
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatContextState {
+    #[serde(default)]
+    pub checkpoint: Option<String>,
+    /// Number of leading stored messages represented by `checkpoint`.
+    #[serde(default)]
+    pub summarized_through_message_count: usize,
+    #[serde(default = "default_auto_compact")]
+    pub auto_compact: bool,
+    #[serde(default = "default_auto_threshold")]
+    pub auto_threshold: u8,
+    #[serde(default)]
+    pub last_compacted_at: Option<DateTime<Utc>>,
+}
+
+impl Default for ChatContextState {
+    fn default() -> Self {
+        Self {
+            checkpoint: None,
+            summarized_through_message_count: 0,
+            auto_compact: default_auto_compact(),
+            auto_threshold: default_auto_threshold(),
+            last_compacted_at: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -75,6 +109,9 @@ pub struct StoredMessage {
     #[serde(default)]
     pub tool_limit_reached: Option<u16>,
     pub tool_activity: Option<Value>,
+    /// Concise model-visible record of tool findings retained across turns.
+    #[serde(default)]
+    pub context_notes: Option<String>,
     #[serde(default)]
     pub cancelled: bool,
     pub created_at: DateTime<Utc>,
@@ -92,6 +129,7 @@ impl StoredMessage {
             generation_metrics: None,
             tool_limit_reached: None,
             tool_activity: None,
+            context_notes: None,
             cancelled: false,
             created_at: Utc::now(),
         }
@@ -135,6 +173,7 @@ impl ChatSession {
             model,
             settings: SessionSettings::default(),
             messages: Vec::new(),
+            context_state: ChatContextState::default(),
         }
     }
 

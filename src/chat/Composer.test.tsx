@@ -28,9 +28,16 @@ describe("chat context indicator", () => {
           percent: 9,
           level: "normal",
           countExact: false,
+          autoCompact: true,
+          autoThreshold: 80,
+          compacted: false,
+          status: "idle",
           mcpTools: 33,
           mcpSchemaTokens: 6_400,
         }}
+        compacting={false}
+        onCompact={() => undefined}
+        onContextSettings={() => undefined}
       />,
     );
 

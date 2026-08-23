@@ -267,6 +267,7 @@ export type StoredMessage = {
   generationMetrics: GenerationMetrics | null;
   toolLimitReached: number | null;
   toolActivity: unknown;
+  contextNotes: string | null;
   cancelled: boolean;
   createdAt: string;
 };
@@ -288,6 +289,15 @@ export type ChatSession = {
   model: string;
   settings: SessionSettings;
   messages: StoredMessage[];
+  contextState: ChatContextState;
+};
+
+export type ChatContextState = {
+  checkpoint: string | null;
+  summarizedThroughMessageCount: number;
+  autoCompact: boolean;
+  autoThreshold: number;
+  lastCompactedAt: string | null;
 };
 
 /** Streamed delta events emitted by the backend on the "local-chat" event. */
@@ -296,6 +306,10 @@ export type LocalChatEvent = { requestId: string; sessionId: string } & (
   | { type: "thinking"; delta: string }
   | { type: "tool"; name: string; arguments: string }
   | { type: "tool_result"; name: string; summary: string }
+  | { type: "context_updated"; context: ChatContextInfo }
+  | { type: "compaction_started"; reason: "manual" | "auto" }
+  | { type: "compaction_completed"; reason: "manual" | "auto" }
+  | { type: "compaction_failed"; message: string }
 );
 
 // --- Coding sessions (cloud-backed; mirror supabase 0036 + shared chat.ts) --
@@ -322,6 +336,7 @@ export type CodingStoredMessage = {
   content: string;
   thinking: string | null;
   toolActivity: unknown;
+  contextNotes: string | null;
   cancelled: boolean;
   createdAt: string;
 };
@@ -489,6 +504,10 @@ export type ChatContextInfo = {
   percent: number;
   level: "normal" | "orange" | "red";
   countExact: boolean;
+  autoCompact: boolean;
+  autoThreshold: number;
+  compacted: boolean;
+  status: "idle" | "compacting";
   mcpTools: number;
   mcpSchemaTokens: number;
 };
@@ -542,6 +561,7 @@ export function newUserMessage(content: string, attachments: Attachment[] = []):
     generationMetrics: null,
     toolLimitReached: null,
     toolActivity: null,
+    contextNotes: null,
     cancelled: false,
     createdAt: new Date().toISOString(),
   };

@@ -26,6 +26,9 @@ export function Composer({
   onAddFiles,
   onRemoveAttachment,
   contextInfo,
+  compacting,
+  onCompact,
+  onContextSettings,
 }: {
   disabled: boolean;
   streaming: boolean;
@@ -45,6 +48,9 @@ export function Composer({
   onAddFiles: (files: FileList) => void;
   onRemoveAttachment: (index: number) => void;
   contextInfo: ChatContextInfo | null;
+  compacting: boolean;
+  onCompact: () => void;
+  onContextSettings: (autoCompact: boolean, autoThreshold: number) => void;
 }) {
   const [input, setInput] = useState("");
   const [contextOpen, setContextOpen] = useState(false);
@@ -138,6 +144,11 @@ export function Composer({
               <div style={{ marginTop: 4, color: "#64748b" }}>
                 {formatTokens(contextInfo.reserveTokens)} reserved for generation and tool results
               </div>
+              {contextInfo.compacted && (
+                <div style={{ marginTop: 4, color: "#64748b" }}>
+                  Older turns are represented by a checkpoint.
+                </div>
+              )}
               {contextInfo.mcpTools > 0 && (
                 <div style={{ marginTop: 8, paddingTop: 8, borderTop: "1px solid #1f2937" }}>
                   MCP definitions: {contextInfo.mcpTools} tools · approximately{" "}
@@ -152,6 +163,33 @@ export function Composer({
                   No trusted read-only MCP tools are currently available in Chat.
                 </div>
               )}
+              <button
+                type="button"
+                disabled={compacting || streaming}
+                onClick={() => { setContextOpen(false); onCompact(); }}
+                style={{ ...secondaryButton, width: "100%", marginTop: 8, padding: "6px 8px" }}
+              >
+                {compacting ? "Compacting…" : "Compact now"}
+              </button>
+              <label style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 8 }}>
+                <span>Auto compact</span>
+                <input
+                  type="checkbox"
+                  checked={contextInfo.autoCompact}
+                  onChange={(event) => onContextSettings(event.target.checked, contextInfo.autoThreshold)}
+                />
+              </label>
+              <label style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 6 }}>
+                <span>Threshold</span>
+                <select
+                  value={contextInfo.autoThreshold}
+                  disabled={!contextInfo.autoCompact}
+                  onChange={(event) => onContextSettings(contextInfo.autoCompact, Number(event.target.value))}
+                  style={{ ...inputStyle, width: 82, padding: "4px 6px" }}
+                >
+                  {[70, 75, 80, 85, 90].map((value) => <option key={value} value={value}>{value}%</option>)}
+                </select>
+              </label>
             </div>
           )}
         </div>

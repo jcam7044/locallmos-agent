@@ -45,14 +45,17 @@ _llamacpp_tag_ge() {
   fi
 }
 
-# Resolve the release tag ("latest" → newest tag via the GitHub API; else as-is).
+# Resolve the release tag ("latest" → newest bNNNNN build via the GitHub API;
+# else as-is). Upstream now marks a semver release (e.g. v0.2.0) as "Latest" and
+# tags rolling builds (bNNNNN) as prereleases, so /releases/latest returns a
+# non-b tag. List releases (newest-first) and pick the newest bNNNNN instead.
 resolve_llamacpp_tag() {
   if [ "$LLAMACPP_VERSION" != "latest" ]; then
     printf '%s\n' "$LLAMACPP_VERSION"
     return
   fi
-  curl -fsSL "https://api.github.com/repos/$LLAMACPP_REPO/releases/latest" 2>/dev/null \
-    | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n1
+  curl -fsSL "https://api.github.com/repos/$LLAMACPP_REPO/releases?per_page=50" 2>/dev/null \
+    | sed -n 's/.*"tag_name": *"\(b[0-9][0-9]*\)".*/\1/p' | head -n1
 }
 
 # ---- hardware detection ----------------------------------------------------

@@ -132,10 +132,16 @@ function Get-UserConfigJson {
 
 function Resolve-LlamaCppTag([string]$Version, [string]$Repo) {
   if ($Version -ne "latest") { return $Version }
+  # Upstream now marks a semver release (e.g. v0.2.0) as "Latest" and tags rolling
+  # builds (bNNNNN) as prereleases, so /releases/latest returns a non-b tag. List
+  # releases (newest-first) and pick the newest bNNNNN instead.
   try {
-    $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/latest" `
+    $rels = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases?per_page=50" `
       -Headers @{ "User-Agent" = "locallmos-installer" }
-    return $rel.tag_name
+    foreach ($rel in $rels) {
+      if ($rel.tag_name -match '^b[0-9]+$') { return $rel.tag_name }
+    }
+    return ""
   } catch { return "" }
 }
 

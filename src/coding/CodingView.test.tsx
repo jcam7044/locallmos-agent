@@ -105,6 +105,111 @@ describe("coding turn rendering", () => {
     expect(html).toContain("map the auth flow");
   });
 
+  it("shows a working indicator while the model loads", () => {
+    const html = renderToStaticMarkup(
+      <LiveTurn
+        live={{
+          messageId: "message-1",
+          text: "",
+          thinking: "",
+          status: "loading",
+          loadingModel: "coder",
+          trace: [],
+          approvals: [],
+        }}
+        onDecide={() => undefined}
+      />,
+    );
+    expect(html).toContain("Loading model coder…");
+  });
+
+  it("names the running tool in the working indicator", () => {
+    const html = renderToStaticMarkup(
+      <LiveTurn
+        live={{
+          messageId: "message-1",
+          text: "",
+          thinking: "",
+          status: "streaming",
+          trace: [{ kind: "tool", name: "read_file" }],
+          approvals: [],
+        }}
+        onDecide={() => undefined}
+      />,
+    );
+    expect(html).toContain("Running read_file…");
+  });
+
+  it("shows a generic working cue while streaming a response with no pending step", () => {
+    const html = renderToStaticMarkup(
+      <LiveTurn
+        live={{
+          messageId: "message-1",
+          text: "Here is what I found",
+          thinking: "",
+          status: "streaming",
+          trace: [],
+          approvals: [],
+        }}
+        onDecide={() => undefined}
+      />,
+    );
+    expect(html).toContain("Working…");
+  });
+
+  it("renders reasoning in a collapsible thinking block", () => {
+    const html = renderToStaticMarkup(
+      <LiveTurn
+        live={{
+          messageId: "message-1",
+          text: "",
+          thinking: "Let me check the router config first.",
+          status: "streaming",
+          trace: [],
+          approvals: [],
+        }}
+        onDecide={() => undefined}
+      />,
+    );
+    expect(html).toContain("Thinking");
+    expect(html).toContain("Let me check the router config first.");
+  });
+
+  it("shows an estimated token count on the working line", () => {
+    const html = renderToStaticMarkup(
+      <LiveTurn
+        live={{
+          messageId: "message-1",
+          text: "x".repeat(4000),
+          thinking: "",
+          status: "streaming",
+          trace: [],
+          approvals: [],
+        }}
+        onDecide={() => undefined}
+      />,
+    );
+    expect(html).toContain("~1.0k tokens");
+  });
+
+  it("drops the working indicator once the turn pauses for approval", () => {
+    const html = renderToStaticMarkup(
+      <LiveTurn
+        live={{
+          messageId: "message-1",
+          text: "",
+          thinking: "",
+          status: "streaming",
+          trace: [{ kind: "tool", name: "write_file" }],
+          approvals: [{ invocationId: "approval-1", name: "write_file", preview: "+ new file" }],
+        }}
+        onDecide={() => undefined}
+      />,
+    );
+    expect(html).not.toContain("Working…");
+    expect(html).not.toContain("Running write_file…");
+  });
+
   it("hides legacy empty assistant records while preserving user messages", () => {
     const base = { thinking: null, toolActivity: null, contextNotes: null, cancelled: false, createdAt: "2026-01-01T00:00:00Z" };
     const visible = visibleCodingMessages([

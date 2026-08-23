@@ -22,6 +22,8 @@ import {
 } from "../api";
 import type { ApprovalPolicy, CodingContextInfo, CodingEvent, CodingPreviewStatus, CodingSessionMeta, CodingStoredMessage, LocalModel, ReasoningEffort } from "../types";
 import { Markdown } from "../chat/Markdown";
+import { ThinkingBlock } from "../chat/ThinkingBlock";
+import { formatTokens } from "../components/ContextIndicator";
 import { AgentsPanel } from "./AgentsPanel";
 import { GroupResources } from "./GroupResources";
 import { Composer, MODES } from "./Composer";
@@ -376,7 +378,7 @@ export function CodingView({ models }: { models: LocalModel[] }) {
               style={{ flex: 1, minHeight: 0, overflowY: "auto", display: "flex", flexDirection: "column", gap: 12, paddingRight: 4 }}
             >
               {visibleCodingMessages(messages).map((m, i) => (
-                <MessageBubble key={i} role={m.role} content={m.content} />
+                <MessageBubble key={i} role={m.role} content={m.content} thinking={m.thinking} />
               ))}
               {live.status !== "idle" && <LiveTurn live={live} onDecide={decide} />}
             </div>
@@ -582,14 +584,24 @@ function SessionHeader({
 }
 
 export function LiveTurn({ live, onDecide }: { live: CodingLive; onDecide: (id: string, approved: boolean) => void }) {
+  // The agent is actively working whenever the turn is loading or streaming and
+  // isn't paused on an approval. Reuses the sub-agent "running…" pattern so the
+  // user always has an "it's alive" cue, even in the gaps between tool calls or
+  // while the model is thinking before any text streams.
+  const working = (live.status === "loading" || live.status === "streaming") && live.approvals.length === 0;
+  // Time and tokens are not reported by the backend, so both are derived on the
+  // client: elapsed from a wall-clock timer, tokens estimated from the streamed
+  // characters (hence "~"). Reset per turn via the message id.
+  const elapsedMs = useElapsed(working, live.messageId);
+  const estTokens = Math.round((live.text.length + live.thinking.length) / 4);
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-      {live.status === "loading" && (
-        <div style={{ fontSize: 12, color: C.muted }}>Loading model {live.loadingModel}…</div>
-      )}
       {live.trace.map((t, i) => (
         <TraceItem key={i} trace={t} />
       ))}
+      {live.thinking && (
+        <ThinkingBlock thinking={live.thinking} streaming={working} hasContent={!!live.text} />
+      )}
       {live.text && (
         <div style={bubble("assistant")}>
           <Markdown>{live.text}</Markdown>
@@ -609,9 +621,68 @@ export function LiveTurn({ live, onDecide }: { live: CodingLive; onDecide: (id: 
           </div>
         </div>
       ))}
+      {working && (
+        <div style={{ display: "inline-flex", alignItems: "center", gap: 8, fontSize: 12, color: C.muted }}>
+          <span style={spinner} />
+          <span>{activityLabel(live)}</span>
+          <span
+            style={{ color: "#64748b" }}
+            title={estTokens > 0 ? "Estimated from the streamed text" : undefined}
+          >
+            {[
+              elapsedMs > 0 && formatDuration(elapsedMs),
+              estTokens > 0 && `~${formatTokens(estTokens)} tokens`,
+            ]
+              .filter(Boolean)
+              .map((part, i) => (i === 0 ? `· ${part}` : ` · ${part}`))
+              .join("")}
+          </span>
+        </div>
+      )}
       {live.status === "error" && <div style={{ color: "#f87171", fontSize: 12 }}>{live.error}</div>}
     </div>
   );
+}
+
+/** A short, human label for what the agent is doing right now, so the working
+ * indicator reflects the current step rather than a generic "please wait". */
+function activityLabel(live: CodingLive): string {
+  if (live.status === "loading") {
+    return live.loadingModel ? `Loading model ${live.loadingModel}…` : "Loading model…";
+  }
+  const last = live.trace[live.trace.length - 1];
+  if (last?.kind === "tool" && last.summary === undefined) return `Running ${last.name}…`;
+  if (last?.kind === "command" && last.exitCode == null) return `Running ${last.command}…`;
+  if (last?.kind === "subagent" && last.summary === undefined) return `${last.agent} working…`;
+  if (live.thinking && !live.text) return "Thinking…";
+  return "Working…";
+}
+
+/** Live wall-clock elapsed time for the current turn, ticking each second while
+ * `active`. Resets whenever the turn (message id) changes. */
+function useElapsed(active: boolean, messageId: string | null): number {
+  const [elapsed, setElapsed] = useState(0);
+  const startRef = useRef<number | null>(null);
+  useEffect(() => {
+    if (!active) {
+      startRef.current = null;
+      return;
+    }
+    startRef.current = Date.now();
+    setElapsed(0);
+    const t = setInterval(() => {
+      if (startRef.current != null) setElapsed(Date.now() - startRef.current);
+    }, 1000);
+    return () => clearInterval(t);
+  }, [active, messageId]);
+  return elapsed;
+}
+
+/** Compact duration like "8s" or "1m 14s". */
+function formatDuration(ms: number): string {
+  const total = Math.floor(ms / 1000);
+  if (total < 60) return `${total}s`;
+  return `${Math.floor(total / 60)}m ${total % 60}s`;
 }
 
 /** Hide system records and legacy tool-only assistant records that have no
@@ -673,10 +744,20 @@ function TraceItem({ trace }: { trace: CodingTrace }) {
   );
 }
 
-function MessageBubble({ role, content }: { role: string; content: string }) {
+function MessageBubble({ role, content, thinking }: { role: string; content: string; thinking?: string | null }) {
+  if (role !== "assistant") {
+    return (
+      <div style={bubble(role)}>
+        <div style={{ whiteSpace: "pre-wrap" }}>{content}</div>
+      </div>
+    );
+  }
   return (
-    <div style={bubble(role)}>
-      {role === "assistant" ? <Markdown>{content}</Markdown> : <div style={{ whiteSpace: "pre-wrap" }}>{content}</div>}
+    <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-start", gap: 4, maxWidth: "85%" }}>
+      {thinking && <ThinkingBlock thinking={thinking} streaming={false} hasContent={content.trim().length > 0} />}
+      <div style={{ ...bubble(role), maxWidth: "100%" }}>
+        <Markdown>{content}</Markdown>
+      </div>
     </div>
   );
 }

@@ -4,10 +4,12 @@ import ReactMarkdown from "react-markdown";
 import rehypeRaw from "rehype-raw";
 import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
 import remarkGfm from "remark-gfm";
-import { deleteLocalModel, getModelLoadSettings, hubCancelDownload, hubGetAuthorAvatars, hubGetModel, hubListDownloads, hubSearchModels, hubStartDownload, loadModel, ollamaPullModel, saveModelLoadSettings, unloadModel } from "../api";
+import { deleteLocalModel, getModelLoadSettings, hubCancelDownload, hubGetAuthorAvatars, hubGetModel, hubListDownloads, hubSearchModels, hubStartDownload, listGpuDevices, loadModel, ollamaPullModel, saveModelLoadSettings, setGpuDefault, unloadModel } from "../api";
 import type {
   DownloadState,
   GgufVariant,
+  GpuDevice,
+  GpuDeviceList,
   HubModelDetail,
   HubModelSummary,
   LocalModel,
@@ -54,6 +56,7 @@ export function ModelsView({ local, onChanged }: { local: LocalStatus | null; on
   const [modelAction, setModelAction] = useState<{ id: string; type: LocalModelAction } | null>(null);
   const [settingsModel, setSettingsModel] = useState<LocalModel | null>(null);
   const [removalModel, setRemovalModel] = useState<LocalModel | null>(null);
+  const [gpuDefaults, setGpuDefaults] = useState(false);
   const request = useRef(0);
   const isOllama = local?.runtime.kind === "ollama";
 
@@ -219,6 +222,10 @@ export function ModelsView({ local, onChanged }: { local: LocalStatus | null; on
             <option value="trending">Trending</option><option value="downloads">Most downloaded</option><option value="likes">Most liked</option><option value="newest">Newest</option>
           </select>
         </>}
+        {mode === "device" && local?.runtime.kind === "llamacpp" && <>
+          <span className="hub-toolbar-spacer" />
+          <button className="hub-gpu-defaults-btn" onClick={() => setGpuDefaults(true)}>GPU defaults</button>
+        </>}
       </div>
 
       {error && <div className="hub-error"><span>{error}</span>{!isOllama && <button onClick={() => void loadPage()}>Retry</button>}</div>}
@@ -261,6 +268,7 @@ export function ModelsView({ local, onChanged }: { local: LocalStatus | null; on
         </div>
       ) : <OnDevice models={local?.models ?? []} runtimeKind={local?.runtime.kind} onSelect={selectDevice} action={modelAction} onLoad={load} onEject={eject} onRemove={remove} onSettings={local?.runtime.kind === "llamacpp" ? setSettingsModel : undefined} />}
       {settingsModel && <ModelLoadSettingsDialog model={settingsModel} onClose={() => setSettingsModel(null)} onChanged={onChanged} />}
+      {gpuDefaults && <GpuDefaultsDialog onClose={() => setGpuDefaults(false)} />}
       {removalModel && <ModelRemovalDialog model={removalModel} onCancel={() => setRemovalModel(null)} onConfirm={() => void confirmRemove()} />}
     </main>
   );
@@ -501,15 +509,20 @@ export const recommendedModelLoadSettings = (): ModelLoadSettings => ({
   cpuThreads: null,
   speculativeDecoding: "auto",
   maxToolCalls: null,
+  gpuDevices: null,
 });
 
 export function isRecommendedModelLoadSettings(settings: ModelLoadSettings) {
   return settings.contextSize == null && settings.kvCacheType === "auto" &&
     settings.gpuOffload === "auto" && settings.flashAttention === "auto" &&
-    settings.cpuThreads == null && settings.speculativeDecoding === "auto" && settings.maxToolCalls == null;
+    settings.cpuThreads == null && settings.speculativeDecoding === "auto" &&
+    settings.maxToolCalls == null && settings.gpuDevices == null;
 }
 
 export function modelLoadSettingsError(settings: ModelLoadSettings): string | null {
+  if (settings.gpuDevices != null && settings.gpuDevices.length === 0) {
+    return "Select at least one GPU, or switch back to the rig default.";
+  }
   if (settings.contextSize != null && (!Number.isInteger(settings.contextSize) || settings.contextSize < 512 || settings.contextSize > 1_048_576)) {
     return "Context size must be a whole number between 512 and 1,048,576 tokens.";
   }
@@ -522,19 +535,100 @@ export function modelLoadSettingsError(settings: ModelLoadSettings): string | nu
   return null;
 }
 
+/**
+ * Per-device GPU on/off toggles shared by the per-model settings dialog and the
+ * rig-default editor. `value === null` means "inherit" (rig default for a model,
+ * automatic selection for the rig default itself); a non-null array is an
+ * explicit device-token selection. Toggling any switch produces an explicit,
+ * device-ordered selection (leaving inherit mode), and never yields an empty set.
+ */
+function GpuSelector({ devices, value, onChange, inheritLabel, inheritHint, effectiveWhenInherited }: {
+  devices: GpuDevice[];
+  value: string[] | null;
+  onChange: (value: string[] | null) => void;
+  inheritLabel: string;
+  inheritHint: string;
+  effectiveWhenInherited: string[] | null;
+}) {
+  if (devices.length === 0) {
+    return <p className="hub-gpu-empty">Automatic — no selectable GPUs were detected for this runtime.</p>;
+  }
+  const allTokens = devices.map((d) => d.token);
+  const inherited = value == null;
+  const shown = value ?? effectiveWhenInherited ?? allTokens;
+  const enabled = new Set(shown);
+  const toggle = (token: string) => {
+    const next = enabled.has(token) ? shown.filter((t) => t !== token) : [...shown, token];
+    if (next.length === 0) return; // keep at least one GPU selected
+    onChange(allTokens.filter((t) => next.includes(t)));
+  };
+  return <div className={`hub-gpu-list ${inherited ? "inherited" : ""}`}>
+    <label className="hub-gpu-inherit">
+      <input type="checkbox" checked={inherited} onChange={(e) => onChange(e.target.checked ? null : [...shown])} />
+      <span>{inheritLabel}<small>{inheritHint}</small></span>
+    </label>
+    {devices.map((d, i) => {
+      const on = enabled.has(d.token);
+      return <div key={d.token} className="hub-gpu-row">
+        <div className="hub-gpu-id"><strong>GPU {i}: {d.name}</strong><small>{d.token}</small></div>
+        <button type="button" role="switch" aria-checked={on} aria-label={`GPU ${i}: ${d.name}`}
+          className={`hub-gpu-switch ${on ? "on" : ""}`} onClick={() => toggle(d.token)}><span /></button>
+      </div>;
+    })}
+  </div>;
+}
+
+/** Rig-wide default GPU selection editor, opened from the Models toolbar. */
+function GpuDefaultsDialog({ onClose }: { onClose: () => void }) {
+  const [info, setInfo] = useState<GpuDeviceList | null>(null);
+  const [selection, setSelection] = useState<string[] | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let disposed = false;
+    void listGpuDevices()
+      .then((value) => { if (!disposed) { setInfo(value); setSelection(value.defaultSelection); } })
+      .catch((cause) => { if (!disposed) setError(readError(cause)); })
+      .finally(() => { if (!disposed) setLoading(false); });
+    return () => { disposed = true; };
+  }, []);
+
+  const save = async () => {
+    setSaving(true); setError(null);
+    try { await setGpuDefault(selection); onClose(); }
+    catch (cause) { setError(readError(cause)); }
+    finally { setSaving(false); }
+  };
+
+  return <div className="hub-settings-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !saving) onClose(); }}>
+    <section className="hub-settings-dialog" role="dialog" aria-modal="true" aria-labelledby="gpu-defaults-title">
+      <header><div><span className={`hub-settings-state ${selection == null ? "recommended" : "custom"}`}>{selection == null ? "Automatic" : "Custom"}</span><h3 id="gpu-defaults-title">Default GPUs</h3><p>Applied to every model without its own GPU selection.</p></div><button aria-label="Close" disabled={saving} onClick={onClose}>×</button></header>
+      {loading ? <div className="hub-settings-loading">Loading devices…</div> : <div className="hub-gpu-section">
+        <GpuSelector devices={info?.devices ?? []} value={selection} onChange={setSelection}
+          inheritLabel="Automatic (recommended)" inheritHint="Prefers discrete GPUs and skips an integrated GPU when both are present." effectiveWhenInherited={null} />
+      </div>}
+      {error && <p className="hub-settings-error">{error}</p>}
+      <footer><span /><button disabled={saving} onClick={onClose}>Cancel</button><button className="primary" disabled={loading || saving} onClick={() => void save()}>{saving ? "Saving…" : "Save"}</button></footer>
+    </section>
+  </div>;
+}
+
 function ModelLoadSettingsDialog({ model, onClose, onChanged }: { model: LocalModel; onClose: () => void; onChanged: () => void }) {
   const [settings, setSettings] = useState<ModelLoadSettings>(recommendedModelLoadSettings);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [gpuInfo, setGpuInfo] = useState<GpuDeviceList | null>(null);
   const supportsMtp = model.capabilities.includes("mtp");
 
   useEffect(() => {
     let disposed = false;
     setLoading(true);
-    void getModelLoadSettings(model.id)
-      .then((value) => { if (!disposed) setSettings(value); })
+    void Promise.all([getModelLoadSettings(model.id), listGpuDevices()])
+      .then(([value, gpus]) => { if (!disposed) { setSettings(value); setGpuInfo(gpus); } })
       .catch((cause) => { if (!disposed) setError(readError(cause)); })
       .finally(() => { if (!disposed) setLoading(false); });
     return () => { disposed = true; };
@@ -564,7 +658,7 @@ function ModelLoadSettingsDialog({ model, onClose, onChanged }: { model: LocalMo
   return <div className="hub-settings-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !saving) onClose(); }}>
     <section className="hub-settings-dialog" role="dialog" aria-modal="true" aria-labelledby="model-load-settings-title">
       <header><div><span className={`hub-settings-state ${isRecommendedModelLoadSettings(settings) ? "recommended" : "custom"}`}>{isRecommendedModelLoadSettings(settings) ? "Recommended" : "Custom"}</span><h3 id="model-load-settings-title">Model load settings</h3><p>{model.name}</p></div><button aria-label="Close" disabled={saving} onClick={onClose}>×</button></header>
-      {loading ? <div className="hub-settings-loading">Loading settings…</div> : <div className="hub-settings-fields">
+      {loading ? <div className="hub-settings-loading">Loading settings…</div> : <><div className="hub-settings-fields">
         <label><span>Context window <small>Memory grows with context length.</small></span><input type="number" min={512} max={1048576} step={512} placeholder="Recommended (auto-fit)" value={settings.contextSize ?? ""} onChange={(e) => patch("contextSize", e.target.value ? Number(e.target.value) : null)} /></label>
         <label><span>KV cache type <small>Lower precision saves memory but may reduce compatibility.</small></span><select value={settings.kvCacheType} onChange={(e) => patch("kvCacheType", e.target.value as ModelLoadSettings["kvCacheType"])}><option value="auto">Recommended (llama.cpp default)</option><option value="f16">f16 · highest compatibility</option><option value="q8_0">q8_0 · lower memory</option><option value="q4_0">q4_0 · lowest memory</option></select></label>
         <label><span>GPU offload <small>Auto-fit leaves memory headroom for the KV cache.</small></span><select value={settings.gpuOffload} onChange={(e) => patch("gpuOffload", e.target.value as ModelLoadSettings["gpuOffload"])}><option value="auto">Recommended (auto-fit)</option><option value="all">All model layers</option><option value="cpu_only">CPU only</option></select></label>
@@ -572,7 +666,14 @@ function ModelLoadSettingsDialog({ model, onClose, onChanged }: { model: LocalMo
         <label><span>Speculative decoding <small>{supportsMtp ? "Embedded MTP heads detected; Recommended enables them with a safe two-token draft." : "No embedded MTP prediction layers were detected in this GGUF."}</small></span><select value={settings.speculativeDecoding} onChange={(e) => patch("speculativeDecoding", e.target.value as ModelLoadSettings["speculativeDecoding"])}><option value="auto">Recommended ({supportsMtp ? "embedded MTP" : "off"})</option><option value="off">Off</option><option value="mtp" disabled={!supportsMtp}>Embedded MTP</option></select></label>
         <label><span>Max tool calls per message <small>Stops runaway tool loops. Recommended allows 25 calls, then reserves a final answer pass.</small></span><input type="number" min={1} max={100} step={1} placeholder="Recommended (25)" value={settings.maxToolCalls ?? ""} onChange={(e) => patch("maxToolCalls", e.target.value ? Number(e.target.value) : null)} /></label>
         <label><span>CPU threads <small>Automatic mode lets llama.cpp choose.</small></span><input type="number" min={1} max={512} step={1} placeholder="Recommended (automatic)" value={settings.cpuThreads ?? ""} onChange={(e) => patch("cpuThreads", e.target.value ? Number(e.target.value) : null)} /></label>
-      </div>}
+      </div>
+      <div className="hub-gpu-section">
+        <div className="hub-gpu-heading"><span>GPUs</span><small>Restrict this model to specific GPUs. Rig default follows the toolbar's “GPU defaults”.</small></div>
+        {settings.gpuOffload === "cpu_only"
+          ? <p className="hub-gpu-empty">GPU offload is set to CPU only — no GPUs will be used.</p>
+          : <GpuSelector devices={gpuInfo?.devices ?? []} value={settings.gpuDevices} onChange={(v) => patch("gpuDevices", v)}
+              inheritLabel="Use rig default" inheritHint="Uncheck to choose GPUs just for this model." effectiveWhenInherited={gpuInfo?.defaultSelection ?? null} />}
+      </div></>}
       {error && <p className="hub-settings-error">{error}</p>}{notice && <p className="hub-settings-notice">{notice}</p>}
       <footer><button className="hub-settings-reset" disabled={loading || saving || isRecommendedModelLoadSettings(settings)} onClick={() => { setSettings(recommendedModelLoadSettings()); setNotice(null); setError(null); }}>Reset to recommended</button><span /><button disabled={saving} onClick={onClose}>Cancel</button><button disabled={loading || saving} onClick={() => void save(false)}>{saving ? "Saving…" : "Save"}</button><button className="primary" disabled={loading || saving} onClick={() => void save(true)}>{saving ? "Applying…" : "Save & Load"}</button></footer>
     </section>

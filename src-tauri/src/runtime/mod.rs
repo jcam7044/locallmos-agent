@@ -40,6 +40,12 @@ pub struct ModelLoadSettings {
     /// `None` uses the recommended 25-call tool budget.
     #[serde(default)]
     pub max_tool_calls: Option<u16>,
+    /// Explicit llama.cpp compute devices (`--list-devices` tokens like `CUDA0`,
+    /// `Vulkan1`) this model may use. `None` inherits the rig-wide default
+    /// (`AgentConfig::default_gpu_devices`), which in turn falls back to automatic
+    /// selection. `Some(list)` restricts the model to exactly these devices.
+    #[serde(default)]
+    pub gpu_devices: Option<Vec<String>>,
 }
 
 impl ModelLoadSettings {
@@ -59,6 +65,9 @@ impl ModelLoadSettings {
                 anyhow::bail!("max tool calls must be between 1 and {MAX_TOOL_CALLS}");
             }
         }
+        if let Some(devices) = &self.gpu_devices {
+            validate_gpu_devices(devices)?;
+        }
         Ok(())
     }
 
@@ -69,6 +78,23 @@ impl ModelLoadSettings {
     pub fn tool_call_limit(&self) -> usize {
         self.max_tool_calls.unwrap_or(DEFAULT_MAX_TOOL_CALLS) as usize
     }
+}
+
+/// Validate an explicit GPU device selection. Each entry must be a single
+/// `--list-devices` token (e.g. `CUDA0`) — non-empty and free of whitespace or
+/// commas, since the list is comma-joined into a single `--device` argument.
+/// Tokens are not checked against live hardware here (no probe available); an
+/// unknown token simply fails at model load, exactly as a bad `--device` would.
+pub fn validate_gpu_devices(devices: &[String]) -> anyhow::Result<()> {
+    if devices.is_empty() {
+        anyhow::bail!("select at least one GPU, or clear the selection to use the default");
+    }
+    for token in devices {
+        if token.is_empty() || token.contains(',') || token.chars().any(char::is_whitespace) {
+            anyhow::bail!("invalid GPU device token {token:?}");
+        }
+    }
+    Ok(())
 }
 
 /// Reasoning intensity for a chat turn. Values serialize to the exact strings
@@ -339,6 +365,16 @@ impl Runtime {
         match self {
             Runtime::Ollama(_) => Ok(model.to_string()),
             Runtime::LlamaCpp(a) => a.canonical_model_id(model),
+        }
+    }
+
+    /// Enumerate the runtime's selectable compute devices as `(token, name)`
+    /// pairs (e.g. `("CUDA0", "NVIDIA GeForce RTX 5060 Ti")`). Empty when the
+    /// runtime exposes no per-device selection (Ollama) or none are detected.
+    pub async fn list_gpu_devices(&self) -> Vec<(String, String)> {
+        match self {
+            Runtime::Ollama(_) => Vec::new(),
+            Runtime::LlamaCpp(a) => a.list_gpu_devices().await,
         }
     }
 

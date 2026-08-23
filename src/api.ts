@@ -20,6 +20,7 @@ import type {
   HubModelDetail,
   HubModelPage,
   ModelLoadSettings,
+  GpuDeviceList,
   McpOverview,
   McpServerConfig,
   McpTrust,
@@ -44,6 +45,9 @@ export const saveModelLoadSettings = (
   settings: ModelLoadSettings,
   loadNow: boolean,
 ) => invoke("save_model_load_settings", { modelId, settings, loadNow });
+export const listGpuDevices = () => invoke<GpuDeviceList>("list_gpu_devices");
+export const setGpuDefault = (selection: string[] | null) =>
+  invoke("set_gpu_default", { selection });
 export const deleteLocalModel = (modelId: string) => invoke("delete_local_model", { modelId });
 export const ollamaPullModel = (model: string) => invoke("ollama_pull_model", { model });
 export const restartRuntime = () => invoke("restart_runtime");

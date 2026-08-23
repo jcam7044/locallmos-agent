@@ -182,6 +182,13 @@ impl LlamaServerAdapter {
         picked
     }
 
+    /// Enumerate selectable compute devices as `(token, name)` pairs for the UI
+    /// (per-model / rig-default GPU picker). Thin public wrapper over the internal
+    /// probe so the runtime facade can expose it without duplicating parsing.
+    pub async fn list_gpu_devices(&self) -> Vec<(String, String)> {
+        self.list_devices().await
+    }
+
     /// Ask llama-server to enumerate its compute devices (`token`, `name`).
     async fn list_devices(&self) -> Vec<(String, String)> {
         let output = Command::new(self.bin_path())
@@ -363,8 +370,13 @@ impl LlamaServerAdapter {
         if self.server_has_model(model, &gguf).await {
             return Ok(());
         }
-        // Compute the device selection before taking the process lock.
-        let device = self.device_arg().await;
+        // Compute the device selection before taking the process lock. An explicit
+        // per-model selection (already resolved from the rig-wide default upstream)
+        // wins over the automatic discrete-GPU pick.
+        let device = match settings.gpu_devices.as_deref() {
+            Some(list) if !list.is_empty() => Some(list.join(",")),
+            _ => self.device_arg().await,
+        };
         {
             let mut guard = self.proc.lock().await;
             if let Some(p) = guard.as_mut() {
@@ -1651,11 +1663,39 @@ mod tests {
             cpu_threads: Some(12),
             speculative_decoding: SpeculativeDecoding::Off,
             max_tool_calls: None,
+            gpu_devices: None,
         };
         assert_eq!(managed_args(&settings, true), vec![
             "--ctx-size", "32768", "--cache-type-k", "q8_0", "--cache-type-v",
             "q8_0", "--n-gpu-layers", "all", "--flash-attn", "on", "--threads", "12",
         ]);
+    }
+
+    #[test]
+    fn explicit_gpu_selection_is_left_out_of_managed_args() {
+        // Device tokens ride the shared `--device` slot in `ensure_running`, not
+        // `managed_args`, so a selection must not leak flags here.
+        let settings = ModelLoadSettings {
+            gpu_devices: Some(vec!["CUDA0".into(), "CUDA1".into()]),
+            ..Default::default()
+        };
+        assert!(managed_args(&settings, false).is_empty());
+    }
+
+    #[test]
+    fn gpu_device_selection_validates_tokens() {
+        assert!(ModelLoadSettings {
+            gpu_devices: Some(vec!["CUDA0".into(), "CUDA1".into()]),
+            ..Default::default()
+        }
+        .validate()
+        .is_ok());
+        // Empty selection, embedded whitespace, and embedded commas are rejected.
+        for bad in [vec![], vec!["CUDA 0".into()], vec!["CUDA0,CUDA1".into()], vec!["".into()]] {
+            assert!(ModelLoadSettings { gpu_devices: Some(bad), ..Default::default() }
+                .validate()
+                .is_err());
+        }
     }
 
     #[test]

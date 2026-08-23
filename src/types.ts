@@ -197,7 +197,18 @@ export type ModelLoadSettings = {
   speculativeDecoding: "auto" | "off" | "mtp";
   /** Empty uses the recommended 25-call limit. */
   maxToolCalls: number | null;
+  /**
+   * Explicit llama.cpp device tokens (e.g. "CUDA0") this model may use. `null`
+   * inherits the rig-wide default, which falls back to automatic selection.
+   */
+  gpuDevices: string[] | null;
 };
+
+/** A selectable llama.cpp compute device from `--list-devices`. */
+export type GpuDevice = { token: string; name: string };
+
+/** Live device list plus the current rig-wide default selection. */
+export type GpuDeviceList = { devices: GpuDevice[]; defaultSelection: string[] | null };
 
 // --- Persistent chat sessions (mirror src-tauri/src/chat_store.rs) ---------
 

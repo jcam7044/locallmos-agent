@@ -39,7 +39,7 @@ use std::time::Duration;
 
 use config::AgentConfig;
 use monitor::Monitor;
-use runtime::{validate_gpu_devices, ModelLoadSettings, Runtime};
+use runtime::{GpuPlan, ModelLoadSettings, Runtime};
 use serde_json::{json, Value};
 use settings::Settings;
 use status::AgentStatus;
@@ -127,11 +127,11 @@ impl AppState {
             anyhow::bail!("llama.cpp is being updated; try again when the update finishes");
         }
         let (_, mut settings) = self.model_settings(model).await?;
-        // A model with no explicit GPU selection inherits the rig-wide default;
-        // resolving here (rather than in each runtime adapter) means every load
-        // path — manual load, save-and-load, reconcile — honors the default.
-        if settings.gpu_devices.is_none() {
-            settings.gpu_devices = self.config.lock().await.default_gpu_devices.clone();
+        // A model with no explicit GPU plan inherits the rig-wide default; resolving
+        // here (rather than in each runtime adapter) means every load path — manual
+        // load, save-and-load, reconcile — honors the default.
+        if settings.gpu_plan.is_none() {
+            settings.gpu_plan = self.config.lock().await.default_gpu_plan.clone();
         }
         if force_reload && self.runtime.is_model_loaded(model).await {
             self.runtime.unload_model(model).await?;
@@ -861,11 +861,11 @@ struct GpuDevice {
 #[serde(rename_all = "camelCase")]
 struct GpuDeviceList {
     devices: Vec<GpuDevice>,
-    default_selection: Option<Vec<String>>,
+    default_plan: Option<GpuPlan>,
 }
 
-/// Enumerate the runtime's selectable GPUs plus the current rig-wide default, for
-/// the per-model / rig-default device pickers. `devices` is empty when the runtime
+/// Enumerate the runtime's selectable GPUs plus the current rig-wide default plan,
+/// for the per-model / rig-default GPU pickers. `devices` is empty when the runtime
 /// exposes no per-device selection (e.g. Ollama) or none are detected.
 #[tauri::command]
 async fn list_gpu_devices(state: State<'_, Arc<AppState>>) -> Result<GpuDeviceList, String> {
@@ -876,25 +876,25 @@ async fn list_gpu_devices(state: State<'_, Arc<AppState>>) -> Result<GpuDeviceLi
         .into_iter()
         .map(|(token, name)| GpuDevice { token, name })
         .collect();
-    let default_selection = state.config.lock().await.default_gpu_devices.clone();
+    let default_plan = state.config.lock().await.default_gpu_plan.clone();
     Ok(GpuDeviceList {
         devices,
-        default_selection,
+        default_plan,
     })
 }
 
-/// Set (or clear, with `None`) the rig-wide default GPU selection inherited by
-/// models without their own `gpu_devices`. Applies to the next model load.
+/// Set (or clear, with `None`) the rig-wide default GPU plan inherited by models
+/// without their own `gpu_plan`. Applies to the next model load.
 #[tauri::command]
 async fn set_gpu_default(
     state: State<'_, Arc<AppState>>,
-    selection: Option<Vec<String>>,
+    plan: Option<GpuPlan>,
 ) -> Result<(), String> {
-    if let Some(devices) = &selection {
-        validate_gpu_devices(devices).map_err(|error| error.to_string())?;
+    if let Some(plan) = &plan {
+        plan.validate().map_err(|error| error.to_string())?;
     }
     let mut config = state.config.lock().await;
-    config.default_gpu_devices = selection;
+    config.default_gpu_plan = plan;
     config.save().map_err(|error| error.to_string())
 }
 

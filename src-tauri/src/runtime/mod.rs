@@ -22,7 +22,7 @@ use ollama::OllamaAdapter;
 pub const DEFAULT_MAX_TOOL_CALLS: u16 = 25;
 pub const MAX_TOOL_CALLS: u16 = 100;
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelLoadSettings {
     #[serde(default)]
@@ -40,12 +40,11 @@ pub struct ModelLoadSettings {
     /// `None` uses the recommended 25-call tool budget.
     #[serde(default)]
     pub max_tool_calls: Option<u16>,
-    /// Explicit llama.cpp compute devices (`--list-devices` tokens like `CUDA0`,
-    /// `Vulkan1`) this model may use. `None` inherits the rig-wide default
-    /// (`AgentConfig::default_gpu_devices`), which in turn falls back to automatic
-    /// selection. `Some(list)` restricts the model to exactly these devices.
+    /// How this model uses the GPUs (device selection + multi-GPU split). `None`
+    /// inherits the rig-wide default (`AgentConfig::default_gpu_plan`), which in
+    /// turn falls back to automatic selection. `Some(plan)` is fully explicit.
     #[serde(default)]
-    pub gpu_devices: Option<Vec<String>>,
+    pub gpu_plan: Option<GpuPlan>,
 }
 
 impl ModelLoadSettings {
@@ -65,8 +64,8 @@ impl ModelLoadSettings {
                 anyhow::bail!("max tool calls must be between 1 and {MAX_TOOL_CALLS}");
             }
         }
-        if let Some(devices) = &self.gpu_devices {
-            validate_gpu_devices(devices)?;
+        if let Some(plan) = &self.gpu_plan {
+            plan.validate()?;
         }
         Ok(())
     }
@@ -80,21 +79,101 @@ impl ModelLoadSettings {
     }
 }
 
-/// Validate an explicit GPU device selection. Each entry must be a single
-/// `--list-devices` token (e.g. `CUDA0`) — non-empty and free of whitespace or
-/// commas, since the list is comma-joined into a single `--device` argument.
-/// Tokens are not checked against live hardware here (no probe available); an
-/// unknown token simply fails at model load, exactly as a bad `--device` would.
-pub fn validate_gpu_devices(devices: &[String]) -> anyhow::Result<()> {
-    if devices.is_empty() {
-        anyhow::bail!("select at least one GPU, or clear the selection to use the default");
-    }
-    for token in devices {
-        if token.is_empty() || token.contains(',') || token.chars().any(char::is_whitespace) {
-            anyhow::bail!("invalid GPU device token {token:?}");
+/// How llama.cpp splits a model across the selected GPUs (`--split-mode`).
+/// `Auto` emits no flag (llama.cpp's default is layer split); `Single` maps to
+/// `none` (one GPU, chosen by `main_gpu`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SplitMode {
+    #[default]
+    Auto,
+    Layer,
+    Row,
+    Single,
+}
+
+impl SplitMode {
+    /// The `--split-mode` value, or `None` to leave llama.cpp's default.
+    pub fn as_flag(self) -> Option<&'static str> {
+        match self {
+            SplitMode::Auto => None,
+            SplitMode::Layer => Some("layer"),
+            SplitMode::Row => Some("row"),
+            SplitMode::Single => Some("none"),
         }
     }
-    Ok(())
+}
+
+/// A model's (or the rig default's) complete GPU usage plan: which devices to
+/// use and how to split across them. `devices` are `--list-devices` tokens (e.g.
+/// `CUDA0`) in the order llama.cpp should use them; `main_gpu` and `tensor_split`
+/// index positionally into that list, matching llama.cpp's `--main-gpu` /
+/// `--tensor-split` semantics.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GpuPlan {
+    /// Explicit device tokens, in use order. Always at least one.
+    pub devices: Vec<String>,
+    #[serde(default)]
+    pub split_mode: SplitMode,
+    /// Index into `devices` for `--main-gpu`. `None` leaves llama's default (0).
+    #[serde(default)]
+    pub main_gpu: Option<u32>,
+    /// Per-device proportions for `--tensor-split`, one per entry of `devices`.
+    /// `None` lets llama.cpp split evenly.
+    #[serde(default)]
+    pub tensor_split: Option<Vec<f32>>,
+}
+
+impl GpuPlan {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.devices.is_empty() {
+            anyhow::bail!("select at least one GPU, or clear the selection to use the default");
+        }
+        for token in &self.devices {
+            if token.is_empty() || token.contains(',') || token.chars().any(char::is_whitespace) {
+                anyhow::bail!("invalid GPU device token {token:?}");
+            }
+        }
+        if let Some(index) = self.main_gpu {
+            if (index as usize) >= self.devices.len() {
+                anyhow::bail!("main GPU index {index} is out of range for the selected GPUs");
+            }
+        }
+        if let Some(split) = &self.tensor_split {
+            if split.len() != self.devices.len() {
+                anyhow::bail!("tensor split must have one weight per selected GPU");
+            }
+            if split.iter().any(|w| !w.is_finite() || *w < 0.0) {
+                anyhow::bail!("tensor split weights must be non-negative numbers");
+            }
+            if split.iter().sum::<f32>() <= 0.0 {
+                anyhow::bail!("at least one tensor split weight must be greater than zero");
+            }
+        }
+        Ok(())
+    }
+
+    /// The llama.cpp launch flags this plan contributes beyond `--device`:
+    /// `--split-mode`, `--main-gpu`, `--tensor-split`.
+    pub fn split_args(&self) -> Vec<String> {
+        let mut args = Vec::new();
+        if let Some(mode) = self.split_mode.as_flag() {
+            args.extend(["--split-mode".into(), mode.into()]);
+        }
+        if let Some(index) = self.main_gpu {
+            args.extend(["--main-gpu".into(), index.to_string()]);
+        }
+        if let Some(split) = &self.tensor_split {
+            let joined = split
+                .iter()
+                .map(|w| format!("{w}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            args.extend(["--tensor-split".into(), joined]);
+        }
+        args
+    }
 }
 
 /// Reasoning intensity for a chat turn. Values serialize to the exact strings

@@ -198,17 +198,33 @@ export type ModelLoadSettings = {
   /** Empty uses the recommended 25-call limit. */
   maxToolCalls: number | null;
   /**
-   * Explicit llama.cpp device tokens (e.g. "CUDA0") this model may use. `null`
+   * How this model uses the GPUs (device selection + multi-GPU split). `null`
    * inherits the rig-wide default, which falls back to automatic selection.
    */
-  gpuDevices: string[] | null;
+  gpuPlan: GpuPlan | null;
+};
+
+/** How llama.cpp splits a model across the selected GPUs (`--split-mode`). */
+export type SplitMode = "auto" | "layer" | "row" | "single";
+
+/**
+ * A complete GPU usage plan. `devices` are `--list-devices` tokens in use order;
+ * `mainGpu` and `tensorSplit` index positionally into that list.
+ */
+export type GpuPlan = {
+  devices: string[];
+  splitMode: SplitMode;
+  /** Index into `devices` for `--main-gpu`; `null` = llama default (0). */
+  mainGpu: number | null;
+  /** One proportion per device for `--tensor-split`; `null` = even split. */
+  tensorSplit: number[] | null;
 };
 
 /** A selectable llama.cpp compute device from `--list-devices`. */
 export type GpuDevice = { token: string; name: string };
 
-/** Live device list plus the current rig-wide default selection. */
-export type GpuDeviceList = { devices: GpuDevice[]; defaultSelection: string[] | null };
+/** Live device list plus the current rig-wide default plan. */
+export type GpuDeviceList = { devices: GpuDevice[]; defaultPlan: GpuPlan | null };
 
 // --- Persistent chat sessions (mirror src-tauri/src/chat_store.rs) ---------
 

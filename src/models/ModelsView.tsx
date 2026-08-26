@@ -10,6 +10,8 @@ import type {
   GgufVariant,
   GpuDevice,
   GpuDeviceList,
+  GpuPlan,
+  SplitMode,
   HubModelDetail,
   HubModelSummary,
   LocalModel,
@@ -509,20 +511,19 @@ export const recommendedModelLoadSettings = (): ModelLoadSettings => ({
   cpuThreads: null,
   speculativeDecoding: "auto",
   maxToolCalls: null,
-  gpuDevices: null,
+  gpuPlan: null,
 });
 
 export function isRecommendedModelLoadSettings(settings: ModelLoadSettings) {
   return settings.contextSize == null && settings.kvCacheType === "auto" &&
     settings.gpuOffload === "auto" && settings.flashAttention === "auto" &&
     settings.cpuThreads == null && settings.speculativeDecoding === "auto" &&
-    settings.maxToolCalls == null && settings.gpuDevices == null;
+    settings.maxToolCalls == null && settings.gpuPlan == null;
 }
 
 export function modelLoadSettingsError(settings: ModelLoadSettings): string | null {
-  if (settings.gpuDevices != null && settings.gpuDevices.length === 0) {
-    return "Select at least one GPU, or switch back to the rig default.";
-  }
+  const planError = gpuPlanError(settings.gpuPlan);
+  if (planError) return planError;
   if (settings.contextSize != null && (!Number.isInteger(settings.contextSize) || settings.contextSize < 512 || settings.contextSize > 1_048_576)) {
     return "Context size must be a whole number between 512 and 1,048,576 tokens.";
   }
@@ -535,53 +536,127 @@ export function modelLoadSettingsError(settings: ModelLoadSettings): string | nu
   return null;
 }
 
+/** Light validation for a GPU plan; the editor prevents most invalid states. */
+function gpuPlanError(plan: GpuPlan | null): string | null {
+  if (plan == null) return null;
+  if (plan.devices.length === 0) return "Select at least one GPU, or switch back to the default.";
+  if (plan.tensorSplit != null) {
+    if (plan.tensorSplit.length !== plan.devices.length) return "Tensor split must have one weight per selected GPU.";
+    if (plan.tensorSplit.some((w) => !(w >= 0) || !Number.isFinite(w))) return "Tensor split weights must be non-negative numbers.";
+    if (plan.tensorSplit.reduce((a, b) => a + b, 0) <= 0) return "At least one tensor split weight must be greater than zero.";
+  }
+  return null;
+}
+
+const SPLIT_MODE_LABELS: Record<SplitMode, string> = {
+  auto: "Recommended (layer split)",
+  layer: "By layer",
+  row: "By row",
+  single: "Single GPU",
+};
+
 /**
- * Per-device GPU on/off toggles shared by the per-model settings dialog and the
- * rig-default editor. `value === null` means "inherit" (rig default for a model,
- * automatic selection for the rig default itself); a non-null array is an
- * explicit device-token selection. Toggling any switch produces an explicit,
- * device-ordered selection (leaving inherit mode), and never yields an empty set.
+ * GPU usage editor shared by the per-model settings dialog and the rig-default
+ * editor. `value === null` means "inherit" (rig default for a model, automatic
+ * selection for the rig default itself); a non-null plan is fully explicit.
+ * Editing any control produces a normalized explicit plan (leaving inherit mode),
+ * keeps at least one GPU enabled, and re-aligns main-GPU / tensor-split (which are
+ * positional) to the enabled device list.
  */
-function GpuSelector({ devices, value, onChange, inheritLabel, inheritHint, effectiveWhenInherited }: {
+function GpuPlanEditor({ devices, value, onChange, inheritLabel, inheritHint, effectiveWhenInherited }: {
   devices: GpuDevice[];
-  value: string[] | null;
-  onChange: (value: string[] | null) => void;
+  value: GpuPlan | null;
+  onChange: (value: GpuPlan | null) => void;
   inheritLabel: string;
   inheritHint: string;
-  effectiveWhenInherited: string[] | null;
+  effectiveWhenInherited: GpuPlan | null;
 }) {
   if (devices.length === 0) {
     return <p className="hub-gpu-empty">Automatic — no selectable GPUs were detected for this runtime.</p>;
   }
   const allTokens = devices.map((d) => d.token);
+  const nameOf = (token: string) => devices.find((d) => d.token === token)?.name ?? token;
   const inherited = value == null;
-  const shown = value ?? effectiveWhenInherited ?? allTokens;
-  const enabled = new Set(shown);
-  const toggle = (token: string) => {
-    const next = enabled.has(token) ? shown.filter((t) => t !== token) : [...shown, token];
-    if (next.length === 0) return; // keep at least one GPU selected
-    onChange(allTokens.filter((t) => next.includes(t)));
+
+  // Normalize a plan to the available devices (drop unknown, keep device order,
+  // ≥1) and re-align main-GPU / tensor-split to that device set.
+  const normalize = (plan: GpuPlan): GpuPlan => {
+    const kept = allTokens.filter((t) => plan.devices.includes(t));
+    const devs = kept.length ? kept : allTokens;
+    const mainToken = plan.mainGpu != null ? plan.devices[plan.mainGpu] : null;
+    const mainIdx = mainToken != null ? devs.indexOf(mainToken) : -1;
+    let tensorSplit: number[] | null = null;
+    if (plan.tensorSplit != null) {
+      const weight = new Map(plan.devices.map((t, i) => [t, plan.tensorSplit![i] ?? 1]));
+      tensorSplit = devs.map((t) => weight.get(t) ?? 1);
+    }
+    return { devices: devs, splitMode: plan.splitMode, mainGpu: mainIdx >= 0 ? mainIdx : null, tensorSplit };
   };
+
+  // The explicit plan edits build on: the current value, or the effective plan
+  // shown while inheriting (rig default, or "all devices / auto" as a fallback).
+  const shown: GpuPlan = normalize(value ?? effectiveWhenInherited ?? { devices: allTokens, splitMode: "auto", mainGpu: null, tensorSplit: null });
+  const enabled = shown.devices;
+  const multi = enabled.length >= 2;
+  const update = (plan: GpuPlan) => onChange(normalize(plan));
+
+  const toggleDevice = (token: string) => {
+    const has = enabled.includes(token);
+    const next = allTokens.filter((t) => (t === token ? !has : enabled.includes(t)));
+    if (next.length === 0) return; // keep at least one GPU enabled
+    update({ ...shown, devices: next });
+  };
+
   return <div className={`hub-gpu-list ${inherited ? "inherited" : ""}`}>
     <label className="hub-gpu-inherit">
-      <input type="checkbox" checked={inherited} onChange={(e) => onChange(e.target.checked ? null : [...shown])} />
+      <input type="checkbox" checked={inherited} onChange={(e) => onChange(e.target.checked ? null : shown)} />
       <span>{inheritLabel}<small>{inheritHint}</small></span>
     </label>
     {devices.map((d, i) => {
-      const on = enabled.has(d.token);
+      const on = enabled.includes(d.token);
       return <div key={d.token} className="hub-gpu-row">
         <div className="hub-gpu-id"><strong>GPU {i}: {d.name}</strong><small>{d.token}</small></div>
         <button type="button" role="switch" aria-checked={on} aria-label={`GPU ${i}: ${d.name}`}
-          className={`hub-gpu-switch ${on ? "on" : ""}`} onClick={() => toggle(d.token)}><span /></button>
+          className={`hub-gpu-switch ${on ? "on" : ""}`} onClick={() => toggleDevice(d.token)}><span /></button>
       </div>;
     })}
+    {multi && <div className="hub-gpu-advanced">
+      <label className="hub-gpu-field"><span>Split mode <small>How the model is divided across the selected GPUs.</small></span>
+        <select value={shown.splitMode} onChange={(e) => update({ ...shown, splitMode: e.target.value as SplitMode })}>
+          {(Object.keys(SPLIT_MODE_LABELS) as SplitMode[]).map((m) => <option key={m} value={m}>{SPLIT_MODE_LABELS[m]}</option>)}
+        </select>
+      </label>
+      <label className="hub-gpu-field"><span>Main GPU <small>Holds the KV cache / small tensors (row &amp; single-GPU modes).</small></span>
+        <select value={shown.mainGpu ?? ""} onChange={(e) => update({ ...shown, mainGpu: e.target.value === "" ? null : Number(e.target.value) })}>
+          <option value="">Recommended (first)</option>
+          {enabled.map((t, i) => <option key={t} value={i}>GPU {allTokens.indexOf(t)}: {nameOf(t)}</option>)}
+        </select>
+      </label>
+      {shown.splitMode !== "single" && <div className="hub-gpu-field hub-gpu-tensor">
+        <span>Tensor split <small>Fraction of the model on each GPU. Off = even split.</small></span>
+        <div className="hub-gpu-tensor-body">
+          <label className="hub-gpu-tensor-toggle">
+            <input type="checkbox" checked={shown.tensorSplit != null}
+              onChange={(e) => update({ ...shown, tensorSplit: e.target.checked ? enabled.map(() => 1) : null })} />
+            <span>Custom weights</span>
+          </label>
+          {shown.tensorSplit != null && <div className="hub-gpu-tensor-rows">
+            {enabled.map((t, i) => <label key={t} className="hub-gpu-tensor-weight">
+              <span>GPU {allTokens.indexOf(t)}</span>
+              <input type="number" min={0} step="any" value={shown.tensorSplit![i]}
+                onChange={(e) => { const next = [...shown.tensorSplit!]; next[i] = e.target.value === "" ? 0 : Number(e.target.value); update({ ...shown, tensorSplit: next }); }} />
+            </label>)}
+          </div>}
+        </div>
+      </div>}
+    </div>}
   </div>;
 }
 
-/** Rig-wide default GPU selection editor, opened from the Models toolbar. */
+/** Rig-wide default GPU plan editor, opened from the Models toolbar. */
 function GpuDefaultsDialog({ onClose }: { onClose: () => void }) {
   const [info, setInfo] = useState<GpuDeviceList | null>(null);
-  const [selection, setSelection] = useState<string[] | null>(null);
+  const [plan, setPlan] = useState<GpuPlan | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -589,24 +664,26 @@ function GpuDefaultsDialog({ onClose }: { onClose: () => void }) {
   useEffect(() => {
     let disposed = false;
     void listGpuDevices()
-      .then((value) => { if (!disposed) { setInfo(value); setSelection(value.defaultSelection); } })
+      .then((value) => { if (!disposed) { setInfo(value); setPlan(value.defaultPlan); } })
       .catch((cause) => { if (!disposed) setError(readError(cause)); })
       .finally(() => { if (!disposed) setLoading(false); });
     return () => { disposed = true; };
   }, []);
 
   const save = async () => {
+    const validationError = gpuPlanError(plan);
+    if (validationError) { setError(validationError); return; }
     setSaving(true); setError(null);
-    try { await setGpuDefault(selection); onClose(); }
+    try { await setGpuDefault(plan); onClose(); }
     catch (cause) { setError(readError(cause)); }
     finally { setSaving(false); }
   };
 
   return <div className="hub-settings-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !saving) onClose(); }}>
     <section className="hub-settings-dialog" role="dialog" aria-modal="true" aria-labelledby="gpu-defaults-title">
-      <header><div><span className={`hub-settings-state ${selection == null ? "recommended" : "custom"}`}>{selection == null ? "Automatic" : "Custom"}</span><h3 id="gpu-defaults-title">Default GPUs</h3><p>Applied to every model without its own GPU selection.</p></div><button aria-label="Close" disabled={saving} onClick={onClose}>×</button></header>
+      <header><div><span className={`hub-settings-state ${plan == null ? "recommended" : "custom"}`}>{plan == null ? "Automatic" : "Custom"}</span><h3 id="gpu-defaults-title">Default GPUs</h3><p>Applied to every model without its own GPU selection.</p></div><button aria-label="Close" disabled={saving} onClick={onClose}>×</button></header>
       {loading ? <div className="hub-settings-loading">Loading devices…</div> : <div className="hub-gpu-section">
-        <GpuSelector devices={info?.devices ?? []} value={selection} onChange={setSelection}
+        <GpuPlanEditor devices={info?.devices ?? []} value={plan} onChange={setPlan}
           inheritLabel="Automatic (recommended)" inheritHint="Prefers discrete GPUs and skips an integrated GPU when both are present." effectiveWhenInherited={null} />
       </div>}
       {error && <p className="hub-settings-error">{error}</p>}
@@ -671,8 +748,8 @@ function ModelLoadSettingsDialog({ model, onClose, onChanged }: { model: LocalMo
         <div className="hub-gpu-heading"><span>GPUs</span><small>Restrict this model to specific GPUs. Rig default follows the toolbar's “GPU defaults”.</small></div>
         {settings.gpuOffload === "cpu_only"
           ? <p className="hub-gpu-empty">GPU offload is set to CPU only — no GPUs will be used.</p>
-          : <GpuSelector devices={gpuInfo?.devices ?? []} value={settings.gpuDevices} onChange={(v) => patch("gpuDevices", v)}
-              inheritLabel="Use rig default" inheritHint="Uncheck to choose GPUs just for this model." effectiveWhenInherited={gpuInfo?.defaultSelection ?? null} />}
+          : <GpuPlanEditor devices={gpuInfo?.devices ?? []} value={settings.gpuPlan} onChange={(v) => patch("gpuPlan", v)}
+              inheritLabel="Use rig default" inheritHint="Uncheck to choose GPUs just for this model." effectiveWhenInherited={gpuInfo?.defaultPlan ?? null} />}
       </div></>}
       {error && <p className="hub-settings-error">{error}</p>}{notice && <p className="hub-settings-notice">{notice}</p>}
       <footer><button className="hub-settings-reset" disabled={loading || saving || isRecommendedModelLoadSettings(settings)} onClick={() => { setSettings(recommendedModelLoadSettings()); setNotice(null); setError(null); }}>Reset to recommended</button><span /><button disabled={saving} onClick={onClose}>Cancel</button><button disabled={loading || saving} onClick={() => void save(false)}>{saving ? "Saving…" : "Save"}</button><button className="primary" disabled={loading || saving} onClick={() => void save(true)}>{saving ? "Applying…" : "Save & Load"}</button></footer>

@@ -182,6 +182,13 @@ impl LlamaServerAdapter {
         picked
     }
 
+    /// Enumerate selectable compute devices as `(token, name)` pairs for the UI
+    /// (per-model / rig-default GPU picker). Thin public wrapper over the internal
+    /// probe so the runtime facade can expose it without duplicating parsing.
+    pub async fn list_gpu_devices(&self) -> Vec<(String, String)> {
+        self.list_devices().await
+    }
+
     /// Ask llama-server to enumerate its compute devices (`token`, `name`).
     async fn list_devices(&self) -> Vec<(String, String)> {
         let output = Command::new(self.bin_path())
@@ -363,8 +370,13 @@ impl LlamaServerAdapter {
         if self.server_has_model(model, &gguf).await {
             return Ok(());
         }
-        // Compute the device selection before taking the process lock.
-        let device = self.device_arg().await;
+        // Compute the device selection before taking the process lock. An explicit
+        // per-model plan (already resolved from the rig-wide default upstream) wins
+        // over the automatic discrete-GPU pick.
+        let device = match &settings.gpu_plan {
+            Some(plan) if !plan.devices.is_empty() => Some(plan.devices.join(",")),
+            _ => self.device_arg().await,
+        };
         {
             let mut guard = self.proc.lock().await;
             if let Some(p) = guard.as_mut() {
@@ -389,7 +401,7 @@ impl LlamaServerAdapter {
                 // --jinja applies the GGUF's chat template and enables native,
                 // grammar-constrained tool calling.
                 .arg("--jinja");
-            for a in filtered_extra_args(&self.extra_args, settings.gpu_offload) {
+            for a in filtered_extra_args(&self.extra_args, settings.gpu_offload, settings.gpu_plan.is_some()) {
                 cmd.arg(a);
             }
             for a in managed_args(settings, embedded_mtp) {
@@ -398,6 +410,14 @@ impl LlamaServerAdapter {
             if settings.gpu_offload != GpuOffload::CpuOnly {
                 if let Some(dev) = &device {
                     cmd.arg("--device").arg(dev);
+                }
+                // Multi-GPU split flags (--split-mode/--main-gpu/--tensor-split)
+                // only apply with an explicit plan; the auto path leaves llama's
+                // defaults untouched.
+                if let Some(plan) = &settings.gpu_plan {
+                    for a in plan.split_args() {
+                        cmd.arg(a);
+                    }
                 }
             }
             // Surface llama-server load progress/errors in the agent terminal.
@@ -772,19 +792,26 @@ fn managed_args(settings: &ModelLoadSettings, embedded_mtp: bool) -> Vec<String>
     args
 }
 
-fn filtered_extra_args(extra: &[String], gpu_offload: GpuOffload) -> Vec<String> {
+fn filtered_extra_args(extra: &[String], gpu_offload: GpuOffload, plan_active: bool) -> Vec<String> {
     const MANAGED: &[&str] = &[
         "-c", "--ctx-size", "-ngl", "--gpu-layers", "--n-gpu-layers", "-ctk",
         "--cache-type-k", "-ctv", "--cache-type-v", "-fa", "--flash-attn", "-t",
         "--threads", "--spec-type", "--spec-draft-n-max", "--spec-draft-n-min",
+    ];
+    // Device and split flags are owned by the model's GPU plan; strip any the user
+    // set via LOCALLMOS_LLAMACPP_ARGS when a plan is active (or --device when
+    // CPU-only) so they can't collide with the ones we inject.
+    const GPU_PLAN: &[&str] = &[
+        "-dev", "--device", "-sm", "--split-mode", "-ts", "--tensor-split",
+        "-mg", "--main-gpu",
     ];
     let mut out = Vec::new();
     let mut i = 0;
     while i < extra.len() {
         let arg = &extra[i];
         let managed = MANAGED.iter().any(|flag| arg == flag || arg.starts_with(&format!("{flag}=")));
-        let device = gpu_offload == GpuOffload::CpuOnly
-            && ["-dev", "--device"].iter().any(|flag| arg == flag || arg.starts_with(&format!("{flag}=")));
+        let device = (plan_active || gpu_offload == GpuOffload::CpuOnly)
+            && GPU_PLAN.iter().any(|flag| arg == flag || arg.starts_with(&format!("{flag}=")));
         if managed || device {
             tracing::warn!("ignoring LOCALLMOS_LLAMACPP_ARGS value controlled by model settings: {arg}");
             if !arg.contains('=') && i + 1 < extra.len() {
@@ -1605,6 +1632,7 @@ fn finalize(state: StreamState) -> ChatOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::{GpuPlan, SplitMode};
     use std::fs;
 
     /// Feed a sequence of parsed SSE chunks and finalize.
@@ -1651,11 +1679,69 @@ mod tests {
             cpu_threads: Some(12),
             speculative_decoding: SpeculativeDecoding::Off,
             max_tool_calls: None,
+            gpu_plan: None,
         };
         assert_eq!(managed_args(&settings, true), vec![
             "--ctx-size", "32768", "--cache-type-k", "q8_0", "--cache-type-v",
             "q8_0", "--n-gpu-layers", "all", "--flash-attn", "on", "--threads", "12",
         ]);
+    }
+
+    #[test]
+    fn explicit_gpu_plan_is_left_out_of_managed_args() {
+        // Device tokens and split flags ride `ensure_running` (via `--device` and
+        // `plan.split_args`), not `managed_args`, so a plan must not leak here.
+        let settings = ModelLoadSettings {
+            gpu_plan: Some(GpuPlan {
+                devices: vec!["CUDA0".into(), "CUDA1".into()],
+                split_mode: SplitMode::Row,
+                main_gpu: Some(1),
+                tensor_split: Some(vec![3.0, 1.0]),
+            }),
+            ..Default::default()
+        };
+        assert!(managed_args(&settings, false).is_empty());
+    }
+
+    #[test]
+    fn gpu_plan_split_args_map_to_llama_flags() {
+        let plan = GpuPlan {
+            devices: vec!["CUDA0".into(), "CUDA1".into()],
+            split_mode: SplitMode::Row,
+            main_gpu: Some(1),
+            tensor_split: Some(vec![3.0, 1.0]),
+        };
+        assert_eq!(
+            plan.split_args(),
+            vec!["--split-mode", "row", "--main-gpu", "1", "--tensor-split", "3,1"]
+        );
+        // Auto split mode + no main gpu / tensor split emits nothing.
+        let bare = GpuPlan { devices: vec!["CUDA0".into()], ..Default::default() };
+        assert!(bare.split_args().is_empty());
+    }
+
+    #[test]
+    fn gpu_plan_validates_devices_main_gpu_and_tensor_split() {
+        assert!(GpuPlan {
+            devices: vec!["CUDA0".into(), "CUDA1".into()],
+            split_mode: SplitMode::Layer,
+            main_gpu: Some(1),
+            tensor_split: Some(vec![3.0, 1.0]),
+        }
+        .validate()
+        .is_ok());
+        // Empty devices, bad token, out-of-range main gpu, mismatched tensor-split
+        // length, and an all-zero split are each rejected.
+        let bad_plans = [
+            GpuPlan { devices: vec![], ..Default::default() },
+            GpuPlan { devices: vec!["CUDA 0".into()], ..Default::default() },
+            GpuPlan { devices: vec!["CUDA0".into()], main_gpu: Some(2), ..Default::default() },
+            GpuPlan { devices: vec!["CUDA0".into(), "CUDA1".into()], tensor_split: Some(vec![1.0]), ..Default::default() },
+            GpuPlan { devices: vec!["CUDA0".into()], tensor_split: Some(vec![0.0]), ..Default::default() },
+        ];
+        for plan in bad_plans {
+            assert!(plan.validate().is_err());
+        }
     }
 
     #[test]
@@ -1671,12 +1757,18 @@ mod tests {
         ]
         .map(str::to_string);
         assert_eq!(
-            filtered_extra_args(&extra, GpuOffload::Auto),
+            filtered_extra_args(&extra, GpuOffload::Auto, false),
             vec!["--mlock", "--no-mmap"]
+        );
+        // With a plan active, user-supplied device/split flags are stripped too.
+        let plan_conflicts = ["--tensor-split", "5,5", "-sm", "row", "--device", "CUDA0", "--mlock"].map(str::to_string);
+        assert_eq!(
+            filtered_extra_args(&plan_conflicts, GpuOffload::Auto, true),
+            vec!["--mlock"]
         );
         let device = ["--device", "Vulkan0", "--mlock"].map(str::to_string);
         assert_eq!(
-            filtered_extra_args(&device, GpuOffload::CpuOnly),
+            filtered_extra_args(&device, GpuOffload::CpuOnly, false),
             vec!["--mlock"]
         );
         assert_eq!(

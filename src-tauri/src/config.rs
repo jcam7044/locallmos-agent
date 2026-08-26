@@ -32,6 +32,11 @@ pub struct AgentConfig {
     /// the configured models directory, so cloud aliases and local IDs converge.
     #[serde(default)]
     pub model_load_settings: BTreeMap<String, ModelLoadSettings>,
+    /// Rig-wide default GPU plan (device selection + multi-GPU split) inherited by
+    /// any model whose own `ModelLoadSettings::gpu_plan` is `None`. `None` leaves
+    /// automatic selection (discrete GPUs preferred over an iGPU) in place.
+    #[serde(default)]
+    pub default_gpu_plan: Option<crate::runtime::GpuPlan>,
     /// Configured MCP servers. Secret env values live in `mcp_secrets.json`.
     #[serde(default)]
     pub mcp_servers: Vec<crate::mcp::McpServerConfig>,
@@ -202,16 +207,42 @@ mod tests {
             "huggingface/owner/model/model-Q4_K_M.gguf".into(),
             ModelLoadSettings {
                 context_size: Some(16384),
+                gpu_plan: Some(crate::runtime::GpuPlan {
+                    devices: vec!["CUDA0".into(), "CUDA1".into()],
+                    split_mode: crate::runtime::SplitMode::Row,
+                    main_gpu: Some(1),
+                    tensor_split: Some(vec![3.0, 1.0]),
+                }),
                 ..Default::default()
             },
         );
         let json = serde_json::to_string(&config).unwrap();
         let restored: AgentConfig = serde_json::from_str(&json).unwrap();
-        assert_eq!(
-            restored.model_load_settings["huggingface/owner/model/model-Q4_K_M.gguf"]
-                .context_size,
-            Some(16384)
-        );
+        let entry = &restored.model_load_settings["huggingface/owner/model/model-Q4_K_M.gguf"];
+        assert_eq!(entry.context_size, Some(16384));
+        let plan = entry.gpu_plan.as_ref().unwrap();
+        assert_eq!(plan.devices, vec!["CUDA0".to_string(), "CUDA1".to_string()]);
+        assert_eq!(plan.split_mode, crate::runtime::SplitMode::Row);
+        assert_eq!(plan.main_gpu, Some(1));
+        assert_eq!(plan.tensor_split.as_deref(), Some(&[3.0f32, 1.0][..]));
+    }
+
+    #[test]
+    fn default_gpu_plan_round_trips_and_defaults_to_none() {
+        // Absent field in an older config.json must deserialize as None.
+        let restored: AgentConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(restored.default_gpu_plan, None);
+
+        let config = AgentConfig {
+            default_gpu_plan: Some(crate::runtime::GpuPlan {
+                devices: vec!["CUDA0".into(), "CUDA1".into()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let restored: AgentConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.default_gpu_plan.unwrap().devices, vec!["CUDA0".to_string(), "CUDA1".to_string()]);
     }
 
     #[test]

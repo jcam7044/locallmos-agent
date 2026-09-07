@@ -7,6 +7,7 @@ import {
   codingSetUseGroupSubagents,
 } from "../api";
 import type { AgentView, GroupSubagentStatus } from "../types";
+import { SUBAGENT_TEMPLATES, type SubagentTemplate } from "./agentTemplates";
 import { C } from "./tokens";
 
 /** The read-only tools a sub-agent may use (mirrors agents.rs READONLY_TOOLS). */
@@ -192,9 +193,30 @@ function AgentForm({
         ? draft.tools.filter((t) => t !== tool)
         : [...draft.tools, tool],
     });
+  const applyTemplate = (t: SubagentTemplate) =>
+    setDraft({
+      ...draft,
+      name: draft.name.trim() ? draft.name : t.id,
+      description: t.description,
+      tools: [...t.tools],
+      prompt: t.prompt,
+      maxRounds: t.maxRounds != null ? String(t.maxRounds) : "",
+    });
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 10, overflowY: "auto", flex: 1 }}>
+      {!editing && (
+        <div>
+          <div style={fieldLabel}>Start from a template</div>
+          <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+            {SUBAGENT_TEMPLATES.map((t) => (
+              <button key={t.id} style={btn} title={t.description} onClick={() => applyTemplate(t)}>
+                {t.label}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
       <div style={{ display: "flex", gap: 10 }}>
         <label style={{ flex: 1 }}>
           <div style={fieldLabel}>Name</div>
